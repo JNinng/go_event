@@ -6,9 +6,14 @@ go_event 的 Postgres 后端，基于标准库 `database/sql`（连接由使用�
 
 ```go
 db, _ := sql.Open("pgx", dsn)
-_ = postgrec.Migrate(ctx, db)                      // 可选：显式迁移
+_ = postgrec.Migrate(ctx, db)                      // 部署/启动期可选：与缺省 Create 同义，需 DDL 权限
 drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
+// 运行账号仅 DML（+ 系统目录读）、表已由部署流程建好时：
+// drv := postgrec.NewDriver(db, postgrec.WithMigrateMode(event.MigrateVerify))
 ```
+
+缺省迁移模式 `Create` 在首次操作时持迁移锁执行基线；`Verify` 只读校验；
+`None` 不建表也不校验。无 DDL 权限的运行连接不能自动迁移，只能用后两者。
 
 ## 能力边界表（ADR 0005）
 
@@ -25,7 +30,27 @@ drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
 | 心跳 / 迟到 Complete / Fail 不生效（CAS） | 原生 | `lease_token` 条件更新，不命中静默返回 |
 | 递增退避 | 原生 | Fail 事务内按 `Backoff.Next` 计算 `next_eligible_at` |
 | 惰性清理 | 原生 | 超窗且无活跃租约（无论终态）行删除，`event_claim` 经 FK ON DELETE CASCADE 级联；墙钟节流，随 Append 机会性执行 |
-| 持久结构初始化幂等 | 原生 | `CREATE SCHEMA/TABLE IF NOT EXISTS`，首次使用自动执行（`Migrate` 亦可显式调用） |
+
+## 迁移能力
+
+迁移相关能力与 [ADR 0007](../docs/adr/0007-migration-mode-and-protocol.md) 的协议一致；核心语义档位见上表（[ADR 0005](../docs/adr/0005-backend-capability-boundary.md)）。
+
+| 项 | 值 | 说明 |
+| --- | --- | --- |
+| 迁移模式 | `Create` / `Verify` / `None`（P1 增 `Upgrade`） | `Create` 缺省，首次操作持锁执行基线；`Verify` 只读校验；`None` 不建不校验 |
+| DDL 原子性 | 跨语句事务 | 基线在单事务内执行；失败整体回滚 |
+| 执行路径 | fast | 锁 + 基线接管校验 + 基线 DDL 同事务；不逐对象探测 |
+| 基线接管校验 | 系统目录快照 | 定义一致且仅缺对象则补齐；冲突返回差异错误、不自动修复 |
+| `Verify` 报告 | `VerifyReport` / `*VerifyError` | P0 报告 `missing` / `outdated`；`too_new` / `failed` 为 P1 预留 |
+| 导出物 | `Statements` / `SQL` | `Statements` 不含锁；`SQL` 以 `BEGIN` 开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于全部基线 DDL 之前），末尾 `COMMIT` |
+| 锁原语 | 事务级 advisory 锁 | `pg_try_advisory_xact_lock(hashtext('go_event:<schema>'))`，有界等待；提交/回滚自动释放 |
+| 能力声明 | `Capabilities()` | 跨语句事务；constraint 无原生 `IF NOT EXISTS`（探测 + DO 块）；schema 仅存在性，表/列/索引/约束为存在性 + 定义；错误分类全支持；同步完成；可声明事务外步骤；不隐式提交 |
+| 权限边界 | 按模式 | `Create`/`Migrate` 需 DDL；`Verify`/`None` 只需 DML（+ 系统目录读）；锁能力为 `LockNone` 时 `Create` 返回 `ErrMigrationUnsupported` |
+
+导出 `SQL` 使用阻塞式 `pg_advisory_xact_lock` + `lock_timeout`；执行器使用
+`pg_try_advisory_xact_lock` + 有界退避，两者不是同一形式。
+
+完整能力矩阵与连接权限矩阵见 [design.md §8](../docs/design.md#8-后端能力边界)。
 
 ## 可选能力
 

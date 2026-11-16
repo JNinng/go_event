@@ -15,45 +15,146 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jninng/go_event"
+	"github.com/jninng/go_event/postgresschema"
 )
 
 // Driver event.Driver 的 Postgres 实现（pgx v5 连接池载体）。
-// 持久结构在首次使用时自动幂等初始化（design.md §8）。
+// 持久结构按迁移模式在首次使用时处理（design.md §8）：缺省 Create 执行
+// 基线，Verify 只读校验，None 直接放行。
 type Driver struct {
 	pool      *pgxpool.Pool
 	schema    string
 	retention time.Duration
+	mode      event.MigrateMode
+	manager   schemaManager
 
-	ensureMu sync.Mutex
-	ensured  bool
+	ensureMu     sync.Mutex
+	ensured      bool
+	ensureErr    error
+	retryAt      time.Time
+	retryBackoff time.Duration
+
+	// now 可注入时钟（缺省 time.Now），用于失败负缓存的退避判定。
+	now func() time.Time
+
+	// initErr 是构造期错误（非法 schema）；所有模式都要在 ensure 首行返回，
+	// 避免非法 schema 拼进任何 DML/DDL。
+	initErr error
 
 	cleanupMu   sync.Mutex
 	lastCleanup time.Time
 }
 
-// NewDriver 基于 pgx v5 连接池构造 event.Driver。
+// NewDriver 基于 pgx v5 连接池构造 event.Driver。schema 名在构造期校验
+// （所有模式一致）：非法名记录为 initErr，首次操作直接返回 ErrInvalidSchema。
 func NewDriver(pool *pgxpool.Pool, opts ...Option) event.Driver {
 	cfg := newConfig(opts)
-	return &Driver{
+	d := &Driver{
 		pool:      pool,
 		schema:    cfg.schema,
 		retention: cfg.retention,
+		mode:      cfg.mode,
+		manager:   &pgSchemaManager{pool: pool, schema: cfg.schema},
+		now:       time.Now,
 	}
+	if err := postgresschema.ValidateSchema(cfg.schema); err != nil {
+		d.initErr = fmt.Errorf("pgxc: %w: %v", event.ErrInvalidSchema, err)
+	}
+	return d
 }
 
-// ensure 首次使用时自动执行幂等迁移（design.md §8）。迁移失败不缓存：
-// DB 未就绪等瞬时故障只影响当次操作，下次操作重试迁移。
+// schemaManager 抽象初始化面的两种操作，便于在无 DB 的单测中注入替身。
+type schemaManager interface {
+	migrate(ctx context.Context) error
+	verify(ctx context.Context) (event.VerifyReport, error)
+}
+
+type pgSchemaManager struct {
+	pool   *pgxpool.Pool
+	schema string
+}
+
+func (m *pgSchemaManager) migrate(ctx context.Context) error {
+	return Migrate(ctx, m.pool, WithSchema(m.schema))
+}
+
+func (m *pgSchemaManager) verify(ctx context.Context) (event.VerifyReport, error) {
+	return Verify(ctx, m.pool, WithSchema(m.schema))
+}
+
+const (
+	ensureInitialBackoff = 100 * time.Millisecond
+	ensureMaxBackoff     = 30 * time.Second
+)
+
+// ensure 按迁移模式处理持久结构，并对失败做并发安全的负缓存：
+// 瞬时错误（DB 不可用、锁等待超时）在指数退避窗口内直接返回同一错误，
+// 窗口过后重试；永久配置错误（权限、定义冲突、不支持的模式）fail-fast，
+// 不再重试。Verify 成功后同样缓存「首次检查通过」。
 func (d *Driver) ensure(ctx context.Context) error {
+	if d.initErr != nil {
+		return d.initErr
+	}
 	d.ensureMu.Lock()
 	defer d.ensureMu.Unlock()
 	if d.ensured {
 		return nil
 	}
-	if err := Migrate(ctx, d.pool, WithSchema(d.schema), WithRetention(d.retention)); err != nil {
+	if d.ensureErr != nil {
+		if event.IsPermanentMigrationError(d.ensureErr) {
+			return d.ensureErr
+		}
+		if d.now().Before(d.retryAt) {
+			return d.ensureErr
+		}
+	}
+	err := d.runEnsure(ctx)
+	if err == nil {
+		d.ensured = true
+		d.ensureErr = nil
+		d.retryBackoff = 0
+		return nil
+	}
+	// 调用方取消/超时不是迁移结论：ctx 已取消时（含 DDL 执行中取消被驱动
+	// 映射为 57014/连接关闭）不写负缓存、不推进退避。
+	if ctx.Err() != nil {
 		return err
 	}
-	d.ensured = true
-	return nil
+	d.ensureErr = err
+	if event.IsPermanentMigrationError(err) {
+		return err
+	}
+	if d.retryBackoff == 0 {
+		d.retryBackoff = ensureInitialBackoff
+	} else {
+		d.retryBackoff *= 2
+		if d.retryBackoff > ensureMaxBackoff {
+			d.retryBackoff = ensureMaxBackoff
+		}
+	}
+	d.retryAt = d.now().Add(d.retryBackoff)
+	return err
+}
+
+func (d *Driver) runEnsure(ctx context.Context) error {
+	switch d.mode {
+	case event.MigrateCreate:
+		return d.manager.migrate(ctx)
+	case event.MigrateVerify:
+		report, err := d.manager.verify(ctx)
+		if err != nil {
+			return err
+		}
+		if !report.OK() {
+			return &event.VerifyError{Report: report}
+		}
+		return nil
+	case event.MigrateNone:
+		return nil
+	default:
+		return fmt.Errorf("pgxc: unsupported migrate mode %d: %w",
+			int(d.mode), event.ErrMigrateModeUnsupported)
+	}
 }
 
 // HeadPosition 广播基线锚点：该类型已提交事件的最大 Position，无行返回

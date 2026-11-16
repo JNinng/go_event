@@ -7,10 +7,13 @@
 ## 1. 包布局与类型形态
 
 ```
-github.com/jninng/go_event           # core：契约与编排（package event）
-github.com/jninng/go_event/postgrec  # Postgres 后端，标准库 database/sql（package postgrec）
-github.com/jninng/go_event/pgxc      # Postgres 后端，pgx v5（package pgxc）
-github.com/jninng/go_event/eventtest # 契约测试套件（package eventtest / eventtest/inmem）
+github.com/jninng/go_event                 # core：契约与编排（package event）
+github.com/jninng/go_event/postgrec        # Postgres 后端，标准库 database/sql（package postgrec）
+github.com/jninng/go_event/pgxc            # Postgres 后端，pgx v5（package pgxc）
+github.com/jninng/go_event/postgresschema  # Postgres 方言 DDL 单一事实源（无驱动依赖）
+github.com/jninng/go_event/eventtest       # 契约测试套件（package eventtest）
+github.com/jninng/go_event/eventtest/inmem     # 进程内 Driver
+github.com/jninng/go_event/eventtest/simmigrate # 迁移契约测试的进程内模拟 backend
 ```
 
 - **接口面只有 `Driver` 一个**（core 是它的消费方，接口定义在 core）。
@@ -69,15 +72,26 @@ func (ev Event[T]) SubscribeClaim(r *Runner, h Handler[T],
 ```go
 // Envelope 面向使用方的事件信封（强类型 payload）。
 type Envelope[T any] struct {
-    ID         string            // 发布侧生成的唯一 ID；幂等去重与追踪主键
+    // ID 是事件主键、全局唯一（发布侧生成或 WithEventID 显式指定），
+    // 幂等去重与追踪主键。跨事件类型复用同一 ID 视为同一事件，业务键
+    // 须按类型加前缀后才能当 ID 用。
+    ID         string
     Type       string            // 即 Event.Name
     Payload    T
     Metadata   map[string]string // 透传元数据，如 trace_id（design.md §4）
     OccurredAt time.Time
+    // Attempts 是本次投递的尝试序号（含本次）：新认领为「已失败次数 + 1」，
+    // 接管认领在先前基础上递增。仅认领消费有意义，广播消费恒为 0。
+    Attempts    int
+    // LastAttempt 表示本次是否为最后一次尝试：Attempts >= 订阅 RetryLimit
+    // 时为 true（按 >= 判定，防御多实例间的订阅配置差异）。接管侧在认领时
+    // 直接置 failed 的路径不投递「最后一次」，handler 不得假设它必然出现。
+    // 广播消费恒为 false。
+    LastAttempt bool
 }
 
-// RawEnvelope 面向 Driver 的事件信封（payload 已编码）。后端必须原样
-// 落库透传（design.md §4）。
+// RawEnvelope 面向 Driver 的事件信封（payload 已编码）。除运行时注入字段
+// （Attempts/LastAttempt，见下）外，后端必须原样落库透传（design.md §4）。
 type RawEnvelope struct {
     ID         string
     Type       string
@@ -88,6 +102,12 @@ type RawEnvelope struct {
     // 广播消费的已读水位条件（ADR 0004）：core 内存按订阅类型维护、
     // 只进不退，Fetch 时原样回传。
     Position string
+    // Lease.Attempts 是 Claim 侧尝试序号的唯一来源；RawEnvelope.Attempts /
+    // LastAttempt 仅由 core 在派发 handler 前写入，Append 输入侧忽略且不落库，
+    // Fetch/Claim 返回时必须为零值。Driver 不得依赖它们，也不得把它们作为
+    // 存取判据。
+    Attempts    int
+    LastAttempt bool
 }
 
 // Codec payload 编解码，缺省 JSON，可插拔（design.md §6）。
@@ -115,6 +135,7 @@ func WithIDGenerator(g IDGenerator) PublisherOption
                                 // RunnerOption，可传给两侧构造器
 
 // Publish 发布实现：ID 与 OccurredAt 缺省自动填充（design.md §6）。
+// WithEventID 优先于 IDGenerator；空串返回 ErrEmptyEventID。
 // 事件侧糖 Event[T].Publish 委托到此。因 Go 方法不支持类型参数，
 // Publish 为包级泛型函数而非 Publisher 方法。
 func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
@@ -125,7 +146,18 @@ func (p *Publisher) PublishNoPayload(ctx context.Context, ev Event[NoPayload],
     opts ...PublishOption) error
 
 func WithMetadata(meta map[string]string) PublishOption // 合并进缺省元数据
+
+// WithEventID 显式指定事件 ID，优先于 IDGenerator；空串非法，Publish
+// 返回 ErrEmptyEventID（不静默回退到生成器）。
+func WithEventID(id string) PublishOption
 ```
+
+事件 ID 是事件主键、**全局唯一**；`Append` 以 ID 为唯一冲突目标，冲突时
+静默首写为准（不校验 payload；重复发布不同 payload 保留旧值，Metadata 与
+OccurredAt 同样保留首写）。**跨事件类型复用同一 ID 不报错**，而是静默视为
+同一事件、丢弃第二个 payload——业务键必须按类型加前缀（或与类型绑定）后
+才能当 ID 用。若确需跨类型复用同一业务键，必须改主键模型，不能只靠文档
+约定；进程内串行锁不能跨实例去重，不能替代该语义。
 
 ### 2.4 Driver（唯一接口，最小缝合点）
 
@@ -197,7 +229,7 @@ type Lease struct {
     ConsumerType string
     LeaseToken   string    // 不透明凭证；Heartbeat/Complete/Fail 必须携带（CAS 依据）
     LeaseUntil   time.Time
-    Attempts     int       // 当前 claim_count（含本次认领）
+    Attempts     int       // 本次认领的尝试序号 = 认领后 claim_count + 1
 }
 
 type HeartbeatRequest struct {
@@ -241,7 +273,11 @@ func ExponentialBackoff(base, max time.Duration) Backoff // base * 2^(attempt-1)
   判据不依赖宿主时钟。
 - Complete/Fail/Heartbeat 的 CAS 不命中（租约过期、已被接管）**返回 nil
   而非错误**——「不生效」是接管场景的正常结果，是否记日志由 core 决定。
-- Driver 不返回哨兵错误；错误一律视为该次操作失败，core 记日志重试或跳过。
+- 除迁移相关错误（`ErrMigrationLockTimeout`、`ErrMigrationPermissionDenied`、
+  `ErrMigrationUnsupported`、`ErrMigrateModeUnsupported`、`ErrInvalidSchema`
+  等，见 §2.8）外，Driver 不返回哨兵错误；其余错误一律视为该次操作失败，
+  core 记日志重试或跳过。迁移错误在操作入口返回，调用方应按错误性质修正
+  配置、退避重试或改用 `Verify`/`None`。
 
 ### 2.5 Runner
 
@@ -265,7 +301,9 @@ func WithLogger(l *slog.Logger) RunnerOption      // 缺省 slog.Default()
 
 ```go
 // SubscribeOption 广播与认领均可用的选项
-func WithFetchLimit(n int) SubscribeOption   // 每轮按类型限额取数（ADR 0004）
+func WithFetchLimit(n int) SubscribeOption   // 每轮按类型限额取数（ADR 0004）；
+                                             // 认领侧实际批大小另受空闲并发
+                                             // 槽位封顶（usage.md §6.6）
 func WithConcurrency(n int) SubscribeOption  // handler 并发度
 
 // 仅认领订阅可用（广播订阅传入返回 ErrNotClaimSubscription）
@@ -300,8 +338,12 @@ func (r *Runner) Run(ctx context.Context) error
 - 广播基线在 Start 内经 `Driver.HeadPosition` 同步锚定（返回即基线确立，
   ADR 0006）；此后按订阅类型轮询 Fetch，watermark 按（订阅 × 类型）在
   内存维护，只进不退（ADR 0004）；handler 失败仅记日志跳过。
-- 认领消费按订阅类型轮询 Claim，每轮每类型限额 `WithFetchLimit`，
-  防单类型洪泛饿死其他类型（ADR 0004）。
+- 认领消费按订阅类型轮询 Claim，每轮 Limit 取 `min(WithFetchLimit, 当前
+  空闲并发槽位)`，无空闲槽位时不认领；`WithFetchLimit` 对认领是批次上限，
+  不要求 ≤ `WithConcurrency`。认领返回即派发、心跳随派发启动，不存在已
+  认领但排队等槽位的窗口（以 Driver 遵守 Claim 至多返回 Limit 条契约为
+  前提）。槽位释放后 core 立即补认领一轮，积压消化不依赖轮询间隔。
+  `WithFetchLimit` 在广播订阅仍是每轮取数上限。
 - 每个在途租约由独立 goroutine 心跳续租，心跳持续至
   `min(处理结束, 最大处理时长)`；超过最大处理时长停止续租，租约到期由
   其他实例接管（ADR 0006）。心跳瞬时错误（DB 抖动）记日志并在下个间隔
@@ -309,6 +351,14 @@ func (r *Runner) Run(ctx context.Context) error
 - 就近唤醒：Publish 经 LocalWake 发信号，Runner 按订阅注册表定向路由本
   实例对应 poller 立即拉取/认领；信号不承载投递保证，跨实例与丢失由
   poll 兜底（ADR 0003）。
+- 认领派发前由 core 用 `Lease.Attempts` 填充 `RawEnvelope.Attempts`，并按
+  `Lease.Attempts >= 订阅 RetryLimit` 设置 `RawEnvelope.LastAttempt`；解码后
+  原样映射到 `Envelope`；广播路径不设置，保持 `0` / `false`。
+  接管侧在认领时直接置 failed 的路径不投递「最后一次」，handler 不得
+  假设 `LastAttempt` 必然出现。
+- 接管例外：进程崩溃、停机（停止派发，未开始的租约到期后由其他实例接管）
+  与 handler 超过 `MaxProcessing`（停止续租）都允许接管，属 at-least-once
+  的正常表现，不是异常。
 
 ### 2.6 就近唤醒总线
 
@@ -326,6 +376,174 @@ var (
     ErrRunnerStarted        // Runner.Start 后再订阅
     ErrNotClaimSubscription // 广播订阅传入认领专属选项
     ErrIdentityMissing      // 认领订阅未设置身份（订阅级与 Runner 默认皆缺）
+    ErrEmptyEventID         // WithEventID 传入空串（不回退到 IDGenerator）
+
+    // ---- 迁移（ADR 0007） ----
+    ErrMigrateModeUnsupported    // WithMigrateMode 显式传给 Migrate（该选项只对 NewDriver 有意义）
+    ErrMigrationUnsupported      // 锁能力为无（LockNone）时 Create 不支持自动迁移（只能 Verify/None）
+    ErrMigrationLockTimeout      // 等待迁移锁超时，属瞬时错误（退避后重试）
+    ErrMigrationPermissionDenied // DDL 权限不足，属永久配置错误
+    ErrInvalidSchema             // schema 名非法（只允许 ^[A-Za-z_][A-Za-z0-9_]*$）
+)
+
+// IsPermanentMigrationError 报告迁移失败是否属永久配置错误：*VerifyError、
+// ErrMigrationUnsupported、ErrMigrateModeUnsupported、
+// ErrMigrationPermissionDenied、ErrInvalidSchema 为 true；瞬时错误
+// （数据库不可用、锁等待超时）为 false。永久错误应 fail-fast，不进入重试窗口。
+func IsPermanentMigrationError(err error) bool
+```
+
+### 2.8 迁移契约
+
+迁移模式定义在 core；`WithMigrateMode` 选项函数由各后端提供（`Option` 是
+后端私有类型，避免枚举在多个后端重复定义）。P0 只有三种模式；P1 计划新增
+`Upgrade` 模式（届时补 `MigrateUpgrade` 常量，见 ADR 0007）。
+
+```go
+// MigrateMode 运行面（Driver 构造期）迁移模式；只对 NewDriver 有意义。
+type MigrateMode int
+
+const (
+    MigrateCreate MigrateMode = iota // 缺省：首次操作时持迁移锁执行基线
+    MigrateVerify                    // 只读校验，不执行 DDL
+    MigrateNone                      // 不建表也不校验
+)
+
+func (m MigrateMode) String() string // "create" / "verify" / "none"
+```
+
+对象与校验报告：
+
+```go
+type ObjectKind string
+
+const (
+    KindSchema     ObjectKind = "schema"
+    KindTable      ObjectKind = "table"
+    KindColumn     ObjectKind = "column"
+    KindIndex      ObjectKind = "index"
+    KindConstraint ObjectKind = "constraint"
+)
+
+type VerifyProblem string
+
+const (
+    ProblemMissing  VerifyProblem = "missing"  // 对象缺失（基线可补齐）
+    ProblemOutdated VerifyProblem = "outdated" // 定义与基线不一致（不自动修复）
+    ProblemTooNew   VerifyProblem = "too_new"  // P1 预留：库内版本高于二进制要求
+    ProblemFailed   VerifyProblem = "failed"   // P1 预留：版本处于 failed 状态
+)
+
+type VerifyIssue struct {
+    Object  string // 稳定标识，如 "public"、"public.event"、"public.event.id"
+    Kind    ObjectKind
+    Problem VerifyProblem
+    Action  string // 处置说明；契约测试只断言字段，不断言文本
+}
+
+type VerifyReport struct {
+    Issues []VerifyIssue // 为空表示与基线一致
+}
+
+func (r VerifyReport) OK() bool
+
+// VerifyError 在 Verify 发现问题时返回，携带结构化报告；
+// errors.As 可取回 *VerifyError 后读取 Report。
+type VerifyError struct {
+    Report VerifyReport
+}
+
+func (e *VerifyError) Error() string
+```
+
+能力声明（供契约测试与文档判定；P1 执行器按声明选择路径）：
+
+```go
+type DDLAtomicity int
+
+const (
+    DDLAtomicNone          DDLAtomicity = iota // 无 DDL 原子性：不支持自动迁移
+    DDLAtomicSingle                            // 仅单语句原子
+    DDLAtomicTransactional                     // 跨语句事务
+)
+
+type NativeSupport int
+
+const (
+    SupportNone     NativeSupport = iota // 无原生 IF NOT EXISTS
+    SupportWarnOnly                      // 接受语法但告警/有限支持
+    SupportNative                        // 原生支持
+)
+
+type ProbeSupport int
+
+const (
+    ProbeNone       ProbeSupport = iota // 不可探测
+    ProbeExistence                      // 只能探测存在性
+    ProbeDefinition                     // 可探测存在性并比对定义
+)
+
+type LockPrimitive int
+
+const (
+    LockNone        LockPrimitive = iota // 无锁：Create（及 P1 Upgrade）不支持自动迁移
+    LockRowLease                         // 锁行租约（TTL、续约、过期回收）
+    LockSession                          // 原生会话锁（固定连接、断连释放）
+    LockTransaction                      // 事务级锁（随提交/回滚释放）
+)
+
+type LockRelease int
+
+const (
+    LockReleaseTransaction LockRelease = iota // 提交/回滚自动释放（零值）
+    LockReleaseSession                        // 会话断连释放
+    LockReleaseLease                          // 租约到期
+)
+
+type DDLCompletion int
+
+const (
+    DDLSync  DDLCompletion = iota // DDL 返回即完成
+    DDLAsync                      // DDL 可能返回异步 job
+)
+
+type ErrorClasses struct {
+    Exists     bool // 对象已存在/重复定义
+    Permission bool // 权限不足
+    Transient  bool // 瞬时错误（可退避重试）
+}
+
+type MigrationCapabilities struct {
+    Atomicity             DDLAtomicity
+    IfNotExists           map[ObjectKind]NativeSupport // 按对象类型的原生 IF NOT EXISTS 覆盖
+    Probe                 map[ObjectKind]ProbeSupport  // 按对象类型的探测能力
+    Errors                ErrorClasses
+    Lock                  LockPrimitive
+    LockRelease           LockRelease
+    Completion            DDLCompletion
+    ImplicitCommit        bool // DDL 是否隐式提交（放进事务也无法整体回滚）
+    NonTransactionalSteps bool // 计划可声明必须在事务外执行的步骤（如并发建索引）
+}
+```
+
+执行路径与故障点：P0 已定义，并被迁移契约测试（`simmigrate` 的
+`ForcePath`/`InjectFault`）使用；P1 状态机复用。
+
+```go
+type MigrationPath int
+
+const (
+    MigrationPathFast MigrationPath = iota // 单事务：锁、基线、P1 版本 DDL 与台账同事务
+    MigrationPathStep                      // 逐步探测/执行（无跨语句事务或含不可事务化步骤）
+)
+
+type FaultPoint string
+
+const (
+    FaultAfterLock    FaultPoint = "after_lock"
+    FaultBeforeStep   FaultPoint = "before_step"
+    FaultAfterStep    FaultPoint = "after_step"
+    FaultBeforeCommit FaultPoint = "before_commit"
 )
 ```
 
@@ -333,27 +551,58 @@ var (
 
 两个 Postgres 后端共享同一套能力与选项语义，仅连接载体不同：`postgrec`
 基于标准库 `database/sql`（`*sql.DB`），`pgxc` 基于 pgx v5 连接池
-（`*pgxpool.Pool`）；选项与 `Migrate` 在各自 module 内同名定义。
+（`*pgxpool.Pool`）；选项与迁移函数（`Migrate`/`Verify`/`Statements`/
+`SQL`/`Capabilities`）在各自 module 内同名定义。
 
 ```go
 package postgrec // github.com/jninng/go_event/postgrec（标准库 database/sql）
 
-// NewDriver 基于 *sql.DB 构造 event.Driver。
+// NewDriver 基于 *sql.DB 构造 event.Driver。缺省迁移模式 Create：首次操作
+// 时持迁移锁执行基线。WithMigrateMode 只对本构造函数生效。
 func NewDriver(db *sql.DB, opts ...Option) event.Driver
 
-// Migrate 幂等 DDL：创建 event / event_claim 两表与唯一约束
-// （event(type,id)、event_claim(event_id,consumer_type)）。
+// Migrate 执行基线迁移（Create 语义）：单事务内取迁移锁、做基线接管校验、
+// 执行幂等基线 DDL，任何一步失败整体回滚。可重复执行。需要 DDL 权限；
+// 只建基线、不升级存量表。显式传入 WithMigrateMode 返回
+// ErrMigrateModeUnsupported。
 func Migrate(ctx context.Context, db *sql.DB, opts ...Option) error
+
+// Verify 只读校验：不执行 DDL，比对 schema/表/列/主键/唯一/索引/外键是否
+// 与基线一致。发现问题时返回报告与 *event.VerifyError；查询本身失败时
+// 返回错误。只依赖表已由部署流程创建，运行账号可只授 DML（另需系统目录读）。
+func Verify(ctx context.Context, db *sql.DB, opts ...Option) (event.VerifyReport, error)
+
+// Statements 返回基线语句（不含迁移锁），按执行顺序排列。
+func Statements(opts ...Option) ([]string, error)
+
+// SQL 返回手工脚本：以 BEGIN 开始，随后设 lock_timeout 并取迁移锁（锁键
+// 含 schema，锁语句位于全部基线 DDL 之前），末尾 COMMIT；整段须在同一事务执行。
+func SQL(opts ...Option) (string, error)
+
+// Capabilities 返回本后端的迁移能力声明（供契约测试与能力矩阵读取）。
+func Capabilities() event.MigrationCapabilities
 ```
 
 ```go
 package pgxc // github.com/jninng/go_event/pgxc（pgx v5）
 
-// NewDriver 基于 pgx v5 连接池构造 event.Driver。
+// NewDriver 基于 pgx v5 连接池构造 event.Driver。迁移模式语义与 postgrec
+// 相同（缺省 Create）；WithMigrateMode 只对本构造函数生效。
 func NewDriver(pool *pgxpool.Pool, opts ...Option) event.Driver
 
-// Migrate 幂等 DDL：与 postgrec.Migrate 相同的两表与唯一约束。
+// Migrate 执行基线迁移（Create 语义），与 postgrec.Migrate 相同的两表、
+// 约束、索引与失败回滚语义。
 func Migrate(ctx context.Context, pool *pgxpool.Pool, opts ...Option) error
+
+// Verify 只读校验，语义与 postgrec.Verify 相同。
+func Verify(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (event.VerifyReport, error)
+
+// Statements / SQL 语义与 postgrec 相同。
+func Statements(opts ...Option) ([]string, error)
+func SQL(opts ...Option) (string, error)
+
+// Capabilities 返回本后端的迁移能力声明。
+func Capabilities() event.MigrationCapabilities
 ```
 
 两 module 各自提供的同名选项：
@@ -367,7 +616,32 @@ func WithSchema(s string) Option
 // 配置为覆盖最坏重试路径：约 重试上限 × (最大退避 + 最大处理时长)，
 // 另留心跳间隔与时钟偏差余量。
 func WithRetention(d time.Duration) Option
+
+// WithMigrateMode 设置运行面迁移模式（缺省 Create）：Create 首次操作时
+// 执行基线；Verify 只读校验、不执行 DDL；None 不建表也不校验。该选项只对
+// NewDriver 有意义，显式传给 Migrate 返回 ErrMigrateModeUnsupported。
+func WithMigrateMode(m event.MigrateMode) Option
 ```
+
+迁移相关语义：
+
+- 两个后端共享 `postgresschema` 方言包中的结构化步骤与期望对象（单一事实
+  源），各自只做连接适配。
+- `Migrate` 即 `Create` 语义：以调用方连接执行 DDL，需要 DDL 权限；运行账号
+  只授 DML 时不能自动迁移，应在部署期建表、运行期用 `Verify` 或 `None`。
+  锁能力为无（`LockNone`）时 `Create` 返回 `ErrMigrationUnsupported`；DDL
+  原子性为无（`DDLAtomicNone`）时 `Create` 同样返回
+  `ErrMigrationUnsupported`（P0 无此档后端，P1 执行器按声明返回）。
+- `Verify` 的 P0 问题类别为 `missing` / `outdated`；`too_new` / `failed` 为
+  P1 版本台账预留。`missing` 可由基线补齐，`outdated` 不自动修复。
+- `Statements` 不含锁；`SQL` 以 `BEGIN` 开始，随后设 `lock_timeout` 并取
+  迁移锁（锁语句位于全部基线 DDL 之前），末尾 `COMMIT`。导出只覆盖当前基线，
+  列/索引变更必须走版本化迁移。
+- 两个 Postgres 后端的能力声明均为：跨语句事务、schema/table/column/index
+  原生 `IF NOT EXISTS`（constraint 无原生语法，用探测 + DO 块）、schema 仅
+  存在性探测而表/列/索引/约束为存在性 + 定义探测、错误分类全支持、事务级
+  advisory 锁、提交/回滚释放、同步完成、可声明事务外步骤、不隐式提交
+  （矩阵见 design.md §8）。
 
 两者均须通过 eventtest 全套契约测试并各自给出能力边界表（ADR 0005）；
 pgxc 可原生实现 P1 的 LISTEN/NOTIFY 推送唤醒，postgrec 退化回轮询。
@@ -385,6 +659,115 @@ func RunSuite(t *testing.T, d event.Driver)
 // newDriver 须为每个用例返回配置了保留窗口（≤ 2s，推荐 2s）的
 // 全新 Driver 实例（清理簿记按 Driver 实例记忆，共享实例会被节流跳过）。
 func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver)
+
+// RunMigrationSuite 运行迁移契约测试。suite 本身不读环境变量；门控
+// （如 TEST_POSTGRES_DSN）在具体后端的测试内完成。
+func RunMigrationSuite(t *testing.T, b MigrationBackend)
+
+// ErrUnsupportedByBackend 表示后端不支持某项可选能力（强制路径 / 故障注入）。
+var ErrUnsupportedByBackend = errors.New("eventtest: backend does not support")
+
+// MigrationScene 是迁移契约测试的场景。
+type MigrationScene int
+
+const (
+    MigrationSceneEmpty    MigrationScene = iota // 空库（无 schema、无表）
+    MigrationSceneComplete                       // 完整基线（对象集合与定义全部一致）
+    MigrationScenePartial                        // 部分存量：已有对象定义一致，仅缺对象
+    MigrationSceneConflict                       // 已有对象定义冲突（不自动修复）
+)
+
+func (s MigrationScene) String() string // "empty" / "complete" / "partial" / "conflict"
+
+// MigrationBackend 是迁移契约测试的后端适配接口，由各后端测试提供实现。
+// 每个子测试都会获得独立环境：先 Reset 清空，再 Prepare 构造场景，
+// 结束时 Cleanup 释放资源。
+type MigrationBackend interface {
+    NewDriver(t *testing.T, mode event.MigrateMode) event.Driver
+    Migrate(ctx context.Context) error
+    Verify(ctx context.Context) (event.VerifyReport, error)
+    Statements() ([]string, error) // 基线语句，不含迁移锁与账号授权
+    SQL() (string, error)          // 手工脚本：BEGIN 后设 lock_timeout 并取迁移锁
+    Capabilities() event.MigrationCapabilities
+    Prepare(t *testing.T, scene MigrationScene)
+    Reset(t *testing.T)
+    // ForcePath 强制执行路径；不支持时返回 ErrUnsupportedByBackend。
+    ForcePath(path event.MigrationPath) error
+    // InjectFault 在指定边界注入错误（err 为 nil 表示清除）；
+    // 不支持时返回 ErrUnsupportedByBackend。
+    InjectFault(point event.FaultPoint, err error) error
+    Cleanup(t *testing.T)
+}
+```
+
+可选观察接口（真实后端通常不实现，模拟 backend 实现；suite 用类型断言探测）：
+
+```go
+// ProbeObserver 统计 step 路径的对象探测次数，用于断言 fast 路径不逐对象探测。
+type ProbeObserver interface {
+    ProbeCount() int
+    ResetProbeCount()
+}
+
+// ApplyObserver 统计每个对象被成功应用的次数（按限定标识）。
+type ApplyObserver interface {
+    ApplyCount(object string) int
+    ResetApplyCounts()
+}
+
+// FaultObserver 报告本次 Migrate 已尝试的步骤数（失败或回滚后仍保留）。
+type FaultObserver interface {
+    AttemptedSteps() int
+    ResetAttempts()
+}
+
+// LockObserver 统计迁移锁争用次数；配合 EntryHooker 才能稳定观察到争用。
+type LockObserver interface {
+    LockContentions() int
+    ResetLockStats()
+}
+
+// EntryHooker 在 Migrate 入口安装钩子，让并发用例确定性地观察锁争用。
+type EntryHooker interface {
+    SetEntryHook(func())
+}
+
+// LockNoneProvider 返回一个声明锁能力为无（LockNone）的等价 backend，
+// 用于验证该能力面不支持自动迁移。
+type LockNoneProvider interface {
+    LockNoneBackend(t *testing.T) MigrationBackend
+}
+
+// ObjectDescriber 返回基线期望对象的限定名列表。
+type ObjectDescriber interface {
+    ExpectedObjects() []string
+}
+
+// RelationChecker 报告限定标识对应的关系是否存在。
+type RelationChecker interface {
+    RelationExists(object string) bool
+}
+
+// SchemaNamer 返回 backend 当前使用的 schema 名。
+type SchemaNamer interface {
+    Schema() string
+}
+
+// SchemaExporter 按显式 schema 导出语句，供非法 schema 用例使用。
+type SchemaExporter interface {
+    StatementsForSchema(schema string) ([]string, error)
+    SQLForSchema(schema string) (string, error)
+}
+```
+
+```go
+package simmigrate // github.com/jninng/go_event/eventtest/simmigrate
+
+// New 构造进程内模拟 backend：用内存 catalog 模拟 Postgres 的
+// schema/表/列/约束/索引，始终运行；实现 MigrationBackend，支持
+// ForcePath(fast|step) 与全部 FaultPoint 注入。步骤与期望对象直接消费
+// postgresschema，不复制 DDL 文本。
+func New() *Backend
 ```
 
 ```go
@@ -393,6 +776,16 @@ package inmem // github.com/jninng/go_event/eventtest/inmem
 // New 构造进程内 Driver：供契约测试与使用方本地测试/示例使用。
 // 条件过滤在内存模拟，能力边界表注明「模拟」档（ADR 0005）。
 func New(opts ...Option) event.Driver
+
+// Capabilities 返回零值能力声明：无持久结构，迁移为 no-op（无 DDL
+// 原子性、无锁、无探测、无错误分类）。
+func Capabilities() event.MigrationCapabilities
+
+// Migrate 是 no-op：不产生任何 DDL，恒返回 nil。
+func Migrate(context.Context) error
+
+// Verify 是 no-op：恒报告 OK 且无错误。
+func Verify(context.Context) (event.VerifyReport, error)
 ```
 
 ## 5. 使用示例
@@ -422,6 +815,8 @@ func main() {
     ctx := context.Background()
 
     pool, _ := pgxpool.New(ctx, dsn)
+    // 部署/启动期用高权限连接执行；运行账号仅 DML 时改用
+    // pgxc.WithMigrateMode(event.MigrateVerify) 或 event.MigrateNone。
     _ = pgxc.Migrate(ctx, pool)
     drv := pgxc.NewDriver(pool, pgxc.WithRetention(7*24*time.Hour))
     // 标准库环境改用 postgrec：
@@ -569,4 +964,7 @@ func TestVectorizeFlow(t *testing.T) {
 | 消费者身份构造默认 + 订阅覆盖（§5.1）             | `WithIdentity` + `WithConsumerType`，皆缺返回 `ErrIdentityMissing`                |
 | 订阅启动前注册完毕（§5）                      | 订阅入口在 Start 后返回 `ErrRunnerStarted`                                           |
 | 构造器显式注入、无包级状态（§4）                  | 全部 `NewX(依赖, opts...)`；`Event[T]` 为无状态声明值                                    |
+| 持久结构初始化按模式（§8、ADR 0007）             | `MigrateMode` + 后端 `WithMigrateMode`/`Migrate`/`Verify`；缺省 Create                     |
+| 迁移能力声明用于契约测试与文档判定（§8、ADR 0007） | `MigrationCapabilities` + `MigrationPath` + `Capabilities()`                          |
+| 校验报告结构化、错误可 `errors.As`（§8）          | `VerifyReport`/`VerifyIssue`/`VerifyProblem` + `*VerifyError`                        |
 | 保留窗口惰性清理（§5.2、ADR 0006）            | `pgxc.WithRetention` / `postgrec.WithRetention`                              |

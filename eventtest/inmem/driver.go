@@ -84,6 +84,10 @@ func (d *Driver) Append(_ context.Context, e event.RawEnvelope) error {
 	d.position++
 	ev := e
 	ev.Position = strconv.FormatUint(d.position, 10)
+	// 运行时注入字段不落库：Append 输入侧忽略（RawEnvelope 注释），
+	// 保证 Fetch 返回零值、不被后端依赖。
+	ev.Attempts = 0
+	ev.LastAttempt = false
 	d.events[e.ID] = &storedEvent{env: ev, position: d.position}
 	d.cleanupLocked(time.Now())
 	return nil

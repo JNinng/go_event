@@ -8,9 +8,13 @@ import (
 // Driver 单次原子操作（design.md §4、ADR 0004）：全部编排逻辑在 core 的
 // Runner 完成。所有方法语义由 eventtest 契约测试约束。
 //
-// 错误约定（docs/api.md §2.4）：Driver 不返回哨兵错误；错误一律视为该次
-// 操作失败，core 记日志重试或跳过。Complete/Fail/Heartbeat 的 CAS 不命中
-// （租约过期、已被接管）返回 nil 而非错误——「不生效」是接管场景的正常结果。
+// 错误约定（docs/api.md §2.4）：除迁移相关错误（ErrMigrationLockTimeout、
+// ErrMigrationPermissionDenied、ErrMigrationUnsupported、ErrMigrateModeUnsupported、
+// ErrInvalidSchema 等）外，Driver 不返回哨兵错误；其余错误一律视为该次操作
+// 失败，core 记日志重试或跳过。迁移错误在操作入口返回，调用方应按错误性质
+// 修正配置、退避重试或改用 Verify/None。Complete/Fail/Heartbeat 的 CAS
+// 不命中（租约过期、已被接管）返回 nil 而非错误——「不生效」是接管场景的
+// 正常结果。
 type Driver interface {
 	// Append 幂等：重复 Append 同 ID 视为成功（首写为准，不覆盖既有行、
 	// 不触发重投，不校验 payload 一致性）。

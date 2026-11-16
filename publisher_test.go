@@ -63,6 +63,57 @@ func TestInjectedIDGenerator_Publish_UsesInjected(t *testing.T) {
 	}
 }
 
+// 显式 ID 优先于 IDGenerator：WithEventID 的值原样落库，生成器完全不被
+// 调用（docs/api.md §2.3）。
+func TestWithEventID_Publish_OverridesGenerator(t *testing.T) {
+	d := newStubDriver()
+	pub := event.NewPublisher(d, event.WithIDGenerator(func() string {
+		t.Fatal("explicit ID must not call the generator")
+		return ""
+	}))
+	ev := event.Declare[pubPayload]("unit.explicit")
+
+	if err := ev.Publish(context.Background(), pub, pubPayload{"x"},
+		event.WithEventID("explicit-id")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	appends := d.appended()
+	if len(appends) != 1 || appends[0].ID != "explicit-id" {
+		t.Fatalf("explicit event ID must override generator, got %+v", appends)
+	}
+}
+
+// 显式空串 ID 非法：Publish 返回 ErrEmptyEventID，不落库、不回退生成器。
+func TestEmptyEventID_Publish_ReturnsErrEmptyEventIDNoAppend(t *testing.T) {
+	d := newStubDriver()
+	pub := event.NewPublisher(d, event.WithIDGenerator(func() string { return "gen-id" }))
+	ev := event.Declare[pubPayload]("unit.emptyid")
+
+	err := ev.Publish(context.Background(), pub, pubPayload{"x"},
+		event.WithEventID(""))
+	if !errors.Is(err, event.ErrEmptyEventID) {
+		t.Fatalf("empty explicit ID must return ErrEmptyEventID, got %v", err)
+	}
+	if appends := d.appended(); len(appends) != 0 {
+		t.Fatalf("rejected publish must not append, got %+v", appends)
+	}
+}
+
+// 未设置 WithEventID 时仍走注入的生成器（缺省行为回归）。
+func TestWithoutEventID_Publish_UsesGenerator(t *testing.T) {
+	d := newStubDriver()
+	pub := event.NewPublisher(d, event.WithIDGenerator(func() string { return "gen-id" }))
+	ev := event.Declare[pubPayload]("unit.noid")
+
+	if err := ev.Publish(context.Background(), pub, pubPayload{"x"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	appends := d.appended()
+	if len(appends) != 1 || appends[0].ID != "gen-id" {
+		t.Fatalf("publish without WithEventID must use generator, got %+v", appends)
+	}
+}
+
 // WithPublisherCodec 注入的 codec 替代缺省 JSON（design.md §6）。
 func TestInjectedCodec_Publish_EncodesWithInjected(t *testing.T) {
 	d := newStubDriver()

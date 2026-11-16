@@ -73,6 +73,21 @@ type PublishOption func(*publishConfig)
 
 type publishConfig struct {
 	metadata map[string]string
+	// eventID 为 nil 表示未显式指定（回退到 Publisher 的 IDGenerator）；
+	// 非 nil 即显式指定，其值为空串时非法。nil 与指向空串必须可区分，
+	// 不能以字符串零值判断「是否设置」。
+	eventID *string
+}
+
+// WithEventID 显式指定事件 ID，优先于 IDGenerator；空串非法，
+// Publish 返回 ErrEmptyEventID（不静默回退到生成器）。
+//
+// ID 是事件主键、全局唯一，Append 以其为唯一冲突目标（首写为准）。
+// 业务键必须按类型加前缀（或与类型绑定）后才能当 ID 用：跨事件类型
+// 复用同一 ID 不报错，而是静默视为同一事件、丢弃第二个 payload
+// （docs/api.md §2.3）。
+func WithEventID(id string) PublishOption {
+	return func(c *publishConfig) { c.eventID = &id }
 }
 
 // WithMetadata 合并进缺省元数据（如 trace_id，design.md §4）。
@@ -88,6 +103,7 @@ func WithMetadata(meta map[string]string) PublishOption {
 }
 
 // Publish 发布实现：ID 与 OccurredAt 缺省自动填充（design.md §6）。
+// 显式 WithEventID 优先于 IDGenerator；空串返回 ErrEmptyEventID。
 // 事件侧糖 Event[T].Publish 委托到此。
 //
 // Go 方法不支持类型参数，故为包级泛型函数而非 Publisher 方法。
@@ -97,12 +113,21 @@ func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	id := ""
+	if cfg.eventID != nil {
+		if *cfg.eventID == "" {
+			return ErrEmptyEventID
+		}
+		id = *cfg.eventID
+	} else {
+		id = p.idgen()
+	}
 	encoded, err := p.codec.Encode(payload)
 	if err != nil {
 		return err
 	}
 	raw := RawEnvelope{
-		ID:         p.idgen(),
+		ID:         id,
 		Type:       ev.Name,
 		Payload:    encoded,
 		Metadata:   cfg.metadata,

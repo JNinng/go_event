@@ -19,9 +19,9 @@ type stubDriver struct {
 	events   map[string]event.RawEnvelope
 	position uint64
 
-	headFail  error        // HeadPosition 注入错误
-	fetchErrs int          // Fetch 剩余注入错误次数
-	appendErr error        // Append 注入错误
+	headFail  error // HeadPosition 注入错误
+	fetchErrs int   // Fetch 剩余注入错误次数
+	appendErr error // Append 注入错误
 	appends   []event.RawEnvelope
 }
 

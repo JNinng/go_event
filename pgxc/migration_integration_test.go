@@ -1,0 +1,1020 @@
+package pgxc_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jninng/go_event"
+
+	"github.com/jninng/go_event/pgxc"
+	"github.com/jninng/go_event/postgresschema"
+)
+
+// 迁移集成测试需真实 Postgres：设置 TEST_POSTGRES_DSN 启用，未设置时跳过。
+func migrationPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN not set; skip Postgres migration integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Fatalf("ping db: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// newMigrationSchema 返回独立 schema 名并注册清理（隔离性）。
+func newMigrationSchema(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	schema := fmt.Sprintf("go_event_mig_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+	})
+	return schema
+}
+
+func provisionBaseline(t *testing.T, pool *pgxpool.Pool, schema string) {
+	t.Helper()
+	stmts, err := pgxc.Statements(pgxc.WithSchema(schema))
+	if err != nil {
+		t.Fatalf("statements: %v", err)
+	}
+	ctx := context.Background()
+	for i, stmt := range stmts {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("provision statement %d: %v\n%s", i, err, stmt)
+		}
+	}
+}
+
+func relationExists(t *testing.T, pool *pgxpool.Pool, schema, name string) bool {
+	t.Helper()
+	var reg *string
+	if err := pool.QueryRow(context.Background(),
+		"SELECT to_regclass($1)::text", schema+"."+name).Scan(&reg); err != nil {
+		t.Fatalf("to_regclass(%s.%s): %v", schema, name, err)
+	}
+	return reg != nil && *reg != ""
+}
+
+func schemaExists(t *testing.T, pool *pgxpool.Pool, schema string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(),
+		"SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", schema).Scan(&exists); err != nil {
+		t.Fatalf("schema existence: %v", err)
+	}
+	return exists
+}
+
+func appendEvent(t *testing.T, drv event.Driver, typ, id string) {
+	t.Helper()
+	err := drv.Append(context.Background(), event.RawEnvelope{
+		ID:         id,
+		Type:       typ,
+		Payload:    []byte(`{}`),
+		OccurredAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("append %s: %v", id, err)
+	}
+}
+
+// exerciseDML 跑一轮完整 DML：Append/Fetch/Claim/Heartbeat/Complete/Fail。
+func exerciseDML(t *testing.T, drv event.Driver, typ, prefix string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+
+	appendEvent(t, drv, typ, prefix+"-1")
+	envs, err := drv.Fetch(ctx, event.FetchQuery{Type: typ, Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(envs) == 0 {
+		t.Fatal("fetch returned no events")
+	}
+
+	leases, err := drv.Claim(ctx, event.ClaimQuery{
+		Type: typ, ConsumerType: prefix + "-c1",
+		Lease: time.Minute, Limit: 10, RetryLimit: 3, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("claim leases = %d, want 1", len(leases))
+	}
+	lease := leases[0]
+	if err := drv.Heartbeat(ctx, event.HeartbeatRequest{
+		EventID: lease.Envelope.ID, ConsumerType: lease.ConsumerType,
+		LeaseToken: lease.LeaseToken, Extend: time.Minute, Now: now,
+	}); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if err := drv.Complete(ctx, event.CompleteRequest{
+		EventID: lease.Envelope.ID, ConsumerType: lease.ConsumerType,
+		LeaseToken: lease.LeaseToken, Now: now,
+	}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	appendEvent(t, drv, typ, prefix+"-2")
+	leases, err = drv.Claim(ctx, event.ClaimQuery{
+		Type: typ, ConsumerType: prefix + "-c2",
+		Lease: time.Minute, Limit: 10, RetryLimit: 1, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("claim second: %v", err)
+	}
+	if len(leases) == 0 {
+		t.Fatal("second claim returned no leases")
+	}
+	if err := drv.Fail(ctx, event.FailRequest{
+		EventID: leases[0].Envelope.ID, ConsumerType: leases[0].ConsumerType,
+		LeaseToken: leases[0].LeaseToken, RetryLimit: 1,
+		Backoff: event.LinearBackoff(time.Second, time.Second), Now: now,
+	}); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+}
+
+// requireIssue 断言报告包含指定对象的问题，并校验 Kind/Problem/Action。
+func requireIssue(t *testing.T, report event.VerifyReport, object string,
+	kind event.ObjectKind, problem event.VerifyProblem) {
+	t.Helper()
+	for _, issue := range report.Issues {
+		if issue.Object != object {
+			continue
+		}
+		if issue.Kind != kind {
+			t.Fatalf("issue %s kind = %q, want %q", object, issue.Kind, kind)
+		}
+		if issue.Problem != problem {
+			t.Fatalf("issue %s problem = %q, want %q", object, issue.Problem, problem)
+		}
+		if issue.Action == "" {
+			t.Fatalf("issue %s action is empty", object)
+		}
+		return
+	}
+	t.Fatalf("issue %s not found in %+v", object, report.Issues)
+}
+
+func TestCreateOnEmptyDatabase(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("FreshSchema_Migrate_ConvergesAndVerifies", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if !report.OK() {
+			t.Fatalf("verify issues: %+v", report.Issues)
+		}
+	})
+	t.Run("FreshSchema_Migrate_CreatesBothTables", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		if !relationExists(t, pool, schema, "event") {
+			t.Fatal("event table missing after migrate")
+		}
+		if !relationExists(t, pool, schema, "event_claim") {
+			t.Fatal("event_claim table missing after migrate")
+		}
+	})
+	t.Run("FreshSchema_CreateDriver_AppendSucceeds", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema))
+		appendEvent(t, drv, "test.migration", "empty-pool-1")
+	})
+}
+
+func TestMigrateIdempotentOnCompleteBaseline(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("CompleteBaseline_Migrate_NoError", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate over complete baseline: %v", err)
+		}
+	})
+	t.Run("CompleteBaseline_MigrateTwice_Idempotent", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 1: %v", err)
+		}
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 2: %v", err)
+		}
+	})
+	t.Run("CompleteBaseline_Verify_ReportsNoIssues", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if !report.OK() {
+			t.Fatalf("verify issues: %+v", report.Issues)
+		}
+	})
+}
+
+func TestMigrateFillsPartialBaseline(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("PartialBaseline_Migrate_FillsMissingObjects", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		// 只建 schema 与 event 表（含其约束），模拟部分存量基线。
+		stmts, err := pgxc.Statements(pgxc.WithSchema(schema))
+		if err != nil {
+			t.Fatalf("statements: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := pool.Exec(ctx, stmts[i]); err != nil {
+				t.Fatalf("provision statement %d: %v", i, err)
+			}
+		}
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate over partial baseline: %v", err)
+		}
+		if !relationExists(t, pool, schema, "event_claim") {
+			t.Fatal("event_claim table not filled")
+		}
+	})
+	t.Run("PartialBaseline_Verify_ReportsNoIssues", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		stmts, err := pgxc.Statements(pgxc.WithSchema(schema))
+		if err != nil {
+			t.Fatalf("statements: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := pool.Exec(ctx, stmts[i]); err != nil {
+				t.Fatalf("provision statement %d: %v", i, err)
+			}
+		}
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if !report.OK() {
+			t.Fatalf("verify issues: %+v", report.Issues)
+		}
+	})
+}
+
+func TestMigrateRepairsMissingConstraints(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("MissingConstraints_Migrate_ReAddsAndConverges", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		// 依赖顺序：先 FK，再 PK，最后 UNIQUE。
+		for _, stmt := range []string{
+			fmt.Sprintf(`ALTER TABLE %s.event_claim DROP CONSTRAINT event_claim_event_id_fkey`, schema),
+			fmt.Sprintf(`ALTER TABLE %s.event_claim DROP CONSTRAINT event_claim_pk`, schema),
+			fmt.Sprintf(`ALTER TABLE %s.event DROP CONSTRAINT event_pk`, schema),
+			fmt.Sprintf(`ALTER TABLE %s.event DROP CONSTRAINT event_type_id_uniq`, schema),
+		} {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				t.Fatalf("drop constraint: %v\n%s", err, stmt)
+			}
+		}
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate after dropping constraints: %v", err)
+		}
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if !report.OK() {
+			t.Fatalf("verify issues after repair: %+v", report.Issues)
+		}
+	})
+}
+
+func TestMigrateDefinitionConflict(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	conflicting := func(t *testing.T) string {
+		t.Helper()
+		schema := newMigrationSchema(t, pool)
+		if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+			t.Fatalf("create schema: %v", err)
+		}
+		// payload 类型与基线（bytea）冲突。
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE %s.event (
+	id          text        NOT NULL,
+	type        text        NOT NULL,
+	payload     text        NOT NULL,
+	metadata    jsonb       NOT NULL DEFAULT '{}'::jsonb,
+	occurred_at timestamptz NOT NULL,
+	position    bigserial   NOT NULL,
+	CONSTRAINT event_pk PRIMARY KEY (id)
+)`, schema)); err != nil {
+			t.Fatalf("create conflicting table: %v", err)
+		}
+		return schema
+	}
+
+	t.Run("ConflictingColumn_Migrate_ReturnsVerifyError", func(t *testing.T) {
+		schema := conflicting(t)
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+	})
+	t.Run("ConflictingColumn_Migrate_ReportsOutdatedPayload", func(t *testing.T) {
+		schema := conflicting(t)
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		requireIssue(t, verifyErr.Report, schema+".event.payload",
+			event.KindColumn, event.ProblemOutdated)
+	})
+	t.Run("ConflictingColumn_Migrate_DoesNotCreateMissingTable", func(t *testing.T) {
+		schema := conflicting(t)
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		if relationExists(t, pool, schema, "event_claim") {
+			t.Fatal("event_claim must not be created when definitions conflict")
+		}
+	})
+	t.Run("ConflictingColumn_Migrate_DoesNotAlterExistingTable", func(t *testing.T) {
+		schema := conflicting(t)
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		var dataType string
+		if err := pool.QueryRow(ctx, `
+SELECT data_type FROM information_schema.columns
+WHERE table_schema = $1 AND table_name = 'event' AND column_name = 'payload'`,
+			schema).Scan(&dataType); err != nil {
+			t.Fatalf("read payload type: %v", err)
+		}
+		if dataType != "text" {
+			t.Fatalf("payload type = %q, want untouched text", dataType)
+		}
+	})
+}
+
+func TestMigrateConstraintAndIndexConflicts(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("UniqueColumnsConflict_Migrate_RejectedAsOutdated", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		for _, stmt := range []string{
+			fmt.Sprintf(`ALTER TABLE %s.event DROP CONSTRAINT event_type_id_uniq`, schema),
+			fmt.Sprintf(`ALTER TABLE %s.event ADD CONSTRAINT event_type_id_uniq UNIQUE (type)`, schema),
+		} {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				t.Fatalf("prepare unique conflict: %v\n%s", err, stmt)
+			}
+		}
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		requireIssue(t, verifyErr.Report, schema+".event_type_id_uniq",
+			event.KindConstraint, event.ProblemOutdated)
+	})
+	t.Run("IndexColumnsConflict_Migrate_RejectedAsOutdated", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		for _, stmt := range []string{
+			fmt.Sprintf(`DROP INDEX %s.event_type_position_idx`, schema),
+			fmt.Sprintf(`CREATE INDEX event_type_position_idx ON %s.event (position)`, schema),
+		} {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				t.Fatalf("prepare index conflict: %v\n%s", err, stmt)
+			}
+		}
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		requireIssue(t, verifyErr.Report, schema+".event_type_position_idx",
+			event.KindIndex, event.ProblemOutdated)
+	})
+	t.Run("IndexOnOtherTable_Migrate_RejectedAsOutdated", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		for _, stmt := range []string{
+			fmt.Sprintf(`DROP INDEX %s.event_type_position_idx`, schema),
+			fmt.Sprintf(`CREATE INDEX event_type_position_idx ON %s.event_claim (consumer_type)`, schema),
+		} {
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				t.Fatalf("prepare cross-table index: %v\n%s", err, stmt)
+			}
+		}
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		requireIssue(t, verifyErr.Report, schema+".event_type_position_idx",
+			event.KindIndex, event.ProblemOutdated)
+		var table string
+		if err := pool.QueryRow(ctx, `
+SELECT tablename FROM pg_indexes WHERE schemaname = $1 AND indexname = 'event_type_position_idx'`,
+			schema).Scan(&table); err != nil {
+			t.Fatalf("read conflicting index: %v", err)
+		}
+		if table != "event_claim" {
+			t.Fatalf("conflicting index table = %q, want untouched event_claim", table)
+		}
+	})
+	t.Run("MissingSequenceDefault_Migrate_RejectedAsOutdated", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		if _, err := pool.Exec(ctx,
+			fmt.Sprintf(`ALTER TABLE %s.event ALTER COLUMN position DROP DEFAULT`, schema)); err != nil {
+			t.Fatalf("drop position default: %v", err)
+		}
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify = %v, want *VerifyError", err)
+		}
+		requireIssue(t, report, schema+".event.position", event.KindColumn, event.ProblemOutdated)
+
+		err = pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError (baseline must not silently accept)", err)
+		}
+		var defaultCount int
+		if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM pg_attrdef d
+JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+JOIN pg_class c ON c.oid = a.attrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relname = 'event' AND a.attname = 'position'`,
+			schema).Scan(&defaultCount); err != nil {
+			t.Fatalf("read position default: %v", err)
+		}
+		if defaultCount != 0 {
+			t.Fatalf("position default count = %d, want 0 (not silently repaired)", defaultCount)
+		}
+	})
+}
+
+func TestVerifyMissingObjects(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	assertAllMissing := func(t *testing.T, report event.VerifyReport, schema string) {
+		t.Helper()
+		requireIssue(t, report, schema, event.KindSchema, event.ProblemMissing)
+		requireIssue(t, report, schema+".event", event.KindTable, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim", event.KindTable, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_pk", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_type_id_uniq", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim_pk", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim_event_id_fkey", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_type_position_idx", event.KindIndex, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim_eligible_idx", event.KindIndex, event.ProblemMissing)
+	}
+
+	t.Run("SchemaMissing_Verify_ReportsEveryObjectMissing", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify = %v, want *VerifyError", err)
+		}
+		assertAllMissing(t, report, schema)
+	})
+	t.Run("TablesMissing_Verify_ReportsEveryObjectMissingExceptSchema", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+			t.Fatalf("create schema: %v", err)
+		}
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify = %v, want *VerifyError", err)
+		}
+		for _, issue := range report.Issues {
+			if issue.Kind == event.KindSchema {
+				t.Fatalf("unexpected schema issue: %+v", issue)
+			}
+		}
+		requireIssue(t, report, schema+".event", event.KindTable, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim", event.KindTable, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_pk", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_type_id_uniq", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim_pk", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim_event_id_fkey", event.KindConstraint, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_type_position_idx", event.KindIndex, event.ProblemMissing)
+		requireIssue(t, report, schema+".event_claim_eligible_idx", event.KindIndex, event.ProblemMissing)
+	})
+}
+
+func TestNoneModeDoesNotMigrate(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("MissingSchema_NoneModeAppend_Fails", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema),
+			pgxc.WithMigrateMode(event.MigrateNone))
+		err := drv.Append(ctx, event.RawEnvelope{
+			ID: "none-1", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		})
+		if err == nil {
+			t.Fatal("append = nil, want error without tables")
+		}
+	})
+	t.Run("MissingSchema_NoneMode_DoesNotCreateTables", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema),
+			pgxc.WithMigrateMode(event.MigrateNone))
+		err := drv.Append(ctx, event.RawEnvelope{
+			ID: "none-2", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		})
+		if err == nil {
+			t.Fatal("append = nil, want error without tables")
+		}
+		if schemaExists(t, pool, schema) || relationExists(t, pool, schema, "event") {
+			t.Fatal("None mode must not create schema or tables")
+		}
+	})
+}
+
+// 迁移锁语义：持锁期间有界超时且不建对象；释放后成功；事务级锁随提交释放。
+func TestMigrationLockTimeoutAndRelease(t *testing.T) {
+	pool := migrationPool(t)
+	restoreTimeout := pgxc.SetLockWaitTimeoutForTest(300 * time.Millisecond)
+	defer restoreTimeout()
+	schema := newMigrationSchema(t, pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	key := "go_event:" + schema
+
+	holder, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire holder connection: %v", err)
+	}
+	if _, err := holder.Exec(ctx,
+		"SELECT pg_advisory_lock(hashtext($1))", key); err != nil {
+		holder.Release()
+		t.Fatalf("hold migration lock: %v", err)
+	}
+	unlocked := false
+	// 解锁与归还在同一清理：先解锁再 Release，避免会话锁滞留连接池。
+	t.Cleanup(func() {
+		if !unlocked {
+			_, _ = holder.Exec(context.Background(),
+				"SELECT pg_advisory_unlock(hashtext($1))", key)
+		}
+		holder.Release()
+	})
+
+	start := time.Now()
+	err = pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+	elapsed := time.Since(start)
+	if !errors.Is(err, event.ErrMigrationLockTimeout) {
+		t.Fatalf("migrate with held lock = %v, want ErrMigrationLockTimeout", err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("lock wait = %v, want bounded under 2s", elapsed)
+	}
+	if schemaExists(t, pool, schema) || relationExists(t, pool, schema, "event") {
+		t.Fatal("objects must not be created while the lock is held")
+	}
+
+	if _, err := holder.Exec(ctx,
+		"SELECT pg_advisory_unlock(hashtext($1))", key); err != nil {
+		t.Fatalf("release migration lock: %v", err)
+	}
+	unlocked = true
+
+	if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+		t.Fatalf("migrate after lock release: %v", err)
+	}
+	var acquired bool
+	if err := pool.QueryRow(ctx,
+		"SELECT pg_try_advisory_xact_lock(hashtext($1))", key).Scan(&acquired); err != nil {
+		t.Fatalf("probe transaction lock: %v", err)
+	}
+	if !acquired {
+		t.Fatal("transaction-level lock must be released on commit")
+	}
+}
+
+func TestFastMigrationRollback(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	conflictingType := func(t *testing.T) string {
+		t.Helper()
+		schema := newMigrationSchema(t, pool)
+		if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+			t.Fatalf("create schema: %v", err)
+		}
+		// 同名 enum 类型会令 CREATE TABLE ... event_claim 以重复对象失败；
+		// 此时 event 表与其索引已在同一事务内创建，必须整体回滚。
+		if _, err := pool.Exec(ctx,
+			"CREATE TYPE "+schema+".event_claim AS ENUM ('x')"); err != nil {
+			t.Fatalf("create conflicting type: %v", err)
+		}
+		return schema
+	}
+
+	t.Run("MidwayFailure_Migrate_ReturnsVerifyError", func(t *testing.T) {
+		schema := conflictingType(t)
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+	})
+	t.Run("MidwayFailure_Migrate_RollsBackCreatedTables", func(t *testing.T) {
+		schema := conflictingType(t)
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		if relationExists(t, pool, schema, "event") {
+			t.Fatal("event table must be rolled back")
+		}
+		if relationExists(t, pool, schema, "event_claim") {
+			t.Fatal("event_claim relation must not exist")
+		}
+	})
+	t.Run("MidwayFailure_Migrate_LeavesConflictingType", func(t *testing.T) {
+		schema := conflictingType(t)
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		var exists bool
+		if err := pool.QueryRow(ctx, `
+SELECT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+               WHERE n.nspname = $1 AND t.typname = 'event_claim')`, schema).Scan(&exists); err != nil {
+			t.Fatalf("read type: %v", err)
+		}
+		if !exists {
+			t.Fatal("conflicting enum type must remain untouched")
+		}
+	})
+}
+
+// 最后一步失败（注入）：此前所有步骤已执行，事务必须整体回滚。
+func TestFastMigrationLastStepRollback(t *testing.T) {
+	pool := migrationPool(t)
+	schema := newMigrationSchema(t, pool)
+	ctx := context.Background()
+	injected := errors.New("injected last-step failure")
+	restore := pgxc.SetStepHookForTest(func(step postgresschema.Step) error {
+		if step.Object == schema+".event_claim_eligible_idx" {
+			return injected
+		}
+		return nil
+	})
+	defer restore()
+
+	err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+	if !errors.Is(err, injected) {
+		t.Fatalf("migrate = %v, want injected failure", err)
+	}
+	if schemaExists(t, pool, schema) {
+		t.Fatal("schema must be rolled back on last-step failure")
+	}
+	if relationExists(t, pool, schema, "event") || relationExists(t, pool, schema, "event_claim") {
+		t.Fatal("tables must be rolled back on last-step failure")
+	}
+}
+
+func TestVerifyModeDriver(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("MissingTables_VerifyModeAppend_ReturnsVerifyError", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema),
+			pgxc.WithMigrateMode(event.MigrateVerify))
+		err := drv.Append(ctx, event.RawEnvelope{
+			ID: "verify-1", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		})
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("append = %v, want *VerifyError", err)
+		}
+		if schemaExists(t, pool, schema) {
+			t.Fatal("Verify mode must not create the schema")
+		}
+	})
+	t.Run("CompleteSchema_VerifyModeAppend_Succeeds", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionBaseline(t, pool, schema)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema),
+			pgxc.WithMigrateMode(event.MigrateVerify))
+		appendEvent(t, drv, "test.migration", "verify-2")
+	})
+}
+
+// DML-only 连接是可选集成用例：设置 TEST_DML_ONLY_DSN 时运行，否则跳过。
+func TestDMLOnlyConnection(t *testing.T) {
+	dsn := os.Getenv("TEST_DML_ONLY_DSN")
+	if dsn == "" {
+		t.Skip("TEST_DML_ONLY_DSN not set; skip DML-only connection test")
+	}
+	admin := migrationPool(t)
+	ctx := context.Background()
+	dmlPool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("new dml pool: %v", err)
+	}
+	t.Cleanup(dmlPool.Close)
+	if err := dmlPool.Ping(ctx); err != nil {
+		t.Fatalf("ping dml pool: %v", err)
+	}
+	schema := newMigrationSchema(t, admin)
+	if err := pgxc.Migrate(ctx, admin, pgxc.WithSchema(schema)); err != nil {
+		t.Fatalf("provision schema: %v", err)
+	}
+
+	var role string
+	if err := dmlPool.QueryRow(ctx, "SELECT current_user").Scan(&role); err != nil {
+		t.Fatalf("read current_user: %v", err)
+	}
+	quotedRole := `"` + strings.ReplaceAll(role, `"`, `""`) + `"`
+	grant := fmt.Sprintf(`
+GRANT USAGE ON SCHEMA %[1]s TO %[2]s;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %[1]s TO %[2]s;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %[1]s TO %[2]s;`, schema, quotedRole)
+	if _, err := admin.Exec(ctx, grant); err != nil {
+		t.Skipf("cannot grant privileges to DML role: %v", err)
+	}
+
+	for _, mode := range []event.MigrateMode{event.MigrateVerify, event.MigrateNone} {
+		t.Run(mode.String()+"Mode_DMLConnection_FullDMLCycle", func(t *testing.T) {
+			drv := pgxc.NewDriver(dmlPool, pgxc.WithSchema(schema),
+				pgxc.WithMigrateMode(mode))
+			exerciseDML(t, drv, "dml."+mode.String(), "dml-"+mode.String())
+		})
+	}
+	t.Run("CreateMode_DMLConnection_ReportsPermissionDenied", func(t *testing.T) {
+		fresh := newMigrationSchema(t, admin)
+		drv := pgxc.NewDriver(dmlPool, pgxc.WithSchema(fresh),
+			pgxc.WithMigrateMode(event.MigrateCreate))
+		err := drv.Append(ctx, event.RawEnvelope{
+			ID: "dml-4", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		})
+		if !errors.Is(err, event.ErrMigrationPermissionDenied) {
+			t.Fatalf("DML role unexpectedly allowed DDL: %v", err)
+		}
+		if !event.IsPermanentMigrationError(err) {
+			t.Fatal("permission error must be classified permanent (bounded retry)")
+		}
+		// 永久错误 fail-fast：再次调用不重新执行 DDL。
+		err2 := drv.Append(ctx, event.RawEnvelope{
+			ID: "dml-5", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		})
+		if !errors.Is(err2, event.ErrMigrationPermissionDenied) {
+			t.Fatalf("second append = %v, want same permanent error", err2)
+		}
+	})
+}
+
+// 迁移锁必须在第一条 DDL 之前取得：在首个 step 回调里另开连接探测必须失败。
+func TestLockAcquiredBeforeFirstDDL_ProbeFails(t *testing.T) {
+	pool := migrationPool(t)
+	schema := newMigrationSchema(t, pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	key := postgresschema.LockKey(schema)
+
+	var (
+		probed       bool
+		probeAcquire bool
+		probeErr     error
+	)
+	restore := pgxc.SetStepHookForTest(func(postgresschema.Step) error {
+		if probed {
+			return nil
+		}
+		probed = true
+		probeErr = pool.QueryRow(ctx,
+			"SELECT pg_try_advisory_xact_lock(hashtext($1))", key).Scan(&probeAcquire)
+		return probeErr
+	})
+	defer restore()
+
+	if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if !probed {
+		t.Fatal("step hook did not run")
+	}
+	if probeErr != nil {
+		t.Fatalf("probe lock: %v", probeErr)
+	}
+	if probeAcquire {
+		t.Fatal("migration lock must be held before the first DDL step")
+	}
+}
+
+// 并发首启正向用例：两个 Driver 同时首次操作都应成功且对象唯一。
+func TestConcurrentFirstUse(t *testing.T) {
+	pool := migrationPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	runConcurrent := func(t *testing.T) (string, []error) {
+		t.Helper()
+		schema := newMigrationSchema(t, pool)
+		drivers := []event.Driver{
+			pgxc.NewDriver(pool, pgxc.WithSchema(schema)),
+			pgxc.NewDriver(pool, pgxc.WithSchema(schema)),
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		errs := make([]error, len(drivers))
+		for i := range drivers {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				errs[i] = drivers[i].Append(ctx, event.RawEnvelope{
+					ID:         fmt.Sprintf("concurrent-%d", i),
+					Type:       "concurrent",
+					Payload:    []byte(`{}`),
+					OccurredAt: time.Now(),
+				})
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		return schema, errs
+	}
+	requireNoErrors := func(t *testing.T, errs []error) {
+		t.Helper()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("driver %d append = %v, want nil", i, err)
+			}
+		}
+	}
+
+	t.Run("TwoDrivers_ConcurrentFirstAppend_BothSucceed", func(t *testing.T) {
+		_, errs := runConcurrent(t)
+		requireNoErrors(t, errs)
+	})
+	t.Run("TwoDrivers_ConcurrentFirstUse_VerifyReportsNoIssues", func(t *testing.T) {
+		schema, errs := runConcurrent(t)
+		requireNoErrors(t, errs)
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if !report.OK() {
+			t.Fatalf("verify issues: %+v", report.Issues)
+		}
+	})
+	t.Run("TwoDrivers_ConcurrentFirstUse_CreatesSingleObjectSet", func(t *testing.T) {
+		schema, errs := runConcurrent(t)
+		requireNoErrors(t, errs)
+		var count int
+		if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relname IN
+	('event', 'event_claim', 'event_type_position_idx', 'event_claim_eligible_idx')`,
+			schema).Scan(&count); err != nil {
+			t.Fatalf("count baseline relations: %v", err)
+		}
+		if count != 4 {
+			t.Fatalf("baseline relation count = %d, want 4", count)
+		}
+	})
+}
+
+// 真实 23505：存量表无 PK 且 id 重复，加 PK 触发唯一冲突，必须 fail-fast。
+func TestMigrationUniqueViolation(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("DuplicateIDsWithoutPK_Migrate_ReturnsOutdatedVerifyError", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+			t.Fatalf("create schema: %v", err)
+		}
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE %s.event (
+	id          text        NOT NULL,
+	type        text        NOT NULL,
+	payload     bytea       NOT NULL,
+	metadata    jsonb       NOT NULL DEFAULT '{}'::jsonb,
+	occurred_at timestamptz NOT NULL,
+	position    bigserial   NOT NULL
+)`, schema)); err != nil {
+			t.Fatalf("create legacy event table: %v", err)
+		}
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s.event (id, type, payload, occurred_at)
+VALUES ('dup', 'a', ''::bytea, now()), ('dup', 'b', ''::bytea, now())`, schema)); err != nil {
+			t.Fatalf("insert duplicate ids: %v", err)
+		}
+
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("migrate = %v, want *VerifyError", err)
+		}
+		requireIssue(t, verifyErr.Report, schema+".event_pk",
+			event.KindConstraint, event.ProblemOutdated)
+		if relationExists(t, pool, schema, "event_claim") {
+			t.Fatal("event_claim must not be created after duplicate-key failure")
+		}
+		var duplicates int
+		if err := pool.QueryRow(ctx, fmt.Sprintf(
+			"SELECT count(*) FROM %s.event WHERE id = 'dup'", schema)).Scan(&duplicates); err != nil {
+			t.Fatalf("count duplicates: %v", err)
+		}
+		if duplicates != 2 {
+			t.Fatalf("duplicate rows = %d, want untouched 2", duplicates)
+		}
+	})
+}
+
+// 已取消 ctx：Migrate 与首次 Append 都返回 context.Canceled 且不建对象。
+func TestCanceledContext(t *testing.T) {
+	pool := migrationPool(t)
+
+	t.Run("Canceled_Migrate_ReturnsContextCanceledWithoutObjects", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("migrate = %v, want context.Canceled", err)
+		}
+		if schemaExists(t, pool, schema) {
+			t.Fatal("canceled migrate must not create objects")
+		}
+	})
+	t.Run("Canceled_FirstAppend_ReturnsContextCanceled", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema))
+		err := drv.Append(ctx, event.RawEnvelope{
+			ID: "canceled-1", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("append = %v, want context.Canceled", err)
+		}
+		if schemaExists(t, pool, schema) {
+			t.Fatal("canceled first append must not create objects")
+		}
+	})
+}

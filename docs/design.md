@@ -59,7 +59,7 @@
 core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发度控制、优雅停机）
    │  Driver 接口（单次原子操作）
    ▼
-后端 Driver（postgrec / …）：存储与投递实现
+后端 Driver（postgrec / pgxc）：存储与投递实现，共享 postgresschema 方言 DDL
 ```
 
 - **Driver 是最小缝合点**：只做单次原子操作
@@ -73,16 +73,21 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   构造器 `NewX(依赖, opts...)` 显式注入，无包级可变状态、无 init 魔法；
   接口定义遵循 Go 惯例放在消费侧。core 不引 DI 框架依赖（wire 用普通构造
   函数即可装配），必要时消费方自建 ProviderSet。
-- **事件 ID 与元数据**：每个事件在发布侧生成 string 唯一 ID（封装可选 ID
-  生成器，Publisher 构造级注入，缺省用内置实现）；ID 是幂等去重与全链路追踪
+- **事件 ID 与元数据**：每个事件在发布侧生成或通过 `WithEventID` 显式指定
+  string 唯一 ID（封装可选 ID 生成器，Publisher 构造级注入，缺省用内置
+  实现）；ID 是幂等去重与全链路追踪
   的主键，后端必须原样落库，并按事件 ID 施加唯一约束——重复 Append 同 ID 视为
   幂等成功：首写为准，不覆盖既有行、不触发重投，不校验 payload 一致性
   （同 ID 即同一事件，写进契约）。Envelope 携带元数据块（string 键值），后端原样存储透传、不解释
   语义；暂用于携带 trace\_id（使用方可注入 otel TraceID 等追踪上下文）做事件流
   与调用链的关联。
-- **依赖策略**：core 依赖 stdlib（slog），不携带任何数据库驱动；
-  otel metric API 随 P1 观测落地时引入（仅依赖 API 而非实现，埋点同期
-  实现），P0 不引入未使用的依赖。
+- **依赖策略**：core 依赖 stdlib（slog），不携带任何数据库驱动，也不依赖
+  具体方言；方言 DDL（基线/版本步骤、期望对象、锁语句）放在独立
+  `postgresschema` 模块，只做构造、不 import 驱动；各后端 require 该模块并
+  做连接适配。core 的初始化面只定义契约类型（迁移模式、校验报告、能力声明），
+  不内置任何后端 DDL。
+- **观测策略**：以可注入的 `Metrics` 接口接入（P1 计划），实现方适配 otel；
+  不把 otel 依赖强加进 core，未配置时静默、零开销。P0 只用 slog（见 §9.2）。
 - **强类型与无参事件并存**：泛型声明式事件（`Declare[T](name)`）提供强类型
   生产/消费，payload 编解码默认 JSON、可插拔 codec；无参事件是
   `Declare[NoPayload]` 的快捷形态。Type 名是认领与路由的稳定标识，改名即
@@ -174,7 +179,8 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   并破坏跨实例的认领语义。
 - 广播消费的已读水位由 core 按订阅类型在内存中维护并在 Fetch 时下推，只进
   不退，不在存储侧簿记。
-- 单类型洪泛会饿死其他类型：编排按类型轮询限额取数。
+- 单类型洪泛会饿死其他类型：编排按类型轮询限额取数。认领侧每轮有效批
+  大小为 `min(WithFetchLimit, 空闲并发槽位)`；无空闲槽位时不发起认领。
 - 通配订阅（消费全量）基线不允许，订阅必须显式列出类型。
 
 ### 5.5 就近消费
@@ -191,7 +197,7 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 能力    | 接口面                           | 语义要点                                                                                                                                                                 |
 | ----- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 事件声明  | 泛型 `Declare[T]` / `NoPayload` | Type 名是认领与路由的稳定标识；payload 默认 JSON codec、可插拔                                                                                                                          |
-| 事件信封  | Envelope                      | 发布侧唯一 ID、Type、Payload、元数据块（透传）、OccurredAt                                                                                                                            |
+| 事件信封  | Envelope                      | 发布侧唯一 ID、Type、Payload、元数据块（透传）、OccurredAt；Attempts/LastAttempt 为 core 运行时注入（认领消费按租约尝试序号与 RetryLimit 计算，广播恒 0/false）                                                                                                                          |
 | 生产    | Publisher                     | Publish 发布；ID 与元数据缺省自动填充；ID 生成器等构造级注入；outbox 拓展见生产化能力                                                                                                                |
 | 消费编排  | Runner + Subscribe            | 订阅级声明消费方式（广播/认领命名式入口，同一 Runner 可混合承载）与消费者身份（仅认领消费，构造默认 + 订阅级覆盖）、并发、租约、轮询间隔、重试上限与退避（仅认领消费；广播消费失败即跳过，见 §5.2）；两种方式同一订阅签名（强类型糖）；签名见 docs/api.md                                              |
 | 后端缝合点 | Driver                        | 单次原子操作，需求条件（订阅类型集 + 租约过期判据 + 可认领/水位条件）在单条 Fetch/Claim 内下推：Append / Fetch、HeadPosition（广播消费，水位条件与基线锚点由 core 传入）/ Claim、Heartbeat、Complete、Fail（认领消费）；语义见 §5 与 ADR |
@@ -200,15 +206,17 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 
 module path 为 `github.com/jninng/go_event`，子 module 为
 `github.com/jninng/go_event/postgrec`、`github.com/jninng/go_event/pgxc`、
-`github.com/jninng/go_event/eventtest`。 
+`github.com/jninng/go_event/postgresschema`、`github.com/jninng/go_event/eventtest`。 
 
 ```
 go_event/
 ├── doc.go / event.go / publisher.go / runner.go / driver.go /
-│   codec.go / errors.go / localwake.go                    # core：契约与编排
-├── postgrec/        # Postgres 后端（标准库）：event/event_claim 表、幂等 DDL、SKIP LOCKED
-├── pgxc/            # Postgres 后端（pgx v5）：event/event_claim 表、幂等 DDL、SKIP LOCKED
-├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite；新后端必须全过
+│   codec.go / errors.go / localwake.go / migrate.go         # core：契约与编排、迁移契约类型
+├── postgrec/        # Postgres 后端（标准库）：event/event_claim 表、SKIP LOCKED、迁移执行
+├── pgxc/            # Postgres 后端（pgx v5）：event/event_claim 表、SKIP LOCKED、迁移执行
+├── postgresschema/  # Postgres 方言 DDL 单一事实源：结构化步骤、期望对象、锁语句（无驱动依赖）
+├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunMigrationSuite
+│   └── simmigrate/  # 迁移契约测试的进程内模拟 backend（可强制 step、可注入故障）
 └── docs/
     ├── api.md       # API 文档
     ├── design.md    # 本文
@@ -222,10 +230,83 @@ go_event/
 语义的实现档位。非核心的可选能力（延迟事件、管理面查询、NOTIFY 推送唤醒等）
 走可选拓展接口 + 能力探测，与 outbox 同模式。
 
-**持久结构初始化**：后端若依赖持久结构（建表/DDL、Stream/Topic 声明等），
-初始化动作必须由后端自动幂等完成——可重复执行、不破坏既有数据与状态（如
-Postgres 后端的 `CREATE TABLE IF NOT EXISTS`），使用方无需手工迁移步骤；
-初始化的幂等性写进契约测试。
+**持久结构初始化按迁移模式处理**（[ADR 0007](adr/0007-migration-mode-and-protocol.md)）：
+
+- `Create`（缺省）：首次操作时以构造 Driver 的连接持迁移锁执行基线
+  （schema、表、约束、索引）；只建基线、不升级存量表，需要 DDL 权限。
+- `Verify`：只读校验对象集合与定义，不执行 DDL；不一致时首次操作返回
+  `VerifyError`。表须由部署流程创建，运行账号可只授 DML（另需系统目录读）。
+- `None`：不建表也不校验，完全交给调用方。
+- P1 增加 `Upgrade`：在基线上应用版本化迁移。引入版本台账后，`Create`
+  检出库内版本低于二进制要求时 fail-fast 并提示改用 `Upgrade`，不静默运行
+  在旧 schema 上；库代码不得读取仅在 `Upgrade` 后存在的列，除非当前模式
+  已确认版本。
+
+迁移执行：
+
+- **统一锁**：基线建表与版本升级共用同一锁键（含 schema 命名空间）、同一
+  状态记录语义（P1 台账）与同一份步骤定义；先取锁再执行任何 DDL。锁原语
+  按能力从优到劣：事务级锁 → 原生会话锁 → 锁行租约（P1）；等待有界，超时按瞬时
+  错误退避，不得无限阻塞。锁能力为无（`LockNone`）时，`Create` 返回
+  `ErrMigrationUnsupported`，只能 `Verify`/`None`；DDL 原子性为无
+  （`DDLAtomicNone`）时 `Create` 同样返回 `ErrMigrationUnsupported`（P0
+  无此档后端，P1 执行器按声明返回）。`Upgrade` 同属 P1，锁能力为无时同样
+  拒绝。
+- **fast 路径**：后端支持跨语句事务且该版本全部步骤可事务化时，锁、基线、
+  P1 版本 DDL 与台账同事务，全成或全败；失败回滚即恢复，不逐对象探测
+  （基线接管校验除外）、不写 `applying`。事务档后端在全可事务化版本上必须
+  走 fast，不得静默降级。
+- **step 路径**：无跨语句事务或含不可事务化步骤时，逐 step 探测后执行；
+  已存在且定义一致则跳过，缺失则执行，定义不一致报差异错误；每步可安全
+  重入，崩溃后重跑整版依赖探测收敛。P0 两个 Postgres 后端的基线全部可
+  事务化，执行器只走 fast；step 路径的协议与恢复由模拟 backend 的契约
+  测试覆盖，随 P1 台账落到后端执行器。
+- **基线接管校验**：无论哪条路径，表已存在（P0 无台账或 P1 台账无该版本
+  记录）时都要校验对象集合（名称、列与类型、主键/唯一/外键引用/索引列）。
+  已有对象与期望定义一致且仅缺对象 → 补齐并收敛（P1 补记基线版本）；任一
+  已有对象定义冲突或无法判定归属 → 返回差异错误，不自动修复，也不自动补
+  记台账。
+- **不支持先查后建**：不用 `Verify` 作为 `Migrate` 的前置门——检查与创建
+  无法组成原子操作；原子性由锁 + 事务（fast）或执行器探测 + 单语句原子
+  （step）保证。
+- **失败处理**：`ensure` 失败按 Driver 实例负缓存。瞬时错误（数据库不可用、
+  锁等待超时）有界指数退避（100ms 起、封顶 30s）；永久配置错误（权限、
+  定义冲突、非法 schema、后端不支持）fail-fast。`Verify` 首次通过后在
+  Driver 内缓存「已检查」，部署补建或定义修复后需重启/重建 Driver。
+- **导出物**：`Statements` 为基线语句清单（不含锁）；`SQL` 以 `BEGIN`
+  开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于全部基线 DDL 之前），
+  末尾 `COMMIT`，整段须在同一事务执行。导出只覆盖当前基线，列/索引变更
+  必须走版本化迁移。step 路径只导出步骤清单与探测方式，手工整段执行不可
+  重放（P1）。
+
+**能力矩阵**（值以各后端 `Capabilities()` 声明为准）：
+
+| 能力项 | postgrec | pgxc | inmem |
+| --- | --- | --- | --- |
+| DDL 原子性 | 跨语句事务 | 跨语句事务 | 无（`DDLAtomicNone`，零值；迁移为 no-op） |
+| `IF NOT EXISTS` 覆盖 | schema/table/column/index 原生；constraint 无原生语法（探测 + DO 块） | 同 postgrec | 无（nil，零值） |
+| 对象探测 | schema 仅存在性；表/列/索引/约束为存在性 + 定义 | 同 postgrec | 无（nil，零值） |
+| 错误分类 | 已存在 / 权限 / 瞬时全支持 | 同 postgrec | 无（全 false） |
+| 锁原语 | 事务级 advisory 锁 | 事务级 advisory 锁 | `LockNone` |
+| 锁释放 | 提交/回滚自动释放 | 提交/回滚自动释放 | 零值（无锁，无实际语义） |
+| DDL 完成语义 | 同步 | 同步 | 零值（无 DDL） |
+| 步骤事务性 | 可声明事务外步骤（如并发建索引） | 同 postgrec | false（零值） |
+| DDL 是否隐式提交 | 否（事务内可整体回滚） | 同 postgrec | false（零值） |
+| 自动迁移 | 支持（P0 基线走 fast；P1 Upgrade 计划） | 支持（P0 基线走 fast；P1 Upgrade 计划） | no-op，不参与 DDL |
+
+inmem 无持久结构，零值能力声明不触发「锁能力为无」的拒绝分支。
+
+**连接权限矩阵**：
+
+| 模式 | 所需权限 | 推荐场景 | 现状 |
+| --- | --- | --- | --- |
+| `Create` | DDL + DML | 部署/启动期高权限连接初始化空库或幂等补齐基线 | P0 |
+| `Verify` | DML + 系统目录只读 | 运行期自检；运行账号仅 DML，表由部署期建好 | P0 |
+| `None` | 仅 DML | schema 完全由部署流程管理，库不做检查 | P0 |
+| `Upgrade` | DDL + DML | 版本化自动升级 | P1 计划 |
+
+自动迁移（P0 `Create`；P1 `Upgrade`）需要 DDL 权限；无 DDL 权限的运行连接不能自动
+迁移，只能 `Verify`/`None`。库不负责账号或授权管理。
 
 Driver 保持**拉形状**（Claim/Fetch 返回批次），推送型后端经其拉式 API 适配
 （JetStream Fetch、XREADGROUP 等），真推送投递留作可选 DeliverySource 拓展，
@@ -241,7 +322,8 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
 ### 9.1 基线能力（P0）
 
 - **事件生产**：强类型（`Declare[T]`）/无参（`NoPayload`）两种载荷形态发布；
-  发布侧唯一事件 ID（可插拔生成器）；元数据块透传（trace\_id）。
+  发布侧唯一事件 ID（可插拔生成器；可显式指定 ID，优先于生成器），ID 全局
+  唯一、业务键须按类型加前缀后才能当 ID 用；元数据块透传（trace\_id）。
 - **广播消费**：发完即忘、上游无感——无存储侧簿记，已读水位存于实例内存；
   只处理订阅启动后发布的事件，停机期间事件不补投；handler 失败仅记日志
   跳过，不重试、不保序；每个活跃实例各自独立收取全部事件（广播）。
@@ -250,30 +332,46 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   重试有上限且按退避重认领（租约过期被接管同样计入）；每事件 × 每类型同一
   时刻至多一个活跃租约（整体 at-least-once，不承诺恰好一次）；迟到的
   Complete/Fail 不生效；终态为（事件 × 消费者身份）粒度，新增身份重放全部
-  窗口内历史（含其他身份已终态的事件）。
+  窗口内历史（含其他身份已终态的事件）；handler 可从信封读到尝试序号与
+  最后一次尝试标记（广播恒为 0/false，接管即置 failed 的路径不投递最后一次）。
 - **消费编排**：认领消费多身份承载、需求驱动拉取（按类型轮询限额，防单类型
-  洪泛饿死其他类型）、并发度控制、优雅停机（停领在途跑完）。
+  洪泛饿死其他类型）、并发度控制、优雅停机（停领在途跑完）；认领每轮有效
+  批大小为 `min(WithFetchLimit, 空闲并发槽位)`，无空闲槽位时不认领；派发前
+  由 core 按租约尝试序号与订阅 RetryLimit 注入 Attempts/LastAttempt。
 - **就近消费**：同进程发布唤醒本实例立即拉取/认领（仅信号，不跳过存储）。
-- **Postgres 后端**：event / event\_claim 两表、幂等 DDL、SKIP LOCKED 认领、
-  惰性清理（资格：超窗且无活跃租约，无论状态；保留窗口可配，历史重放仅限
-  窗口内，认领消费窗口须覆盖最坏重试路径）。
+- **Postgres 后端**：event / event\_claim 两表、幂等基线 DDL、SKIP LOCKED
+  认领、惰性清理（资格：超窗且无活跃租约，无论状态；保留窗口可配，历史
+  重放仅限窗口内，认领消费窗口须覆盖最坏重试路径）。
+- **持久结构初始化与迁移三模式**：`Create`（缺省，首次操作持迁移锁执行
+  基线）/ `Verify`（只读校验）/ `None`（不建不校验）；`Create` 做基线接管
+  校验，定义冲突返回差异错误、不自动修复；`Statements`/`SQL` 导出基线语句
+  与含锁脚本；能力声明（`Capabilities`）用于契约测试与文档判定，P1 执行器
+  按声明选择路径；运行期无 DDL 权限
+  只能 `Verify`/`None`。迁移失败按 Driver 负缓存：瞬时错误有界退避，永久
+  配置错误 fail-fast。P1 增 `Upgrade` 与版本台账。
 - **契约测试**：inmem Driver + eventtest 套件，覆盖上述全部语义（广播消费
   基线锚定与起点语义/失败跳过且不阻塞/广播各自全收/水位单调；无参事件
   的广播与认领；类型间不互相饿死；认领消费互斥（含并发认领）/接管/
   接管计入重试/心跳/超时停续/退避重试/重试耗尽终态/迟到 Complete 与
   Fail 不生效/新身份重放全部窗口内历史/超限行不占限额槽位；公共的
   ID 唯一与幂等 Append 首写为准、元数据透传、HeadPosition 基线锚点；
-  持久结构初始化的幂等可重复执行；保留窗口清理资格
+  持久结构初始化的幂等可重复执行；迁移契约 `RunMigrationSuite`（空库/
+  完整/部分/冲突、三模式 Driver 首启、导出物、并发首启、锁释放、
+  Lock=none、fast/step 路径与故障注入）；保留窗口清理资格
   （RunRetentionSuite））。
 
 ### 9.2 生产化能力（P1）
 
 - **outbox**：调用方事务内追加事件并随事务原子提交（后端可选拓展接口）。
-- **观测**：slog 日志 + otel metric（发布/认领/完成/失败/重试计数、投递
-  延迟、租约接管次数），未配置时静默。
+- **观测**：slog 日志 + 可注入的 `Metrics` 接口（发布/认领/完成/失败/重试
+  计数、投递延迟、租约接管次数）。实现方适配 otel，不把 otel 依赖强加进
+  core；未配置时静默、零开销。`Claim` 接口计划变更为
+  `ClaimResult{Leases, Takeovers, TerminalFailed}`，`Lease` 不再承担接管
+  标记（v0.x 允许破坏性变更）。
 - **管理面**：滞留/failed 事件查询、手工重放（仅针对 `failed` 终态重新置为
-  可认领；`done` 不可逆、不重放）、dead-letter 处置钩子、失败信息留存
-  （最后错误摘要）、存量消费者身份的重命名迁移（§5.1）。
+  可认领；`done` 不可逆、不重放）、版本台账 failed 重置与基线补记
+  （`Admin` reset/stamp）、dead-letter 处置钩子、失败信息留存（最后错误
+  摘要）、存量消费者身份的重命名迁移（§5.1）。
 - **延迟事件**：deliver\_at 定时投递（Postgres 原生；其余后端为可选能力，见
   能力边界）；未到投递时间的行不满足 Fetch/Claim 的下推条件，与广播消费
   组合的边界（延迟行被内存水位越过即不再投递）写进文档。

@@ -1,6 +1,9 @@
 package eventtest
 
 import (
+	"context"
+	"errors"
+	"maps"
 	"slices"
 	"sync"
 	"testing"
@@ -32,6 +35,142 @@ func testAppendIdempotent(t *testing.T, d event.Driver) {
 	}
 	if batch[0].ID != "aid-1" || batch[0].Type != typ {
 		t.Fatalf("envelope mismatch: %+v", batch[0])
+	}
+}
+
+// 同类型同显式 ID 重复发布：两次 Publish 均返回 nil，落库恰好一行，
+// 且 payload、Metadata、OccurredAt 全部保留首写值（ID 全局唯一、首写
+// 为准、不校验 payload，docs/api.md §2.3）。
+func testDuplicateIDPublishSameType(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	typ := "dup-same-" + t.Name()
+	id := "dup-same-id-" + t.Name()
+	ev := event.Declare[suitePayload](typ)
+	pub := event.NewPublisher(d)
+	firstMeta := map[string]string{"k": "v1"}
+
+	mustPublish(t, ctx, pub, ev, suitePayload{"first"},
+		event.WithEventID(id), event.WithMetadata(firstMeta))
+
+	// 先读出首写行（Publisher 的 OccurredAt 取 time.Now()，以后端落库值
+	// 作为后续比较基准，避免依赖宿主时钟）。
+	first, err := d.Fetch(ctx, event.FetchQuery{Type: typ, Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch first: %v", err)
+	}
+	if len(first) != 1 {
+		t.Fatalf("first publish must store one row, got %d", len(first))
+	}
+	var firstPayload suitePayload
+	if err := event.NewJSONCodec().Decode(first[0].Payload, &firstPayload); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+	if firstPayload.Value != "first" || !maps.Equal(first[0].Metadata, firstMeta) {
+		t.Fatalf("first write mismatch: payload=%q metadata=%+v",
+			firstPayload.Value, first[0].Metadata)
+	}
+
+	mustPublish(t, ctx, pub, ev, suitePayload{"second"},
+		event.WithEventID(id),
+		event.WithMetadata(map[string]string{"k": "v2", "extra": "x"}))
+
+	batch, err := d.Fetch(ctx, event.FetchQuery{Type: typ, Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch after duplicate: %v", err)
+	}
+	if len(batch) != 1 {
+		t.Fatalf("duplicate publish must store one row, got %d", len(batch))
+	}
+	var p suitePayload
+	if err := event.NewJSONCodec().Decode(batch[0].Payload, &p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if batch[0].ID != id || p.Value != firstPayload.Value {
+		t.Fatalf("first payload must win, got id=%q payload=%q", batch[0].ID, p.Value)
+	}
+	if !maps.Equal(batch[0].Metadata, first[0].Metadata) {
+		t.Fatalf("first metadata must win, got %+v", batch[0].Metadata)
+	}
+	if !batch[0].OccurredAt.Equal(first[0].OccurredAt) {
+		t.Fatalf("first OccurredAt must win, got %v want %v",
+			batch[0].OccurredAt, first[0].OccurredAt)
+	}
+}
+
+// 跨类型复用同一显式 ID：两次 Publish 均返回 nil，该 ID 全局只有一行
+// （落在首写类型），第二个 payload 被静默丢弃（docs/api.md §2.3）。
+func testSameIDCrossTypePublish(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	id := "dup-cross-id-" + t.Name()
+	typA := "dup-cross-a-" + t.Name()
+	typB := "dup-cross-b-" + t.Name()
+	evA := event.Declare[suitePayload](typA)
+	evB := event.Declare[suitePayload](typB)
+	pub := event.NewPublisher(d)
+
+	mustPublish(t, ctx, pub, evA, suitePayload{"first"}, event.WithEventID(id))
+	mustPublish(t, ctx, pub, evB, suitePayload{"second"}, event.WithEventID(id))
+
+	batchA, err := d.Fetch(ctx, event.FetchQuery{Type: typA, Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch A: %v", err)
+	}
+	if len(batchA) != 1 || batchA[0].ID != id {
+		t.Fatalf("first type must hold the single row, got %+v", batchA)
+	}
+	var p suitePayload
+	if err := event.NewJSONCodec().Decode(batchA[0].Payload, &p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if p.Value != "first" {
+		t.Fatalf("second payload must be discarded, got %q", p.Value)
+	}
+	batchB, err := d.Fetch(ctx, event.FetchQuery{Type: typB, Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch B: %v", err)
+	}
+	if len(batchB) != 0 {
+		t.Fatalf("same ID must not create a row for the second type, got %+v", batchB)
+	}
+}
+
+// 显式空串 ID 经事件侧糖发布：返回 ErrEmptyEventID 且不落行
+// （docs/api.md §2.3、§2.7）。
+func testEmptyEventIDEventPublish(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	typ := "empty-id-sugar-" + t.Name()
+	ev := event.Declare[suitePayload](typ)
+
+	err := ev.Publish(ctx, event.NewPublisher(d), suitePayload{"x"}, event.WithEventID(""))
+	if !errors.Is(err, event.ErrEmptyEventID) {
+		t.Fatalf("empty explicit ID must return ErrEmptyEventID, got %v", err)
+	}
+	batch, ferr := d.Fetch(ctx, event.FetchQuery{Type: typ, Limit: 10})
+	if ferr != nil {
+		t.Fatalf("fetch: %v", ferr)
+	}
+	if len(batch) != 0 {
+		t.Fatalf("rejected publish must not store a row, got %+v", batch)
+	}
+}
+
+// 显式空串 ID 经 PublishNoPayload 发布：同样返回 ErrEmptyEventID 且不落行
+// （docs/api.md §2.3、§2.7）。
+func testEmptyEventIDPublishNoPayload(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	typ := "empty-id-nopayload-" + t.Name()
+	ev := event.Declare[event.NoPayload](typ)
+
+	err := event.NewPublisher(d).PublishNoPayload(ctx, ev, event.WithEventID(""))
+	if !errors.Is(err, event.ErrEmptyEventID) {
+		t.Fatalf("empty explicit ID must return ErrEmptyEventID, got %v", err)
+	}
+	batch, ferr := d.Fetch(ctx, event.FetchQuery{Type: typ, Limit: 10})
+	if ferr != nil {
+		t.Fatalf("fetch: %v", ferr)
+	}
+	if len(batch) != 0 {
+		t.Fatalf("rejected publish must not store a row, got %+v", batch)
 	}
 }
 
@@ -77,7 +216,7 @@ func testHeadPositionNewest(t *testing.T, d event.Driver) {
 
 // HeadPosition 对无事件的类型返回空串（docs/api.md §2.4）。
 func testHeadPositionEmpty(t *testing.T, d event.Driver) {
-	head, err := d.HeadPosition(t.Context(), "no-such-type-" + t.Name())
+	head, err := d.HeadPosition(t.Context(), "no-such-type-"+t.Name())
 	if err != nil {
 		t.Fatalf("head position: %v", err)
 	}
@@ -182,6 +321,26 @@ func testFetchReadOnly(t *testing.T, d event.Driver) {
 	}
 }
 
+// Claim 限额：至多返回 Limit 条（docs/api.md §2.4；core 认领预取按此契约
+// 计算每轮批大小）。
+func testClaimLimit(t *testing.T, d event.Driver) {
+	typ := t.Name()
+	appendEvent(t, d, "cl1", typ, "1", nil)
+	appendEvent(t, d, "cl2", typ, "2", nil)
+	appendEvent(t, d, "cl3", typ, "3", nil)
+
+	ls, err := d.Claim(t.Context(), event.ClaimQuery{
+		Type: typ, ConsumerType: "cl", Lease: time.Minute, Limit: 1,
+		RetryLimit: 5, Now: baseNow,
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(ls) != 1 {
+		t.Fatalf("limit 1 must cap claim batch at 1 lease, got %d", len(ls))
+	}
+}
+
 // 认领互斥：租约活跃期间同身份不可再认领（design.md §5.3）。
 func testClaimActiveLeaseRejected(t *testing.T, d event.Driver) {
 	typ := t.Name()
@@ -225,8 +384,8 @@ func testClaimConcurrentDisjoint(t *testing.T, d event.Driver) {
 
 	const claimers = 4
 	var (
-		mu     sync.Mutex
-		seen   = map[string]int{}
+		mu      sync.Mutex
+		seen    = map[string]int{}
 		claimWg sync.WaitGroup
 	)
 	for range claimers {
@@ -690,4 +849,67 @@ func testFailRetryLimit(t *testing.T, d event.Driver) {
 
 func linearBackoffMs() event.Backoff {
 	return event.LinearBackoff(time.Millisecond, time.Hour)
+}
+
+// 运行时注入字段不落库、不被后端依赖：Append 带入非零 Attempts/LastAttempt
+// 被忽略（Fetch 返回零值），Claim 的尝试序号从 1 起算；经 Runner 投递时
+// LastAttempt 由 core 按订阅 RetryLimit 计算，不被写入值污染。
+func testRuntimeFieldsNotPersisted(t *testing.T, d event.Driver) {
+	typ := t.Name()
+	payload, err := event.NewJSONCodec().Encode(suitePayload{Value: "runtime"})
+	if err != nil {
+		t.Fatalf("encode payload: %v", err)
+	}
+	injected := event.RawEnvelope{
+		ID: "rf1", Type: typ, Payload: payload, OccurredAt: baseNow,
+		Attempts: 99, LastAttempt: true,
+	}
+	if err := d.Append(t.Context(), injected); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Fetch 返回必须为零值：运行时字段不落库。
+	batch, err := d.Fetch(t.Context(), event.FetchQuery{Type: typ, Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(batch) != 1 || batch[0].Attempts != 0 || batch[0].LastAttempt {
+		t.Fatalf("fetched envelope must carry zero runtime fields, got %+v", batch)
+	}
+
+	// 直接认领：尝试序号 = 认领后 claim_count + 1 = 1，而非写入的 99。
+	ls := claim(t, d, typ, "rf-direct", time.Minute, baseNow)
+	if len(ls) != 1 || ls[0].Attempts != 1 {
+		t.Fatalf("claim want attempts=1 (not persisted 99), got %+v", ls)
+	}
+
+	// handler 侧 LastAttempt 由 core 计算：RetryLimit=2 时首次为 false。
+	ev := event.Declare[suitePayload](typ)
+	got := make(chan attemptObservation, 1)
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity("rf-runner"), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		recordAttempt(got, e)
+		return nil
+	},
+		event.WithRetryLimit(2),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(200*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(t.Context()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(t.Context())) }()
+
+	var obs attemptObservation
+	select {
+	case obs = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting: runtime-fields delivery")
+	}
+	if obs.attempts != 1 || obs.lastAttempt {
+		t.Fatalf("handler attempts=%d last=%v, want 1/false (core computed)", obs.attempts, obs.lastAttempt)
+	}
 }

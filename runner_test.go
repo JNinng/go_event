@@ -123,3 +123,63 @@ func TestHandlerPanic_Broadcast_SkipsAndContinues(t *testing.T) {
 		return count.Load() == 1
 	})
 }
+
+// broadcastRuntimeFieldDriver 包装 stubDriver，让 Fetch 返回带非零运行时
+// 字段的信封（模拟不清理该字段的后端），验证广播零值由 core 强制而非
+// 依赖后端自律。
+type broadcastRuntimeFieldDriver struct{ *stubDriver }
+
+func (d *broadcastRuntimeFieldDriver) Fetch(ctx context.Context,
+	q event.FetchQuery) ([]event.RawEnvelope, error) {
+	batch, err := d.stubDriver.Fetch(ctx, q)
+	for i := range batch {
+		batch[i].Attempts = 99
+		batch[i].LastAttempt = true
+	}
+	return batch, err
+}
+
+var _ event.Driver = (*broadcastRuntimeFieldDriver)(nil)
+
+// Fetch 返回非零 Attempts/LastAttempt 时，广播 handler 仍读到 0/false
+// （广播恒为零值由 core 在派发前强制，不依赖 Driver）。
+func TestBroadcastRuntimeFields_FetchNonZero_HandlerSeesZero(t *testing.T) {
+	type seen struct {
+		attempts    int
+		lastAttempt bool
+	}
+
+	d := &broadcastRuntimeFieldDriver{newStubDriver()}
+	ctx := context.Background()
+	ev := event.Declare[runPayload]("unit.bc-runtime-fields")
+	pub := event.NewPublisher(d)
+
+	delivered := make(chan seen, 1)
+	run := event.NewRunner(d, event.WithPollInterval(time.Millisecond), event.WithLogger(quietLogger()))
+	if err := ev.SubscribeBroadcast(run, func(_ context.Context, e event.Envelope[runPayload]) error {
+		select {
+		case delivered <- seen{e.Attempts, e.LastAttempt}:
+		default:
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	if err := ev.Publish(ctx, pub, runPayload{"x"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	var got seen
+	select {
+	case got = <-delivered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting: broadcast delivery")
+	}
+	if got.attempts != 0 || got.lastAttempt {
+		t.Fatalf("broadcast handler saw attempts=%d last=%v, want 0/false", got.attempts, got.lastAttempt)
+	}
+}

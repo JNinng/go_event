@@ -44,15 +44,27 @@ func (ev Event[T]) SubscribeClaim(r *Runner, h Handler[T],
 
 // Envelope 面向使用方的事件信封（强类型 payload）。
 type Envelope[T any] struct {
-	ID         string // 发布侧生成的唯一 ID；幂等去重与追踪主键
+	// ID 是事件主键、全局唯一（发布侧生成或 WithEventID 显式指定），
+	// 幂等去重与追踪主键。跨事件类型复用同一 ID 视为同一事件、第二个
+	// payload 被丢弃；业务键须按类型加前缀后才能当 ID 用。
+	ID         string
 	Type       string // 即 Event.Name
 	Payload    T
 	Metadata   map[string]string // 透传元数据，如 trace_id（design.md §4）
 	OccurredAt time.Time
+
+	// Attempts 是本次投递的尝试序号（含本次）：新认领为「已失败次数 + 1」，
+	// 接管认领在先前基础上递增。仅认领消费有意义，广播消费恒为 0。
+	Attempts int
+	// LastAttempt 表示本次是否为最后一次尝试，由 core 按订阅级 RetryLimit
+	// 计算：Attempts >= RetryLimit 时为 true（按 >= 判定，防御多实例间的
+	// 订阅配置差异；接管侧在认领时直接置 failed 的路径不投递「最后一次」，
+	// handler 不得假设它必然出现）。广播消费恒为 false。
+	LastAttempt bool
 }
 
-// RawEnvelope 面向 Driver 的事件信封（payload 已编码）。后端必须原样
-// 落库透传（design.md §4）。
+// RawEnvelope 面向 Driver 的事件信封（payload 已编码）。除运行时注入字段
+// （Attempts/LastAttempt，见下）外，后端必须原样落库透传（design.md §4）。
 type RawEnvelope struct {
 	ID         string
 	Type       string
@@ -63,6 +75,13 @@ type RawEnvelope struct {
 	// 广播消费的已读水位条件（ADR 0004）：core 内存按订阅类型维护、
 	// 只进不退，Fetch 时原样回传。Append 输入侧忽略此字段。
 	Position string
+
+	// Lease.Attempts 是 Claim 侧尝试序号的唯一来源；RawEnvelope.Attempts /
+	// LastAttempt 仅由 core 在派发 handler 前写入，Append 输入侧忽略且不落库，
+	// Fetch/Claim 返回时必须为零值。Driver 不得依赖它们，也不得把它们作为
+	// 存取判据。
+	Attempts    int
+	LastAttempt bool
 }
 
 // Handler 消费处理函数；两种消费方式同一签名（design.md §6）。
@@ -78,11 +97,13 @@ func wrapHandler[T any](r *Runner, h Handler[T]) func(context.Context, RawEnvelo
 			return err
 		}
 		return h(ctx, Envelope[T]{
-			ID:         raw.ID,
-			Type:       raw.Type,
-			Payload:    payload,
-			Metadata:   raw.Metadata,
-			OccurredAt: raw.OccurredAt,
+			ID:          raw.ID,
+			Type:        raw.Type,
+			Payload:     payload,
+			Metadata:    raw.Metadata,
+			OccurredAt:  raw.OccurredAt,
+			Attempts:    raw.Attempts,
+			LastAttempt: raw.LastAttempt,
 		})
 	}
 }

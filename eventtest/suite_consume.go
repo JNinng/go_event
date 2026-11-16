@@ -551,6 +551,82 @@ func testTakeoverAfterMaxProcessing(t *testing.T, d event.Driver) {
 	}
 }
 
+// 正常区间（未崩溃、未停机、handler 未超过最大处理时长）内租约持续续租：
+// 第二个实例用同一身份认领不到在途事件，且原实例正常完成、只处理一次。
+func testActiveLeaseNoTakeover(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	ev := event.Declare[suitePayload]("no-takeover-" + t.Name())
+	pub := event.NewPublisher(d)
+	mustPublish(t, ctx, pub, ev, suitePayload{"active"})
+
+	const (
+		identity = "no-takeover"
+		lease    = 200 * time.Millisecond
+	)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	stopRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	var calls atomic.Int64
+	var entered atomic.Bool
+
+	runA := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity(identity), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(runA, func(context.Context, event.Envelope[suitePayload]) error {
+		calls.Add(1)
+		entered.Store(true)
+		<-release
+		return nil
+	},
+		event.WithLease(lease),
+		event.WithHeartbeat(50*time.Millisecond),
+		event.WithMaxProcessing(2*time.Second),
+	); err != nil {
+		t.Fatalf("subscribe A: %v", err)
+	}
+	if err := runA.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	defer func() {
+		stopRelease()
+		_ = runA.Stop(context.WithoutCancel(ctx))
+	}()
+
+	waitFor(t, 5*time.Second, "instance A handler entered", entered.Load)
+	// 处理时长跨过至少一个租约周期：正常区间内依赖心跳续租，租约不应过期。
+	time.Sleep(lease + 100*time.Millisecond)
+
+	ls, err := d.Claim(ctx, event.ClaimQuery{
+		Type: ev.Name, ConsumerType: identity, Lease: lease,
+		Limit: 10, RetryLimit: 5, Now: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("claim B: %v", err)
+	}
+	if len(ls) != 0 {
+		t.Fatalf("active lease within max processing must not be taken over, got %+v", ls)
+	}
+
+	stopRelease()
+	if err := runA.Stop(context.WithoutCancel(ctx)); err != nil {
+		t.Fatalf("stop A: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1 (no duplicate processing)", got)
+	}
+
+	// A 已 Complete：done 终态不可再认领。
+	ls, err = d.Claim(ctx, event.ClaimQuery{
+		Type: ev.Name, ConsumerType: identity, Lease: time.Minute,
+		Limit: 10, RetryLimit: 5, Now: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("claim after complete: %v", err)
+	}
+	if len(ls) != 0 {
+		t.Fatalf("completed event must be done, got %+v", ls)
+	}
+}
+
 // 优雅停机：Stop 阻塞至在途 handler 跑完；在途 handler 的 ctx 不因
 // 停机取消（design.md §9.1「停领在途跑完」——停机不把在途事件记为失败）。
 func testGracefulStop(t *testing.T, d event.Driver) {
@@ -722,5 +798,318 @@ func testGuardSubscribeAfterStart(t *testing.T, d event.Driver) {
 	}
 	if err := ev.SubscribeClaim(run, handler); err != event.ErrRunnerStarted {
 		t.Fatalf("claim after start: want ErrRunnerStarted, got %v", err)
+	}
+}
+
+// attemptObservation handler 侧读到的尝试次数快照。
+type attemptObservation struct {
+	attempts    int
+	lastAttempt bool
+}
+
+// zeroBackoff 零退避：重试立即可认领，保持重试用例时长可控。
+func zeroBackoff() event.Backoff { return event.LinearBackoff(0, 0) }
+
+// recordAttempt 非阻塞记录一次尝试观测：实现缺陷导致多投时 handler 不
+// 阻塞，用例按既有断言尽快失败，而不是挂到默认长超时。
+func recordAttempt(ch chan<- attemptObservation, e event.Envelope[suitePayload]) {
+	select {
+	case ch <- attemptObservation{e.Attempts, e.LastAttempt}:
+	default:
+	}
+}
+
+// 首次投递：Attempts==1、LastAttempt==false（RetryLimit=2 时首次远非最后）。
+func testFirstDeliveryAttempts(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	ev := event.Declare[suitePayload]("attempt-first-" + t.Name())
+	pub := event.NewPublisher(d)
+	mustPublish(t, ctx, pub, ev, suitePayload{"first"})
+
+	got := make(chan attemptObservation, 1)
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity("first"), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		recordAttempt(got, e)
+		return nil
+	},
+		event.WithRetryLimit(2),
+		event.WithBackoff(zeroBackoff()),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(200*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	var obs attemptObservation
+	select {
+	case obs = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting: first delivery")
+	}
+	if obs.attempts != 1 || obs.lastAttempt {
+		t.Fatalf("first delivery attempts=%d last=%v, want 1/false", obs.attempts, obs.lastAttempt)
+	}
+}
+
+// RetryLimit=2 且首次返回错误：第二次投递 Attempts==2、LastAttempt==true
+// （Attempts >= 订阅 RetryLimit 即最后一次尝试）。
+func testRetryLimitTwoLastAttempt(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	ev := event.Declare[suitePayload]("attempt-last2-" + t.Name())
+	pub := event.NewPublisher(d)
+	mustPublish(t, ctx, pub, ev, suitePayload{"retry"})
+
+	var calls atomic.Int64
+	second := make(chan attemptObservation, 1)
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity("last2"), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		if calls.Add(1) == 1 {
+			return context.DeadlineExceeded // 首次失败
+		}
+		recordAttempt(second, e)
+		return nil
+	},
+		event.WithRetryLimit(2),
+		event.WithBackoff(zeroBackoff()),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(200*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	var obs attemptObservation
+	select {
+	case obs = <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting: second delivery")
+	}
+	if obs.attempts != 2 || !obs.lastAttempt {
+		t.Fatalf("second delivery attempts=%d last=%v, want 2/true", obs.attempts, obs.lastAttempt)
+	}
+}
+
+// RetryLimit=3 时倒数第二次（Attempts=2）不是最后一次：
+// LastAttempt 必须为 false。
+func testRetryLimitThreeNotLast(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	ev := event.Declare[suitePayload]("attempt-last3-" + t.Name())
+	pub := event.NewPublisher(d)
+	mustPublish(t, ctx, pub, ev, suitePayload{"retry3"})
+
+	var mu sync.Mutex
+	var seen []attemptObservation
+	callCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(seen)
+	}
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity("last3"), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		mu.Lock()
+		seen = append(seen, attemptObservation{e.Attempts, e.LastAttempt})
+		mu.Unlock()
+		return context.DeadlineExceeded // 恒失败，推进到第二次尝试
+	},
+		event.WithRetryLimit(3),
+		event.WithBackoff(zeroBackoff()),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(200*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitFor(t, 5*time.Second, "second attempt delivered", func() bool {
+		return callCount() >= 2
+	})
+	mu.Lock()
+	obs := seen[1]
+	mu.Unlock()
+	if obs.attempts != 2 || obs.lastAttempt {
+		t.Fatalf("second-to-last attempt attempts=%d last=%v, want 2/false", obs.attempts, obs.lastAttempt)
+	}
+}
+
+// RetryLimit=3 且 handler 持续失败：第三次（最后一次）Attempts==3、
+// LastAttempt==true。
+func testRetryLimitThreeLast(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	ev := event.Declare[suitePayload]("attempt-last3-final-" + t.Name())
+	pub := event.NewPublisher(d)
+	mustPublish(t, ctx, pub, ev, suitePayload{"retry3-final"})
+
+	var mu sync.Mutex
+	var seen []attemptObservation
+	callCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(seen)
+	}
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity("last3-final"), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		mu.Lock()
+		seen = append(seen, attemptObservation{e.Attempts, e.LastAttempt})
+		mu.Unlock()
+		return context.DeadlineExceeded // 恒失败，推进到第三次尝试
+	},
+		event.WithRetryLimit(3),
+		event.WithBackoff(zeroBackoff()),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(200*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitFor(t, 5*time.Second, "last attempt delivered", func() bool {
+		return callCount() >= 3
+	})
+	mu.Lock()
+	obs := seen[2]
+	mu.Unlock()
+	if obs.attempts != 3 || !obs.lastAttempt {
+		t.Fatalf("last attempt attempts=%d last=%v, want 3/true", obs.attempts, obs.lastAttempt)
+	}
+}
+
+// RetryLimit=1：首投即最后一次，Attempts==1、LastAttempt==true。
+func testRetryLimitOneFirstIsLast(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	ev := event.Declare[suitePayload]("attempt-limit1-" + t.Name())
+	pub := event.NewPublisher(d)
+	mustPublish(t, ctx, pub, ev, suitePayload{"only-one"})
+
+	got := make(chan attemptObservation, 1)
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity("limit1"), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		recordAttempt(got, e)
+		return nil
+	},
+		event.WithRetryLimit(1),
+		event.WithBackoff(zeroBackoff()),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(200*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	var obs attemptObservation
+	select {
+	case obs = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting: single-attempt delivery")
+	}
+	if obs.attempts != 1 || !obs.lastAttempt {
+		t.Fatalf("single-attempt delivery attempts=%d last=%v, want 1/true", obs.attempts, obs.lastAttempt)
+	}
+}
+
+// 接管认领递增的尝试次数到达 handler：先直接以极短租约认领且不处理，
+// 过期后由 Runner 接管，handler 读到 Attempts==2。
+//
+// 契约边界：接管侧在认领时直接置 failed 的路径（过期租约的尝试序号已达
+// RetryLimit）不会投递「最后一次」，本套件不为此路径断言任何投递。
+func testTakeoverAttemptsReachHandler(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	const identity = "attempt-takeover"
+	ev := event.Declare[suitePayload]("attempt-takeover-" + t.Name())
+	pub := event.NewPublisher(d)
+	mustPublish(t, ctx, pub, ev, suitePayload{"takeover"})
+
+	// 直接认领一次，不 Complete/Fail：租约时长为 0，认领即过期
+	// （契约判据为 lease_until <= now），Runner 启动后必然按接管认领。
+	first, err := d.Claim(ctx, event.ClaimQuery{
+		Type: ev.Name, ConsumerType: identity, Lease: 0,
+		Limit: 10, RetryLimit: 5, Now: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("direct claim: %v", err)
+	}
+	if len(first) != 1 || first[0].Attempts != 1 {
+		t.Fatalf("direct claim want 1 lease attempts=1, got %+v", first)
+	}
+
+	got := make(chan attemptObservation, 1)
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithIdentity(identity), event.WithLogger(discardLogger()))
+	if err := ev.SubscribeClaim(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		recordAttempt(got, e)
+		return nil
+	},
+		event.WithRetryLimit(5),
+		event.WithBackoff(zeroBackoff()),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(200*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	var obs attemptObservation
+	select {
+	case obs = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting: takeover delivery")
+	}
+	if obs.attempts != 2 || obs.lastAttempt {
+		t.Fatalf("takeover delivery attempts=%d last=%v, want 2/false", obs.attempts, obs.lastAttempt)
+	}
+}
+
+// 广播消费恒为零值：handler 读到 Attempts==0、LastAttempt==false。
+func testBroadcastAttemptsZero(t *testing.T, d event.Driver) {
+	ctx := t.Context()
+	ev := event.Declare[suitePayload]("attempt-bc-" + t.Name())
+	pub := event.NewPublisher(d)
+
+	got := make(chan attemptObservation, 1)
+	run := event.NewRunner(d, event.WithPollInterval(5*time.Millisecond),
+		event.WithLogger(discardLogger()))
+	if err := ev.SubscribeBroadcast(run, func(_ context.Context, e event.Envelope[suitePayload]) error {
+		recordAttempt(got, e)
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	mustPublish(t, ctx, pub, ev, suitePayload{"broadcast"})
+	var obs attemptObservation
+	select {
+	case obs = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting: broadcast delivery")
+	}
+	if obs.attempts != 0 || obs.lastAttempt {
+		t.Fatalf("broadcast attempts=%d last=%v, want 0/false", obs.attempts, obs.lastAttempt)
 	}
 }

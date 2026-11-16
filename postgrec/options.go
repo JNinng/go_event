@@ -1,12 +1,21 @@
 // Package postgrec 是 go_event 的 Postgres 后端，基于标准库 database/sql。
-// event / event_claim 两表、幂等 DDL、FOR UPDATE SKIP LOCKED 认领、
-// 惰性清理（design.md §7、§9.1）。
+// event / event_claim 两表、FOR UPDATE SKIP LOCKED 认领、惰性清理
+// （design.md §7、§9.1）。
+//
+// 持久结构按 NewDriver 的迁移模式处理：缺省 Create 在首次使用时自动执行
+// 基线（持迁移锁）；Verify 只读校验，None 不建也不校验——后两种模式要求
+// 表已由部署流程创建。运行账号只授 DML 权限时用 Verify / None；Create
+// 需要 DDL 权限。
 //
 // 连接由使用方建立并注册驱动（如 pgx/v5/stdlib），本包不携带任何
 // 数据库驱动。
 package postgrec
 
-import "time"
+import (
+	"time"
+
+	"github.com/jninng/go_event"
+)
 
 // Option 后端构造选项。
 type Option func(*config)
@@ -14,6 +23,8 @@ type Option func(*config)
 type config struct {
 	schema    string
 	retention time.Duration
+	mode      event.MigrateMode
+	modeSet   bool
 }
 
 // WithSchema 表所在 schema（缺省 public）。
@@ -29,8 +40,18 @@ func WithRetention(d time.Duration) Option {
 	return func(c *config) { c.retention = d }
 }
 
+// WithMigrateMode 设置运行面迁移模式（缺省 Create）：Create 首次使用时
+// 执行基线；Verify 只读校验、不执行 DDL；None 不建表也不校验。该选项
+// 只对 NewDriver 有意义，显式传给 Migrate 返回 ErrMigrateModeUnsupported。
+func WithMigrateMode(m event.MigrateMode) Option {
+	return func(c *config) {
+		c.mode = m
+		c.modeSet = true
+	}
+}
+
 func newConfig(opts []Option) *config {
-	c := &config{schema: "public", retention: 7 * 24 * time.Hour}
+	c := &config{schema: "public", retention: 7 * 24 * time.Hour, mode: event.MigrateCreate}
 	for _, opt := range opts {
 		opt(c)
 	}

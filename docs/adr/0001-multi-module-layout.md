@@ -25,6 +25,9 @@ Redis 等），以及契约测试套件 eventtest。需要决定仓库与依赖�
   `github.com/jninng/go_event/postgrec`、`github.com/jninng/go_event/pgxc`、
   `github.com/jninng/go_event/eventtest`。
 
+> 注记：观测依赖决策已由 design.md §4/§9.2 的可注入 `Metrics` 接口取代；
+> ADR 0007 §10 覆盖 P1 观测接口变更。core 不引入 otel 依赖，由实现方适配。
+
 ## 理由
 
 - 后端依赖隔离是硬需求：目标环境可能仅 PostgreSQL 可用，引入 core 不应拖入

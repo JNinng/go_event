@@ -16,7 +16,8 @@
 - **认领至少一次**：租约互斥、自动心跳续租、接管计入重试、递增退避、`done`/`failed` 终态；迟到的 `Complete`/`Fail` 不生效。
 - **多身份**：一个进程可承载多个消费者身份，各身份独立认领；同一 `Runner` 可混合承载广播与认领订阅。
 - **就近唤醒**：同进程发布触发本实例 poller 立即拉取；仅信号，不跳过存储，跨实例与信号丢失由轮询兜底。
-- **幂等发布**：发布侧生成唯一事件 ID，重复 `Append` 同 ID 幂等（首写为准）；元数据块原样透传（如 `trace_id`）。
+- **幂等发布**：发布侧生成或通过 `WithEventID` 显式指定唯一事件 ID，重复 `Append` 同 ID 幂等（首写为准）；元数据块原样透传（如 `trace_id`）。
+- **迁移模式**：`Create`（缺省，首次操作建基线）/ `Verify`（只读自检）/ `None`；运行账号只有 DML 权限时用后两者，部署期由高权限连接建表。
 - **最小缝合点**：`Driver` 只做单次原子操作，全部编排（轮询、心跳、重试、并发、优雅停机）在 core 的 `Runner`。
 - **多 module**：core 只依赖标准库，后端依赖按需引入；接口语义由 `eventtest` 契约测试约束。
 
@@ -47,7 +48,10 @@ go get github.com/jninng/go_event/eventtest  # 用 inmem 做本地测试 / 编�
 
 ## 快速开始
 
-以下示例使用 `pgxc`，建表由后端在首次使用时自动幂等完成：
+以下示例使用 `pgxc`。缺省迁移模式 `Create` 会在首次操作时持迁移锁建表；
+若表已由部署流程建好、运行账号只有 DML 权限，改用
+`pgxc.WithMigrateMode(event.MigrateVerify)`（启动自检）或
+`pgxc.WithMigrateMode(event.MigrateNone)`（完全交给部署流程）。
 
 ```go
 package main
@@ -124,7 +128,8 @@ module path 为 `github.com/jninng/go_event`，子 module 独立发版（如 `pg
 | `*.go`（仓库根） | core：事件声明、Publisher、Runner、Driver 接口、codec、就近唤醒（package `event`） |
 | `pgxc/` | Postgres 后端，pgx v5 连接池 |
 | `postgrec/` | Postgres 后端，标准库 `database/sql` |
-| `eventtest/` | 契约测试套件；`eventtest/inmem` 为进程内 Driver |
+| `postgresschema/` | Postgres 方言 DDL 单一事实源（结构化步骤、期望对象、锁语句，无驱动依赖） |
+| `eventtest/` | 契约测试套件；`eventtest/inmem` 为进程内 Driver，`eventtest/simmigrate` 为迁移模拟 backend |
 | `docs/` | 设计文档、API 签名、ADR |
 
 ## 文档
@@ -132,7 +137,7 @@ module path 为 `github.com/jninng/go_event`，子 module 独立发版（如 `pg
 - [使用指南](usage.md)：从安装到广播/认领消费、后端配置、测试与常见问题。
 - [设计文档](docs/design.md)：能力面与语义的单一事实源。
 - [API 签名](docs/api.md)：接口、结构体、选项与错误。
-- [架构决策记录](docs/adr/)：多 module 布局、两种消费方式、就近唤醒、需求驱动拉取、后端能力边界、广播/认领语义。
+- [架构决策记录](docs/adr/)：多 module 布局、两种消费方式、就近唤醒、需求驱动拉取、后端能力边界、广播/认领语义、迁移模式与迁移协议。
 
 ## 开发与测试
 
@@ -154,12 +159,12 @@ Postgres 集成测试需要真实数据库，通过 `TEST_POSTGRES_DSN` 启用�
 TEST_POSTGRES_DSN='postgres://user:pass@localhost:5432/postgres' go test ./...
 ```
 
-新后端必须实现 `event.Driver` 并通过 `eventtest.RunSuite` 与 `eventtest.RunRetentionSuite` 全套契约测试。
+新后端必须实现 `event.Driver` 并通过 `eventtest.RunSuite` 与 `eventtest.RunRetentionSuite` 全套契约测试；迁移面通过 `eventtest.RunMigrationSuite`（由后端提供 `MigrationBackend` 实现），进程内模拟 backend 常驻，真实 Postgres 集成由环境变量门控。
 
 ## 状态与路线
 
-- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）。
-- **P1（规划）**：outbox、otel metric 观测、管理面（failed 查询与重放）、延迟事件、LISTEN/NOTIFY 推送唤醒。
+- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、基线接管校验、迁移能力声明与 `RunMigrationSuite`。
+- **P1（规划）**：版本化迁移 `Upgrade` 与台账、outbox、可注入 `Metrics` 观测、管理面（failed 查询/重放、版本 reset/stamp）、延迟事件、LISTEN/NOTIFY 推送唤醒。
 - **P2（规划）**：NATS JetStream / RocketMQ / Redis Stream / RabbitMQ 后端、事件链、批量认领、限流背压。
 
 详见 [docs/design.md §9](docs/design.md)。

@@ -93,7 +93,8 @@ type subscribeConfig struct {
 	backoff       Backoff
 }
 
-// WithFetchLimit 每轮按类型限额取数（ADR 0004）。
+// WithFetchLimit 每轮按类型限额取数（ADR 0004）。认领侧实际批大小另受
+// 空闲并发槽位封顶（usage.md §6.6）。
 func WithFetchLimit(n int) SubscribeOption {
 	return func(c *subscribeConfig) { c.fetchLimit = n }
 }
@@ -160,7 +161,8 @@ type subscription struct {
 	// 运行时
 	sem       chan struct{}
 	wakeCh    chan struct{}
-	watermark string // 广播消费已读水位：core 内存维护，只进不退（ADR 0004）
+	claimCh   chan struct{} // 内部补认领信号：槽位释放后立即再认领一轮
+	watermark string        // 广播消费已读水位：core 内存维护，只进不退（ADR 0004）
 }
 
 func (r *Runner) subscribeBroadcast(typ string,
@@ -268,6 +270,11 @@ func (r *Runner) Start(ctx context.Context) error {
 	r.started = true
 	for _, s := range r.subs {
 		s.sem = make(chan struct{}, s.concurrency)
+		if s.mode == modeClaim {
+			// 容量 1、非阻塞发送：handler 结束释放槽位后立即补认领，
+			// 积压消化不依赖轮询间隔；多次释放合并为一次信号。
+			s.claimCh = make(chan struct{}, 1)
+		}
 		if r.wake != nil {
 			s.wakeCh = r.wake.subscribe(s.typ)
 		}
@@ -350,6 +357,10 @@ func (r *Runner) pollBroadcast(ctx context.Context, s *subscription) {
 }
 
 func (r *Runner) dispatchBroadcast(ctx context.Context, s *subscription, raw RawEnvelope) {
+	// 广播不消费尝试次数：无视 Fetch/Driver 可能带回的任何值，强制零值，
+	// 使「广播恒为 0/false」不依赖后端自律。
+	raw.Attempts = 0
+	raw.LastAttempt = false
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
@@ -384,18 +395,32 @@ func (r *Runner) runClaim(ctx context.Context, s *subscription) {
 			return
 		case <-timer.C:
 		case <-s.wakeCh:
+		case <-s.claimCh:
+			// 有槽位释放：立即补认领，不等轮询间隔。
 		}
 		r.pollClaim(ctx, s)
 		timer.Reset(r.pollInterval)
 	}
 }
 
+// pollClaim 认领一轮：有效批大小取 min(FetchLimit, 空闲并发槽位)，
+// 无空闲槽位时不认领。由此 Claim 返回的每条租约都能立即派发、立即启动
+// 心跳，不存在「已认领但排队等槽位、期间无人续租」的窗口；FetchLimit
+// 对认领是批次上限，不要求 ≤ Concurrency（缺省 100 > 1 合法）。
 func (r *Runner) pollClaim(ctx context.Context, s *subscription) {
+	free := cap(s.sem) - len(s.sem)
+	if free <= 0 {
+		return
+	}
+	limit := s.fetchLimit
+	if free < limit {
+		limit = free
+	}
 	leases, err := r.drv.Claim(ctx, ClaimQuery{
 		Type:         s.typ,
 		ConsumerType: s.consumerType,
 		Lease:        s.lease,
-		Limit:        s.fetchLimit,
+		Limit:        limit,
 		RetryLimit:   s.retryLimit,
 		Now:          time.Now(),
 	})
@@ -412,6 +437,10 @@ func (r *Runner) pollClaim(ctx context.Context, s *subscription) {
 }
 
 func (r *Runner) dispatchClaim(ctx context.Context, s *subscription, lease Lease) {
+	// 正常契约下（Driver 至多返回 Limit 条，且 Limit ≤ 空闲槽位）这里必然
+	// 立即取得槽位。后端违约返回超额批次时，多出的租约在此排队等槽位，
+	// 属违约后端的兜底；只有停机（ctx.Done）才放弃派发，租约到期后由其
+	// 他实例接管（at-least-once 不破坏）。
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
@@ -423,9 +452,22 @@ func (r *Runner) dispatchClaim(ctx context.Context, s *subscription, lease Lease
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		defer func() { <-s.sem }()
+		defer func() {
+			<-s.sem
+			// 槽位释放后非阻塞补一次认领信号：容量 1，堆积合并；Stop
+			// 路径上 runClaim 已退出，信号最多留在缓冲里，不阻塞。
+			r.signalClaim(s)
+		}()
 		r.processClaim(ctx, s, lease)
 	}()
+}
+
+// signalClaim 向订阅投递一次补认领信号（非阻塞、可合并）。
+func (r *Runner) signalClaim(s *subscription) {
+	select {
+	case s.claimCh <- struct{}{}:
+	default:
+	}
 }
 
 // processClaim 处理单个租约：心跳续租 + Complete/Fail（ADR 0006）。
@@ -433,6 +475,11 @@ func (r *Runner) processClaim(ctx context.Context, s *subscription, lease Lease)
 	hbDone := make(chan struct{})
 	r.wg.Add(1)
 	go r.heartbeatLoop(ctx, s, lease, hbDone)
+
+	// 尝试次数是 core 运行时注入字段：由租约的尝试序号与订阅级
+	// RetryLimit 计算，经 RawEnvelope 原样映射到 Envelope；Driver 不感知。
+	lease.Envelope.Attempts = lease.Attempts
+	lease.Envelope.LastAttempt = lease.Attempts >= s.retryLimit
 
 	// handler 用不取消的 ctx：停机等在途跑完（design.md §9.1），不因
 	// 停机取消把在途 handler 记为失败、消耗重试计数；Stop(ctx) 的

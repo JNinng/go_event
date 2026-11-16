@@ -5,8 +5,12 @@
 // 接管计入重试/心跳/退避/终态/迟到 Complete 与 Fail 不生效/新身份重放/
 // 超限行不占限额槽位）与 core 编排行为（广播基线在 Start 同步确立/失败
 // 跳过且不阻塞/各自全收/水位单调/无参事件/类型间不互相饿死/端到端认领/
-// 重试与耗尽/挂死接管/优雅停机/就近唤醒/订阅守卫）。RunRetentionSuite
-// 覆盖保留窗口惰性清理资格（design.md §5.2）。
+// 重试与耗尽/尝试次数与最后一次标记/挂死接管/优雅停机/就近唤醒/订阅守卫）。
+// RunRetentionSuite 覆盖保留窗口惰性清理资格（design.md §5.2）。
+// RunMigrationSuite 通过 MigrationBackend 适配接口覆盖初始化面：空库/完整
+// 基线/部分存量/定义冲突的 Migrate 与 Verify、三种迁移模式的 Driver 首次
+// 操作、导出物、并发首启与锁语义、Lock=none 变体，以及 fast / step 两条
+// 执行路径（含故障注入与回滚/收敛断言）。
 //
 // 用例命名遵循三段式「条件_动作_预期结果」。
 package eventtest
@@ -26,7 +30,12 @@ import (
 func RunSuite(t *testing.T, d event.Driver) {
 	// ---- 公共语义 ----
 	t.Run("DuplicateID_Append_FirstWriteWinsKeepsFirst", func(t *testing.T) { testAppendIdempotent(t, d) })
+	t.Run("DuplicateID_SameType_Publish_SingleRowFirstPayload", func(t *testing.T) { testDuplicateIDPublishSameType(t, d) })
+	t.Run("SameIDCrossType_Publish_FirstTypeOnlyNoError", func(t *testing.T) { testSameIDCrossTypePublish(t, d) })
+	t.Run("EmptyEventID_EventPublish_RejectedNoRow", func(t *testing.T) { testEmptyEventIDEventPublish(t, d) })
+	t.Run("EmptyEventID_PublishNoPayload_RejectedNoRow", func(t *testing.T) { testEmptyEventIDPublishNoPayload(t, d) })
 	t.Run("PublishMetadata_Append_StoredVerbatim", func(t *testing.T) { testMetadataPassthrough(t, d) })
+	t.Run("RuntimeFields_AppendFetchClaim_NotPersistedCoreComputesLast", func(t *testing.T) { testRuntimeFieldsNotPersisted(t, d) })
 	t.Run("PopulatedType_HeadPosition_ReturnsNewestPosition", func(t *testing.T) { testHeadPositionNewest(t, d) })
 	t.Run("UnknownType_HeadPosition_ReturnsEmptyString", func(t *testing.T) { testHeadPositionEmpty(t, d) })
 
@@ -44,6 +53,7 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("ExpiredLease_Claim_TakeoverIncrementsAttempts", func(t *testing.T) { testClaimTakeover(t, d) })
 	t.Run("OverLimitTakeover_Claim_TerminalNoLease", func(t *testing.T) { testClaimOverLimitTerminal(t, d) })
 	t.Run("OverLimitRow_Claim_DoesNotConsumeLimitSlot", func(t *testing.T) { testClaimOverLimitSlot(t, d) })
+	t.Run("SmallLimit_Claim_CapsBatch", func(t *testing.T) { testClaimLimit(t, d) })
 	t.Run("TerminalRows_Claim_Skipped", func(t *testing.T) { testClaimSkipTerminal(t, d) })
 	t.Run("NewConsumerType_Claim_ReplaysHistory", func(t *testing.T) { testNewConsumerReplays(t, d) })
 	t.Run("MatchingToken_Heartbeat_ExtendsLease", func(t *testing.T) { testHeartbeatExtends(t, d) })
@@ -64,10 +74,18 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("NoPayloadEvent_Claim_ProcessedOnceCompleted", func(t *testing.T) { testNoPayloadClaim(t, d) })
 	t.Run("FloodedType_FetchLimit_DoesNotStarveOtherTypes", func(t *testing.T) { testFetchLimitNoStarvation(t, d) })
 	t.Run("PublishedEnvelope_Claim_FieldsReachHandler", func(t *testing.T) { testEnvelopeFieldsReachHandler(t, d) })
+	t.Run("FirstDelivery_ClaimHandler_AttemptsOneLastFalse", func(t *testing.T) { testFirstDeliveryAttempts(t, d) })
+	t.Run("RetryLimitTwo_FirstAttemptFails_SecondDeliveryLastTrue", func(t *testing.T) { testRetryLimitTwoLastAttempt(t, d) })
+	t.Run("RetryLimitThree_SecondAttempt_LastAttemptFalse", func(t *testing.T) { testRetryLimitThreeNotLast(t, d) })
+	t.Run("RetryLimitThree_ThirdAttempt_LastTrue", func(t *testing.T) { testRetryLimitThreeLast(t, d) })
+	t.Run("RetryLimitOne_FirstDelivery_LastTrue", func(t *testing.T) { testRetryLimitOneFirstIsLast(t, d) })
+	t.Run("ExpiredDirectLease_RunnerTakeover_HandlerAttemptsIncremented", func(t *testing.T) { testTakeoverAttemptsReachHandler(t, d) })
+	t.Run("Broadcast_Handler_AttemptsZeroLastFalse", func(t *testing.T) { testBroadcastAttemptsZero(t, d) })
 	t.Run("ClaimSuccess_Complete_NoRedelivery", func(t *testing.T) { testClaimEndToEnd(t, d) })
 	t.Run("TransientFailures_Claim_RetriedUntilSuccess", func(t *testing.T) { testClaimRetryUntilSuccess(t, d) })
 	t.Run("RetryExhausted_Claim_TerminalNoMoreDelivery", func(t *testing.T) { testClaimRetryExhausted(t, d) })
 	t.Run("ExceededMaxProcessing_Claim_TakenOverByOtherInstance", func(t *testing.T) { testTakeoverAfterMaxProcessing(t, d) })
+	t.Run("ActiveLeaseWithinMaxProcessing_SecondInstance_NoTakeover", func(t *testing.T) { testActiveLeaseNoTakeover(t, d) })
 	t.Run("InFlightHandler_Stop_WaitsUntilCompletion", func(t *testing.T) { testGracefulStop(t, d) })
 	t.Run("AfterStop_Claim_NotResumed", func(t *testing.T) { testClaimNotResumedAfterStop(t, d) })
 	t.Run("LocalWakePublish_Runner_ImmediateDelivery", func(t *testing.T) { testLocalWake(t, d) })
