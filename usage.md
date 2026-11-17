@@ -515,6 +515,8 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
 
 只读查询面 `event.Inspector`（可选接口，pgxc / postgrec 均已提供）直接查询这两张表：状态与分档计数按 `event_claim` 行的 `status` 列与「无认领行」分档，failed 列表取 `status='failed'` 行并随行返回 `last_error` / `failed_at`——查询与落库事实严格对齐，见 [§11](#11-运维注意事项) 的「failed 事件查询」。`NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL，只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
 
+管理写路径由独立 `event.Admin`（可选接口，pgxc / postgrec / inmem 均已提供）承载：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领，写法与 `event_claim` 落库事实对齐（置 `retrying`、`claim_count=0`、清租约、`failed_at=NULL`、`last_error` 保留），见 [§11](#11-运维注意事项) 的「failed 手工重放（Admin）」。`NewAdmin` 与 `NewDriver` 共享连接与命名空间选项，写路径不经 Driver 类型暴露、只经该构造获得，鉴权由使用方负责。
+
 ### 8.4 迁移模式与权限
 
 `event.MigrateMode` 有三种模式（没有 `Upgrade`：升级随部署隐式发生，见
@@ -632,6 +634,8 @@ func TestMyBackendRetention(t *testing.T) {
 
 提供只读查询面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunInspectorSuite`：套件对传入的 Driver 做 `event.Inspector` 类型断言探测，失败即 Fatal——查询结果与 Claim/Fail/Complete 落库事实的比对是查询面契约的一部分。
 
+提供管理面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunAdminReplaySuite(t, d, admin)`：管理写路径不经 Driver 类型暴露，`admin` 由后端 `NewAdmin` 构造传入（与 `d` 共享状态/连接），缺失即 Fatal——重放语义（仅 failed 可重放、计数归零、判别统一、`last_error` 保留 / `failed_at` 清空、并发 CAS 防护）是管理面契约的一部分。
+
 迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
 ### 9.3 Postgres 集成测试
@@ -719,7 +723,13 @@ func TestMyBackendRetention(t *testing.T) {
   - failed 事件偏移分页列表：`last_error` / `failed_at` 随行返回，按 `failed_at` 降序（最新在前）、同刻按事件 ID 升序；Offset 越界返回空列表（非错误），`Limit <= 0` 返回空，偏移分页无快照——跨页间隙的终态变化可能造成重复或遗漏。**升级边界**：不变式「`failed_at` 非空 ⟺ failed」仅对 v2 加列后的写路径成立——v2 是 `ADD COLUMN`、无回填，升级前已存在的 failed 行该列为 NULL，列表中映射为零值。
   - 结果仅在**保留窗口内可见**（硬边界）：超窗行被惰性清理删除后自然查不到，Inspector 不做额外过滤。
   - `NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL——只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
-  - 手工重放（仅 `failed` 可重放，`done` 不可逆）由管理面 `Admin` 承载，尚未提供；也可直接查库定位：`event_claim` 的 `last_error` / `failed_at`（`failed_at IS NOT NULL` 即当前 failed 行，见 [§6.4](#64-成功与失败)）。
+  - 也可直接查库定位：`event_claim` 的 `last_error` / `failed_at`（`failed_at IS NOT NULL` 即当前 failed 行，见 [§6.4](#64-成功与失败)）。
+- **failed 手工重放（Admin）**：管理写路径由独立 `event.Admin` 承载（pgxc / postgrec / inmem 均提供 `NewAdmin`，与 Driver 共享连接与命名空间选项；不进 Driver、不挂后端 Driver 类型——「非管理面路径无法调用」由类型形态保证），当前唯一操作 `ReplayFailed(ctx, eventID, consumerType, now)` 把（事件 × 消费者身份）的 failed 终态行重新置为可认领：
+  - 仅 `status='failed'` 的行可重放：`done` 幂等不可逆、不重放；`active`（租约活跃）与 `retrying`（自动重试退避中）拒绝且不改动；行不存在（事件未知、超保留窗口被清理、该身份尚无认领行）与非 failed 行判别统一——返回 `ok=false` 且无错误，需要区分原因先经 `Inspector.ClaimState` 查询；执行故障经 `error` 返回。
+  - 重放写入：置 `retrying`、`claim_count=0`（此后 Fail 的重试计数从合法范围重新开始）、清 `lease_token`、`lease_until` 置为重放时刻（原租约凭证失效）、`next_eligible_at=now`（立即可认领、不做退避）、`failed_at=NULL`、`last_error` 保留（排障历史，直到下一次终态失败覆盖）。
+  - 并发防护是单条条件更新（CAS，仅命中 `status='failed'`）：并发重放恰好一次生效；已被重新认领（接管）或已完成的行不受迟到重放影响。
+  - **重放窗口 = 保留窗口**：超窗行已被惰性清理删除，重放该键即 `ok=false`——发现 failed 后应在保留窗口内处置；窗口配置见 [§8.5](#85-保留窗口与惰性清理)。
+  - 鉴权与操作审计由使用方负责：管理面对象只应授予运维角色。
 
 ## 12. 错误与排查
 

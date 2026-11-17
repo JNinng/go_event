@@ -15,6 +15,7 @@
 - **广播发完即忘**：`Runner.Start` 内同步锚定基线，只处理启动后发布的事件；失败仅记日志跳过，不重试、不阻塞、不保序。
 - **认领至少一次**：租约互斥、自动心跳续租、接管计入重试、递增退避、`done`/`failed` 终态；失败终态留存错误摘要与时刻（`last_error`/`failed_at`，去除控制字符、截断 4 KiB、不含堆栈），可直接查库排障；迟到的 `Complete`/`Fail` 不生效。
 - **查询面（可选）**：`Inspector` 只读查询——事件 × 消费者身份的状态与重试计数、按身份的分档计数（「待处理」= 该身份无认领行）、failed 事件偏移分页列表（错误摘要与终态时刻随行返回）；按能力探测接入（对 `Driver` 做 `event.Inspector` 类型断言或后端 `NewInspector` 构造），结果仅在保留窗口内可见。
+- **管理面（可选）**：`Admin` 写操作与运行面分离、不进 `Driver`——`ReplayFailed` 把（事件 × 消费者身份）的 `failed` 终态行重置为可认领（仅 failed 可重放，`done` 不可逆；重试计数归零、清租约、立即可认领；`last_error` 保留、`failed_at` 清空）；经后端 `NewAdmin` 构造，重放窗口 = 保留窗口。
 - **多身份**：一个进程可承载多个消费者身份，各身份独立认领；同一 `Runner` 可混合承载广播与认领订阅。
 - **就近唤醒**：同进程发布触发本实例 poller 立即拉取；仅信号，不跳过存储，跨实例与信号丢失由轮询兜底。
 - **幂等发布**：发布侧生成或通过 `WithEventID` 显式指定唯一事件 ID，重复 `Append` 同 ID 幂等（首写为准）；元数据块原样透传（如 `trace_id`）。
@@ -140,7 +141,7 @@ module path 为 `github.com/jninng/go_event`，子 module 独立发版（如 `pg
 - [使用指南](usage.md)：从安装到广播/认领消费、后端配置、测试与常见问题。
 - [设计文档](docs/design.md)：能力面与语义的单一事实源。
 - [API 签名](docs/api.md)：接口、结构体、选项与错误。
-- [架构决策记录](docs/adr/)：多 module 布局、两种消费方式、就近唤醒、需求驱动拉取、后端能力边界、广播/认领语义、迁移模式与迁移协议。
+- [架构决策记录](docs/adr/)：多 module 布局、两种消费方式、就近唤醒、需求驱动拉取、后端能力边界、广播/认领语义、迁移模式与迁移协议、错误摘要落库（0009）、管理面写面与重放（0010）。
 
 ## 开发与测试
 
@@ -162,12 +163,12 @@ Postgres 集成测试需要真实数据库，通过 `TEST_POSTGRES_DSN` 启用�
 TEST_POSTGRES_DSN='postgres://user:pass@localhost:5432/postgres' go test ./...
 ```
 
-新后端必须实现 `event.Driver` 并通过 `eventtest.RunSuite` 与 `eventtest.RunRetentionSuite` 全套契约测试；迁移面通过 `eventtest.RunMigrationSuite`（由后端提供 `MigrationBackend` 实现），进程内模拟 backend 常驻，真实 Postgres 集成由环境变量门控；提供只读查询面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunInspectorSuite`（套件对 Driver 做 `event.Inspector` 类型断言探测）。
+新后端必须实现 `event.Driver` 并通过 `eventtest.RunSuite` 与 `eventtest.RunRetentionSuite` 全套契约测试；迁移面通过 `eventtest.RunMigrationSuite`（由后端提供 `MigrationBackend` 实现），进程内模拟 backend 常驻，真实 Postgres 集成由环境变量门控；提供只读查询面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunInspectorSuite`（套件对 Driver 做 `event.Inspector` 类型断言探测）；提供管理面的后端加跑 `eventtest.RunAdminReplaySuite`（`admin` 由后端 `NewAdmin` 构造传入）。
 
 ## 状态与路线
 
-- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`；失败错误摘要落库（`Fail` 扩展，ADR 0009）；`Inspector` 只读查询面（状态 / 分档计数 / failed 分页列表，按能力探测接入）；otel 指标 + slog + 类型化 Observer 观测面（ADR 0008）。
-- **P1（规划）**：`Admin` 管理面（failed 手工重放）、outbox、接管计数、延迟事件、LISTEN/NOTIFY 推送唤醒。
+- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`；失败错误摘要落库（`Fail` 扩展，ADR 0009）；`Inspector` 只读查询面（状态 / 分档计数 / failed 分页列表，按能力探测接入）；`Admin` 管理面 failed 手工重放（ADR 0010）；otel 指标 + slog + 类型化 Observer 观测面（ADR 0008）。
+- **P1（规划）**：outbox、接管计数、延迟事件、LISTEN/NOTIFY 推送唤醒。
 - **P2（规划）**：NATS JetStream / RocketMQ / Redis Stream / RabbitMQ 后端、事件链、批量认领、限流背压。
 
 详见 [docs/design.md §9](docs/design.md)。

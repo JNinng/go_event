@@ -32,6 +32,7 @@ drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
 | 递增退避 | 原生 | Fail 事务内按 `Backoff.Next` 计算 `next_eligible_at` |
 | 错误摘要与终态时刻（Fail 落库） | 原生 | 终态 UPDATE 写 `last_error`（`SanitizeErrorSummary` 清洗：去除 Unicode 控制字符、4 KiB 截断、不落堆栈）与 `failed_at`；接管终态仅写 `failed_at`；重试中与迟到 Fail 不写（ADR 0009） |
 | 查询面 Inspector（状态 / 分档计数 / failed 列表） | 原生 | SQL 直查 `event` / `event_claim`：状态与计数按认领行 `status` 与「无认领行」分档（「待处理」= 无认领行，不做租约过期推断）；failed 列表按 `failed_at` 降序偏移分页，`last_error` / `failed_at` 随行返回（ADR 0009）；只读、不参与认领路径；结果仅在保留窗口内可见（硬边界）。`NewInspector` 构造（与 Driver 共享连接与命名空间）或对 Driver 做 `event.Inspector` 类型断言探测 |
+| 管理面 Admin（failed 手工重放） | 原生 | `NewAdmin` 构造（与 Driver 共享连接与命名空间选项；写路径不经 Driver 类型暴露，ADR 0010）：`ReplayFailed` 以单条条件更新（`WHERE status='failed'` 的 CAS）置 `retrying`、`claim_count=0`、清 `lease_token`、`lease_until` / `next_eligible_at` 置重放时刻、`failed_at=NULL`、`last_error` 保留（ADR 0009）；done / active / retrying 与行不存在统一 `ok=false` 且不改动；重放窗口 = 保留窗口。契约套件 `eventtest.RunAdminReplaySuite` 全过 |
 | 惰性清理 | 原生 | 超窗且无活跃租约（无论终态）行删除，`event_claim` 经 FK ON DELETE CASCADE 级联；墙钟节流，随 Append 机会性执行 |
 
 ## 迁移能力
@@ -61,6 +62,7 @@ drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
 | 能力 | 支持度 |
 | --- | --- |
 | 查询面 Inspector | 已支持：`NewInspector` 构造或对 `Driver` 做 `event.Inspector` 类型断言（契约套件 `eventtest.RunInspectorSuite` 全过） |
+| 管理面 Admin（failed 重放） | 已支持：`NewAdmin` 构造（写路径不经 Driver 类型暴露；契约套件 `eventtest.RunAdminReplaySuite` 全过） |
 | 延迟事件（deliver_at） | P1 可选拓展，Postgres 原生可实现 |
 | LISTEN/NOTIFY 推送唤醒 | 不支持（P1 由 pgxc 提供；本后端退化回轮询） |
 | outbox（TransactionalAppender） | P1 可选拓展 |

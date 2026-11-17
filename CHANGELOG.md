@@ -12,6 +12,9 @@
 - **`Inspector` 只读查询面（可选接口，按能力探测，不加入 `Driver`）**：三类查询——某（事件 × 消费者身份）的当前状态与重试计数；按消费者身份的状态分档计数（「待处理」= 该身份无认领行，retrying / processing / failed / done 按认领行 `status` 分档，done 为归档档）；failed 事件偏移分页列表（错误摘要与 `failed_at` 随行返回，按 `failed_at` 降序、同刻按事件 ID 升序）。
   - pgxc / postgrec / inmem 均已提供：`NewInspector` 构造（与 `Driver` 共享连接与命名空间选项），或对 `Driver` 做 `event.Inspector` 类型断言探测。
   - 只读边界：不产生簿记、不参与认领/完成路径、不做租约过期推断；结果仅在保留窗口内可见（硬边界，超窗行被清理后自然不可见）。`eventtest` 新增 `RunInspectorSuite` 契约套件（三类查询与 Claim/Fail/Complete 落库事实比对）。
+- **`Admin` 管理面写接口（可选接口，不加入 `Driver`、不挂后端 `Driver` 类型）**：`ReplayFailed` 把（事件 × 消费者身份）的 `failed` 终态行重新置为可认领——仅 `failed` 可重放（`done` 不可逆；`active` / `retrying` 拒绝且不改动），单条 CAS 条件更新保证并发重放 / 认领 / Fail 竞态下不改写非 failed 行。重放置 `retrying`、`claim_count=0`（此后 Fail 的重试计数从合法范围重新开始）、清 `lease_token` / `lease_until`、`next_eligible_at=now`（立即可认领）、`failed_at` 清空、`last_error` 保留（ADR 0009 口径）；无效果（行不存在或非 failed）统一返回 `ok=false`；**重放窗口 = 保留窗口**。
+  - pgxc / postgrec / inmem 均已提供：`NewAdmin` 构造（与 `Driver` 共享连接与命名空间选项；管理写路径不经 `Driver` 类型暴露，只经本构造获得，鉴权由使用方负责）。
+  - `eventtest` 新增 `RunAdminReplaySuite` 契约套件（端到端重放、计数归零与循环重放、非 failed 行无效果判别统一、摘要保留事实、并发恰好一次生效、被接管后迟到重放不污染新属主）。
 
 ### 破坏性变更与兼容期
 
@@ -21,5 +24,6 @@
 ### 文档
 
 - 新增 [ADR 0009](docs/adr/0009-error-summary-persistence.md)：错误摘要落库口径与 `Fail` 接口扩展的决策记录。
+- 新增 [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)：管理面写操作的承载形态（独立 `Admin`、不经 `Driver` 类型暴露）与 failed 手工重放语义的决策记录。
 
 [Unreleased]: https://github.com/JNinng/go_event/compare/v0.1.1...HEAD

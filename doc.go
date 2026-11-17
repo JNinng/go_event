@@ -5,7 +5,9 @@
 //
 // 能力面与语义的单一事实源是 docs/design.md 与 docs/adr/；签名见
 // docs/api.md。必选接口面只有 Driver 一个（单次原子操作，最小缝合点），
-// 全部编排逻辑在本包的 Runner 完成；查询面 Inspector 为只读可选接口，
-// 按能力探测接入（ADR 0005）；Publisher 与 Runner 为具体类型，
-// 依赖经构造函数显式注入，无包级可变状态。
+// 全部编排逻辑在本包的 Runner 完成；查询面 Inspector（只读）与管理面
+// Admin（写操作）为可选接口，按能力探测接入（ADR 0005）——Inspector 可
+// 对后端 Driver 类型断言探测，Admin 只经后端 NewAdmin 构造、不经任何
+// 运行面类型暴露；Publisher 与 Runner 为具体类型，依赖经构造函数显式
+// 注入，无包级可变状态。
 package event

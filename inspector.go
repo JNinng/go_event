@@ -56,7 +56,7 @@ const (
 	ClaimRetrying   ClaimStatus = "retrying"   // 已失败退避中，待重认领
 	ClaimProcessing ClaimStatus = "processing" // 租约内处理中（落库 status='active'）
 	ClaimDone       ClaimStatus = "done"       // 完成终态（幂等、不可逆）
-	ClaimFailed     ClaimStatus = "failed"     // 失败终态（可经管理面重放，后续 Admin）
+	ClaimFailed     ClaimStatus = "failed"     // 失败终态（可经管理面 Admin 重放）
 )
 
 // ClaimState （事件 × 消费者身份）的当前查询面状态。

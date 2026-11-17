@@ -2,7 +2,9 @@
 // 本地测试/示例使用。条件过滤在内存模拟，能力边界注明「模拟」档
 // （ADR 0005）。同一实现同时提供只读查询面 event.Inspector（经
 // NewInspector 构造或对 Driver 类型断言探测）：查询口径与 Postgres
-// 后端一致，返回落库事实、不做租约过期推断。
+// 后端一致，返回落库事实、不做租约过期推断。管理写路径由独立 Admin
+// 承载（NewAdmin，与 Driver 共享同一份内存状态，不挂 Driver 类型）：
+// failed 事件手工重放，语义与 Postgres 后端一致。
 package inmem
 
 import (

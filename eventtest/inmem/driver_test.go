@@ -72,6 +72,23 @@ func TestInmemInspectorSuite(t *testing.T) {
 	eventtest.RunInspectorSuite(t, inmem.New())
 }
 
+// Admin 管理面重放契约：写路径由独立 Admin 承载（NewAdmin 构造，与 Driver
+// 共享同一份内存状态，不挂 Driver 类型）。
+func TestInmemAdminReplaySuite(t *testing.T) {
+	d := inmem.New()
+	eventtest.RunAdminReplaySuite(t, d, inmem.NewAdmin(d))
+}
+
+// NewAdmin 传入非本包构造的 Driver 视为装配错误（panic）。
+func TestForeignDriver_NewAdmin_Panics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewAdmin with a foreign driver must panic")
+		}
+	}()
+	_ = inmem.NewAdmin(struct{ event.Driver }{})
+}
+
 // 保留窗口惰性清理契约：每用例独立的短窗口全新 Driver（design.md §5.2）。
 func TestInmemRetentionSuite(t *testing.T) {
 	eventtest.RunRetentionSuite(t, func(t *testing.T) event.Driver {

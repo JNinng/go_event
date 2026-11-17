@@ -122,6 +122,18 @@ func TestPostgrecInspectorSuite(t *testing.T) {
 	eventtest.RunInspectorSuite(t, drv)
 }
 
+// Admin 管理面重放契约（写路径由独立 Admin 承载：postgrec.NewAdmin 构造，
+// 与 Driver 共享连接与命名空间选项，不挂 Driver 类型）。重放事实经
+// ClaimStateReader 装配（SQL 适配 event_claim 行）断言。
+func TestPostgrecAdminReplaySuite(t *testing.T) {
+	db, drv, schema := testDB(t)
+	admin := postgrec.NewAdmin(db, postgrec.WithSchema(schema))
+	eventtest.RunAdminReplaySuite(t, suiteDriver{
+		Driver: drv,
+		states: claimStateReader{db: db, schema: schema},
+	}, admin)
+}
+
 // 保留窗口惰性清理契约：每用例独立 schema + 短保留窗口的全新 Driver
 // （design.md §5.2）。
 func TestPostgrecRetentionSuite(t *testing.T) {

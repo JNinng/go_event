@@ -644,7 +644,7 @@ const (
     ClaimRetrying   ClaimStatus = "retrying"   // 已失败退避中，待重认领
     ClaimProcessing ClaimStatus = "processing" // 租约内处理中（落库 status='active'）
     ClaimDone       ClaimStatus = "done"       // 完成终态（幂等、不可逆）
-    ClaimFailed     ClaimStatus = "failed"     // 失败终态（重放归 Admin，后续项）
+    ClaimFailed     ClaimStatus = "failed"     // 失败终态（可经管理面 Admin 重放）
 )
 
 // ClaimState （事件 × 消费者身份）的当前查询面状态。Attempts 是已计入的
@@ -734,6 +734,43 @@ func WithScopeName(scope string) Option         // 缺省模块名
 //（schema、mode、duration_seconds）。
 ```
 
+### 2.11 Admin（管理面写接口，可选）
+
+管理面写操作与运行面分离（design.md §6）：`Admin` 不进入 `Driver` 契约，
+**也不挂在后端 Driver 类型上**——与 Inspector 的类型断言探测不同，管理写
+路径只能经后端 `NewAdmin` 显式构造（与 `Driver` 共享连接与命名空间选项），
+「非管理面路径无法调用」由类型形态保证。鉴权与操作审计由使用方负责。
+形态与重放语义见 [ADR 0010](adr/0010-admin-write-plane-and-replay.md)。
+
+```go
+// Admin 管理面写操作（可选接口）：仅处置认领消费的 failed 终态行——
+// done 幂等不可逆、不重放；active / retrying 行不重放（自动重试路径仍在
+// 正常运转）。重放窗口 = 保留窗口：超窗且无活跃租约的行已被惰性清理
+// 删除，重放该键与「行不存在」同判别。
+type Admin interface {
+    // ReplayFailed 把（事件 × 消费者身份）的 failed 终态认领行重新置为
+    // 可认领（手工重放，粒度与认领键一致）。仅 status='failed' 的行可
+    // 重放，由单条条件更新（CAS）完成：并发重放 / 认领 / Fail 竞态下
+    // 不改写非 failed 行——已被重新认领（接管）或已完成的行不受迟到的
+    // 重放请求影响。
+    //
+    // 重放写入（全部字段一次置入）：status='retrying'、claim_count=0
+    // （此后 Fail 的重试计数从合法范围重新开始，RetryLimit 语义不失效）；
+    // lease_token 清空（空串）、lease_until 置为 now（原租约凭证失效）；
+    // next_eligible_at=now（立即可认领，不做退避）；failed_at 清空、
+    // last_error 保留（ADR 0009 口径：重放行与失败行经 failed_at 区分，
+    // 摘要留作最近一次失败的排障历史）。
+    //
+    // 返回值（与 Inspector 的 ok 判别风格一致）：ok=true 表示行原为
+    // failed 且已重放；ok=false（nil error）表示无效果——行不存在（事件
+    // 未知、超保留窗口被清理、该身份尚无认领行）或行非 failed 终态
+    // （done / active / retrying），判别方式统一，需要区分原因时先经
+    // Inspector.ClaimState 查询；err 非 nil 为执行故障（连接、迁移等），
+    // 不得折叠为 ok=false。
+    ReplayFailed(ctx context.Context, eventID, consumerType string, now time.Time) (ok bool, err error)
+}
+```
+
 ## 3. Postgres 后端签名（postgrec / pgxc）
 
 两个 Postgres 后端共享同一套能力与选项语义，仅连接载体不同：`postgrec`
@@ -753,6 +790,11 @@ func NewDriver(db *sql.DB, opts ...Option) event.Driver
 // 处理持久结构）。探测方式：对 NewDriver 返回值做 event.Inspector 类型
 // 断言（本后端 Driver 同时实现该接口），或经本构造函数显式构造。
 func NewInspector(db *sql.DB, opts ...Option) event.Inspector
+
+// NewAdmin 构造管理面 event.Admin（§2.11）：与 NewDriver 共享连接与命名
+// 空间选项（同一 schema、同一迁移模式语义）。管理写路径不经 Driver 类型
+// 暴露——Admin 只经本构造获得；鉴权由使用方负责。
+func NewAdmin(db *sql.DB, opts ...Option) event.Admin
 
 // Migrate 幂等应用版本计划（Create 语义）：单事务内取迁移锁、做接管校验
 // （对象集合与计划期望比对，仅缺对象放行）、执行计划内全部语句（基线与
@@ -789,9 +831,14 @@ package pgxc // github.com/jninng/go_event/pgxc（pgx v5）
 func NewDriver(pool *pgxpool.Pool, opts ...Option) event.Driver
 
 // NewInspector 构造只读查询面 event.Inspector（§2.10）：与 NewDriver 共享
-// 连接与命名空间选项。探测方式：对 NewDriver 返回值做 event.Inspector
-// 类型断言（本后端 Driver 同时实现该接口），或经本构造函数显式构造。
+// 连接与命名空间选项。探测方式：对 NewDriver 返回值做 event.Inspector 类型
+// 断言（本后端 Driver 同时实现该接口），或经本构造函数显式构造。
 func NewInspector(pool *pgxpool.Pool, opts ...Option) event.Inspector
+
+// NewAdmin 构造管理面 event.Admin（§2.11）：与 NewDriver 共享连接与命名
+// 空间选项。管理写路径不经 Driver 类型暴露——Admin 只经本构造获得；
+// 鉴权由使用方负责。
+func NewAdmin(pool *pgxpool.Pool, opts ...Option) event.Admin
 
 // Migrate 幂等应用版本计划（Create 语义），与 postgrec.Migrate 相同的
 // 接管校验、整版单事务与失败回滚语义。
@@ -891,6 +938,15 @@ func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver)
 // 实现该接口），探测失败按 ClaimStateReader 先例 Fatal 终止——提供查询面
 // 的后端必须全过本套件。
 func RunInspectorSuite(t *testing.T, d event.Driver)
+
+// RunAdminReplaySuite 运行管理面 Admin 重放的契约测试（design.md §5.3/
+// §9.2、ADR 0010）：重放后可再认领并完成、重试计数归零与循环重放、
+// done/active/retrying/未知键无效果且判别统一、last_error 保留与
+// failed_at 清空（经 ClaimStateReader 断言）、并发重放恰好一次生效、
+// 被接管后迟到重放不污染新属主行。admin 须非空（管理写路径不经 Driver
+// 类型暴露，只能由后端 NewAdmin 构造获得；缺失即 Fatal——提供管理面的
+// 后端必须全过本套件）；d 须实现 ClaimStateReader。
+func RunAdminReplaySuite(t *testing.T, d event.Driver, admin event.Admin)
 
 // RunMigrationSuite 运行迁移契约测试。suite 本身不读环境变量；门控
 // （如 TEST_POSTGRES_DSN）在具体后端的测试内完成。
@@ -1004,6 +1060,11 @@ func New(opts ...Option) event.Driver
 // 共享同一实现（*Driver 同时实现 Inspector），查询口径与 Postgres 后端
 // 一致——返回落库事实，不做租约过期推断。
 func NewInspector(opts ...Option) event.Inspector
+
+// NewAdmin 构造进程内管理面 event.Admin（§2.11）：与传入的 Driver（须为
+// 本包 New 构造，与 NewInspector 共享同一底层实例）共享同一份内存状态，
+// 写路径不挂 Driver 类型；传入其他实现的 Driver 视为装配错误（panic）。
+func NewAdmin(d event.Driver) event.Admin
 
 // Capabilities 返回零值能力声明：无持久结构，迁移为 no-op（无 DDL
 // 原子性、无锁、无探测、无错误分类）。
