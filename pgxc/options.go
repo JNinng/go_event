@@ -10,9 +10,12 @@
 package pgxc
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/jninng/go_event"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Option 后端构造选项。
@@ -23,6 +26,10 @@ type config struct {
 	retention time.Duration
 	mode      event.MigrateMode
 	modeSet   bool
+
+	logger *slog.Logger         // 迁移生命周期日志（缺省构造期快照 slog.Default()）
+	mp     metric.MeterProvider // nil = 未注入（newConfig 快照全局，未装配时即 noop）
+	scope  string
 }
 
 // WithSchema 表所在 schema（缺省 public）。
@@ -50,9 +57,34 @@ func WithMigrateMode(m event.MigrateMode) Option {
 }
 
 func newConfig(opts []Option) *config {
-	c := &config{schema: "public", retention: 7 * 24 * time.Hour, mode: event.MigrateCreate}
+	c := &config{
+		schema:    "public",
+		retention: 7 * 24 * time.Hour,
+		mode:      event.MigrateCreate,
+		logger:    slog.Default(),
+		mp:        otel.GetMeterProvider(), // 构造期快照；快照后替换全局不追溯
+		scope:     defaultScope,
+	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c
+}
+
+// WithLogger 注入 slog Logger（缺省构造期快照 slog.Default()）：仅迁移
+// 完成这类低频生命周期事件使用，热路径不打日志。
+func WithLogger(l *slog.Logger) Option {
+	return func(c *config) { c.logger = l }
+}
+
+// WithMeterProvider 注入指标 MeterProvider；缺省构造期快照
+// otel.GetMeterProvider()（未装配时即 noop provider，天然静默）。
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(c *config) { c.mp = mp }
+}
+
+// WithScopeName 覆写指标 scope 与指标名前缀（<scope>.<动作>）；缺省为
+// 模块名 pgxc。部署期决策——改名会使仪表盘口径漂移。
+func WithScopeName(scope string) Option {
+	return func(c *config) { c.scope = scope }
 }

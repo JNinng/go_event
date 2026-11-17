@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Runner 消费编排器（design.md §4）：poll 循环、心跳、重试上限、就近唤醒、
@@ -18,6 +21,13 @@ type Runner struct {
 	pollInterval time.Duration
 	wake         *LocalWake
 	logger       *slog.Logger
+
+	mp    metric.MeterProvider // 选项注入值；nil = 未注入（构造期全局兜底）
+	scope string
+	obs   Observer
+
+	metrics *runnerMetrics // 构造期从快照 provider 派生
+	hub     observerHub
 
 	mu      sync.Mutex
 	subs    []*subscription
@@ -53,6 +63,8 @@ func NewRunner(d Driver, opts ...RunnerOption) *Runner {
 	for _, opt := range opts {
 		opt.applyRunner(r)
 	}
+	r.metrics = newRunnerMetrics(r.mp, scopeOrDefault(r.scope))
+	r.hub = newObserverHub(r.obs)
 	return r
 }
 
@@ -285,13 +297,16 @@ func (r *Runner) Start(ctx context.Context) error {
 			go r.runClaim(runCtx, s)
 		}
 	}
+	r.logger.Info("event: runner started", "subscriptions", len(r.subs))
 	return nil
 }
 
 // Stop 优雅停机：停止认领/拉取，等待在途 handler 跑完（design.md §9.1）。
 func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Lock()
+	wasStarted := false
 	if r.cancel != nil {
+		wasStarted = true
 		r.cancel()
 	}
 	r.mu.Unlock()
@@ -302,8 +317,17 @@ func (r *Runner) Stop(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		if wasStarted {
+			r.logger.Info("event: runner stopped")
+			r.hub.runnerStopped(StopEvent{})
+		}
 		return nil
 	case <-ctx.Done():
+		if wasStarted {
+			r.logger.Warn("event: runner stop timed out, in-flight handlers continuing",
+				logErrAttrs(ctx.Err())...)
+			r.hub.runnerStopped(StopEvent{TimedOut: true})
+		}
 		return ctx.Err()
 	}
 }
@@ -339,10 +363,16 @@ func (r *Runner) runBroadcast(ctx context.Context, s *subscription) {
 }
 
 func (r *Runner) pollBroadcast(ctx context.Context, s *subscription) {
+	start := time.Now()
 	batch, err := r.drv.Fetch(ctx, FetchQuery{Type: s.typ, After: s.watermark, Limit: s.fetchLimit})
+	res := pollResult(err)
+	attrs := resultAttrs(res)
+	r.metrics.fetch.Add(ctx, 1, attrs)
+	r.metrics.fetchDuration.Record(ctx, time.Since(start).Seconds(), attrs)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			r.logger.Error("event: broadcast fetch failed", "type", s.typ, "err", err)
+			r.logger.Error("event: broadcast fetch failed",
+				append([]any{"type", s.typ}, logErrAttrs(err))...)
 		}
 		return
 	}
@@ -372,10 +402,21 @@ func (r *Runner) dispatchBroadcast(ctx context.Context, s *subscription, raw Raw
 		defer func() { <-s.sem }()
 		// handler 用不取消的 ctx：优雅停机等在途跑完（design.md §9.1），
 		// 不因停机取消而把在途事件记为失败（广播跳过/认领计次）。
-		if err := callHandler(s.handler, context.WithoutCancel(ctx), raw); err != nil {
+		hctx := context.WithoutCancel(ctx)
+		start := time.Now()
+		err := callHandler(s.handler, hctx, raw)
+		res := handlerResult(err)
+		hAttrs := metric.WithAttributes(
+			attribute.String(attrMode, modeNameBroadcast),
+			attribute.String(attrEvent, s.typ),
+			attribute.String(attrResult, res))
+		r.metrics.consume.Add(hctx, 1, hAttrs)
+		r.metrics.handleDuration.Record(hctx, time.Since(start).Seconds(), hAttrs)
+		r.hub.consume(ConsumeEvent{Mode: modeNameBroadcast, Event: s.typ, Result: res, Err: err})
+		if err != nil {
 			// 广播消费失败即跳过：不重试、不阻塞、不设死信（ADR 0006）。
 			r.logger.Warn("event: broadcast handler failed, skipped",
-				"type", s.typ, "event_id", raw.ID, "err", err)
+				append([]any{"type", s.typ, "event_id", raw.ID}, logErrAttrs(err))...)
 		}
 	}()
 }
@@ -416,6 +457,7 @@ func (r *Runner) pollClaim(ctx context.Context, s *subscription) {
 	if free < limit {
 		limit = free
 	}
+	start := time.Now()
 	leases, err := r.drv.Claim(ctx, ClaimQuery{
 		Type:         s.typ,
 		ConsumerType: s.consumerType,
@@ -424,14 +466,22 @@ func (r *Runner) pollClaim(ctx context.Context, s *subscription) {
 		RetryLimit:   s.retryLimit,
 		Now:          time.Now(),
 	})
+	res := pollResult(err)
+	attrs := resultAttrs(res)
+	r.metrics.claim.Add(ctx, 1, attrs)
+	r.metrics.claimDuration.Record(ctx, time.Since(start).Seconds(), attrs)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			r.logger.Error("event: claim failed", "type", s.typ,
-				"consumer", s.consumerType, "err", err)
+			r.logger.Error("event: claim failed",
+				append([]any{"type", s.typ, "consumer", s.consumerType}, logErrAttrs(err))...)
 		}
 		return
 	}
 	for _, lease := range leases {
+		gAttrs := metric.WithAttributes(
+			attribute.String(attrEvent, s.typ),
+			attribute.String(attrIdentity, s.consumerType))
+		r.metrics.claimGranted.Add(ctx, 1, gAttrs)
 		r.dispatchClaim(ctx, s, lease)
 	}
 }
@@ -445,6 +495,9 @@ func (r *Runner) dispatchClaim(ctx context.Context, s *subscription, lease Lease
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
 		// 停机中不处理：租约到期由其他实例接管（at-least-once 不破坏）。
+		r.metrics.leaseAbandoned.Add(ctx, 1,
+			metric.WithAttributes(attribute.String(attrEvent, s.typ)))
+		r.hub.leaseAbandoned(LeaseEvent{Event: s.typ})
 		r.logger.Info("event: stopping, lease released for takeover",
 			"type", s.typ, "event_id", lease.Envelope.ID)
 		return
@@ -485,14 +538,26 @@ func (r *Runner) processClaim(ctx context.Context, s *subscription, lease Lease)
 	// 停机取消把在途 handler 记为失败、消耗重试计数；Stop(ctx) 的
 	// ctx 超时是调用方兜底。Complete/Fail 同理用不取消的 ctx：
 	// 在途 handler 的终态操作仍需生效（CAS 不命中时后端静默返回 nil）。
+	start := time.Now()
 	err := callHandler(s.handler, context.WithoutCancel(ctx), lease.Envelope)
 	close(hbDone)
 
+	res := handlerResult(err)
 	tctx := context.WithoutCancel(ctx)
+	hAttrs := metric.WithAttributes(
+		attribute.String(attrMode, modeNameClaim),
+		attribute.String(attrEvent, s.typ),
+		attribute.String(attrResult, res))
+	r.metrics.handleDuration.Record(tctx, time.Since(start).Seconds(), hAttrs)
+	r.metrics.consume.Add(tctx, 1, hAttrs)
+	r.hub.consume(ConsumeEvent{
+		Mode: modeNameClaim, Event: s.typ, Result: res,
+		Attempts: lease.Attempts, Err: err,
+	})
 	if err != nil {
 		r.logger.Warn("event: claim handler failed",
-			"type", s.typ, "consumer", s.consumerType, "event_id",
-			lease.Envelope.ID, "attempts", lease.Attempts, "err", err)
+			append([]any{"type", s.typ, "consumer", s.consumerType, "event_id",
+				lease.Envelope.ID, "attempts", lease.Attempts}, logErrAttrs(err))...)
 		if ferr := r.drv.Fail(tctx, FailRequest{
 			EventID:      lease.Envelope.ID,
 			ConsumerType: lease.ConsumerType,
@@ -501,8 +566,12 @@ func (r *Runner) processClaim(ctx context.Context, s *subscription, lease Lease)
 			Backoff:      s.backoff,
 			Now:          time.Now(),
 		}); ferr != nil {
-			r.logger.Error("event: fail recording failed", "event_id", lease.Envelope.ID, "err", ferr)
+			r.metrics.fail.Add(tctx, 1, resultAttrs(resultError))
+			r.logger.Error("event: fail recording failed",
+				append([]any{"event_id", lease.Envelope.ID}, logErrAttrs(ferr))...)
+			return
 		}
+		r.metrics.fail.Add(tctx, 1, resultAttrs(resultOK))
 		return
 	}
 	if cerr := r.drv.Complete(tctx, CompleteRequest{
@@ -511,8 +580,12 @@ func (r *Runner) processClaim(ctx context.Context, s *subscription, lease Lease)
 		LeaseToken:   lease.LeaseToken,
 		Now:          time.Now(),
 	}); cerr != nil {
-		r.logger.Error("event: complete failed", "event_id", lease.Envelope.ID, "err", cerr)
+		r.metrics.complete.Add(tctx, 1, resultAttrs(resultError))
+		r.logger.Error("event: complete failed",
+			append([]any{"event_id", lease.Envelope.ID}, logErrAttrs(cerr))...)
+		return
 	}
+	r.metrics.complete.Add(tctx, 1, resultAttrs(resultOK))
 }
 
 // heartbeatLoop 在订阅级最大处理时长内自动心跳续租；超过最大处理时长
@@ -544,11 +617,27 @@ func (r *Runner) heartbeatLoop(ctx context.Context, s *subscription, lease Lease
 				// 瞬时错误（DB 抖动）不停止续租：记日志、下个心跳间隔重试；
 				// 续租的停止只由最大处理时长决定（ADR 0006）。租约真丢失
 				// （已被接管）时 Heartbeat CAS 不命中静默返回 nil，不会走到这里。
+				r.metrics.heartbeat.Add(hctx, 1, resultAttrs(resultError))
 				r.logger.Warn("event: heartbeat failed, retry next tick",
-					"event_id", lease.Envelope.ID, "err", err)
+					append([]any{"event_id", lease.Envelope.ID}, logErrAttrs(err))...)
+			} else {
+				r.metrics.heartbeat.Add(hctx, 1, resultAttrs(resultOK))
 			}
 		}
 	}
+}
+
+// handlerPanicError 是 handler panic 的包装错误（消息保持既有文本），
+// 供观测分类以 errors.As 判别 handler_panic。
+type handlerPanicError struct{ value any }
+
+func (e handlerPanicError) Error() string {
+	return fmt.Sprintf("event: handler panic: %v", e.value)
+}
+
+func isHandlerPanic(err error) bool {
+	var perr handlerPanicError
+	return errors.As(err, &perr)
 }
 
 // callHandler 执行 handler，panic 转为 error（认领计一次失败重试，
@@ -557,7 +646,7 @@ func callHandler(h func(context.Context, RawEnvelope) error,
 	ctx context.Context, raw RawEnvelope) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf("event: handler panic: %v", p)
+			err = handlerPanicError{value: p}
 		}
 	}()
 	return h(ctx, raw)

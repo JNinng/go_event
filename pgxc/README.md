@@ -47,6 +47,7 @@ drv := pgxc.NewDriver(pool, pgxc.WithRetention(7*24*time.Hour))
 | 锁原语 | 事务级 advisory 锁 | `pg_try_advisory_xact_lock(hashtext('go_event:<schema>'))`，有界等待；提交/回滚自动释放 |
 | 能力声明 | `Capabilities()` | 跨语句事务；constraint 无原生 `IF NOT EXISTS`（探测 + DO 块）；schema 仅存在性，表/列/索引/约束为存在性 + 定义；错误分类全支持；同步完成；计划可包含事务外语句；不隐式提交 |
 | 权限边界 | 按模式 | `Create`/`Migrate` 需 DDL；`Verify`/`None` 只需 DML（+ 系统目录读）；锁能力为 `LockNone` 时 `Create` 返回 `ErrMigrationUnsupported` |
+| 可观测 | `pgxc.migrate` + `.duration` | 迁移/校验结果计数与耗时（`result`：ok/canceled/lock_timeout/permission_denied/verify_conflict/permanent/transient；`schema` 维度），发射点单一（包级 `Migrate`/`Verify`，ensure 同路径）；成功打 Info `pgxc: migration applied`；`WithLogger`/`WithMeterProvider`/`WithScopeName` 注入，缺省跟随全局 |
 
 导出 `SQL` 使用阻塞式 `pg_advisory_xact_lock` + `lock_timeout`；执行器使用
 `pg_try_advisory_xact_lock` + 有界退避，两者不是同一形式。

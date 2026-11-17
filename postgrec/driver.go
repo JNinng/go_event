@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/jninng/go_event"
 	"github.com/jninng/go_event/postgresschema"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Driver event.Driver 的 Postgres 实现（*sql.DB 载体）。
@@ -53,8 +55,9 @@ func NewDriver(db *sql.DB, opts ...Option) event.Driver {
 		schema:    cfg.schema,
 		retention: cfg.retention,
 		mode:      cfg.mode,
-		manager:   &pgSchemaManager{db: db, schema: cfg.schema},
-		now:       time.Now,
+		manager: &pgSchemaManager{db: db, schema: cfg.schema,
+			logger: cfg.logger, mp: cfg.mp, scope: cfg.scope},
+		now: time.Now,
 	}
 	if err := postgresschema.ValidateSchema(cfg.schema); err != nil {
 		d.initErr = fmt.Errorf("postgrec: %w: %v", event.ErrInvalidSchema, err)
@@ -71,14 +74,21 @@ type schemaManager interface {
 type pgSchemaManager struct {
 	db     *sql.DB
 	schema string
+
+	// 可观测注入：透传给包级 Migrate/Verify（迁移指标的单一发射点）。
+	logger *slog.Logger
+	mp     metric.MeterProvider
+	scope  string
 }
 
 func (m *pgSchemaManager) migrate(ctx context.Context) error {
-	return Migrate(ctx, m.db, WithSchema(m.schema))
+	return Migrate(ctx, m.db, WithSchema(m.schema),
+		WithLogger(m.logger), WithMeterProvider(m.mp), WithScopeName(m.scope))
 }
 
 func (m *pgSchemaManager) verify(ctx context.Context) (event.VerifyReport, error) {
-	return Verify(ctx, m.db, WithSchema(m.schema))
+	return Verify(ctx, m.db, WithSchema(m.schema),
+		WithLogger(m.logger), WithMeterProvider(m.mp), WithScopeName(m.scope))
 }
 
 const (

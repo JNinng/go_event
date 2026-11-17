@@ -5,18 +5,29 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // IDGenerator 事件 ID 生成器；发布侧注入（缺省内置实现）。
 type IDGenerator func() string
 
 // Publisher 发布实现。依赖注入：Driver、ID 生成器、codec、就近唤醒总线，
-// 全部经 NewPublisher 构造级注入（design.md §4）。
+// 全部经 NewPublisher 构造级注入（design.md §4）。可观测面（指标 provider
+// 与 scope、Observer）同样构造期注入，缺省跟随全局。
 type Publisher struct {
 	drv   Driver
 	idgen IDGenerator
 	codec Codec
 	wake  *LocalWake
+
+	mp    metric.MeterProvider // 选项注入值；nil = 未注入（构造期全局兜底）
+	scope string
+	obs   Observer
+
+	metrics *publisherMetrics // 构造期从快照 provider 派生
+	hub     observerHub
 }
 
 // PublisherOption 生产者构造选项。与 RunnerOption 同为接口形态：
@@ -37,6 +48,8 @@ func NewPublisher(d Driver, opts ...PublisherOption) *Publisher {
 	for _, opt := range opts {
 		opt.applyPublisher(p)
 	}
+	p.metrics = newPublisherMetrics(p.mp, scopeOrDefault(p.scope))
+	p.hub = newObserverHub(p.obs)
 	return p
 }
 
@@ -116,6 +129,7 @@ func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
 	id := ""
 	if cfg.eventID != nil {
 		if *cfg.eventID == "" {
+			p.recordPublish(ctx, ev.Name, resultInvalidID, ErrEmptyEventID, 0)
 			return ErrEmptyEventID
 		}
 		id = *cfg.eventID
@@ -124,6 +138,7 @@ func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
 	}
 	encoded, err := p.codec.Encode(payload)
 	if err != nil {
+		p.recordPublish(ctx, ev.Name, resultEncodeError, err, 0)
 		return err
 	}
 	raw := RawEnvelope{
@@ -133,13 +148,40 @@ func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
 		Metadata:   cfg.metadata,
 		OccurredAt: time.Now().UTC(),
 	}
-	if err := p.drv.Append(ctx, raw); err != nil {
+	start := time.Now()
+	err = p.drv.Append(ctx, raw)
+	result := resultOK
+	if err != nil {
+		result = resultAppendError
+	}
+	p.recordPublish(ctx, ev.Name, result, err, time.Since(start))
+	if err != nil {
 		return err
 	}
 	if p.wake != nil {
-		p.wake.notify(ev.Name) // 仅信号，可丢弃；poll 兜底（ADR 0003）
+		notified, dropped := p.wake.notify(ev.Name) // 仅信号；poll 兜底（ADR 0003）
+		if notified > 0 || dropped > 0 {
+			p.metrics.wake.Add(ctx, 1, resultAttrs(wakeResult(notified, dropped)))
+			p.hub.wake(WakeEvent{Event: ev.Name, Notified: notified, Dropped: dropped})
+		}
 	}
 	return nil
+}
+
+// recordPublish 发布结果计量 + 观测旁路：仅 Append 已尝试的结果（ok /
+// append_error）记录耗时（粗粒度时钟下耗时可为 0，照实记录）。
+func (p *Publisher) recordPublish(ctx context.Context, typ, result string,
+	err error, elapsed time.Duration) {
+	attrs := metric.WithAttributes(
+		attribute.String(attrEvent, typ),
+		attribute.String(attrResult, result),
+	)
+	p.metrics.publish.Add(ctx, 1, attrs)
+	switch result {
+	case resultOK, resultAppendError:
+		p.metrics.publishDuration.Record(ctx, elapsed.Seconds(), resultAttrs(result))
+	}
+	p.hub.publish(PublishEvent{Event: typ, Result: result, Err: err})
 }
 
 // PublishNoPayload 无参事件糖，等价 Publish(ctx, p, ev, NoPayload{})。

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -26,7 +27,9 @@ func Migrate(ctx context.Context, db *sql.DB, opts ...Option) error {
 	if err := postgresschema.ValidateSchema(cfg.schema); err != nil {
 		return fmt.Errorf("postgrec: migrate: %w: %v", event.ErrInvalidSchema, err)
 	}
-	return postgresschema.Migrate(ctx, sqlMigrator{db: db}, cfg.schema,
+	mm := newMigrationMetrics(cfg.mp, cfg.scope)
+	start := time.Now()
+	err := postgresschema.Migrate(ctx, sqlMigrator{db: db}, cfg.schema,
 		postgresschema.WithMigrationLockWait(lockWaitTimeout),
 		postgresschema.WithMigrationClassify(func(s postgresschema.PlannedStatement, err error) error {
 			return classifyMigrationError("postgrec", s, err)
@@ -38,6 +41,14 @@ func Migrate(ctx context.Context, db *sql.DB, opts ...Option) error {
 			return testStatementHook(s)
 		}),
 	)
+	mm.record(ctx, cfg.scope, cfg.schema, err, time.Since(start))
+	if err != nil {
+		return err
+	}
+	cfg.logger.Info("postgrec: migration applied",
+		"schema", cfg.schema, "mode", cfg.mode.String(),
+		"duration_seconds", time.Since(start).Seconds())
+	return nil
 }
 
 // Verify 只读校验：不执行任何 DDL，只比对 schema/表/列/主键/唯一/索引/
@@ -49,21 +60,35 @@ func Verify(ctx context.Context, db *sql.DB, opts ...Option) (event.VerifyReport
 	if err := postgresschema.ValidateSchema(cfg.schema); err != nil {
 		return event.VerifyReport{}, fmt.Errorf("postgrec: verify: %w: %v", event.ErrInvalidSchema, err)
 	}
+	mm := newMigrationMetrics(cfg.mp, cfg.scope)
+	start := time.Now()
+	report, err := verifySnapshot(ctx, db, cfg.schema)
+	if err != nil {
+		mm.record(ctx, cfg.scope, cfg.schema, err, time.Since(start))
+		return event.VerifyReport{}, err
+	}
+	if !report.OK() {
+		mm.record(ctx, cfg.scope, cfg.schema, &event.VerifyError{Report: report}, time.Since(start))
+		return report, &event.VerifyError{Report: report}
+	}
+	mm.record(ctx, cfg.scope, cfg.schema, nil, time.Since(start))
+	return report, nil
+}
+
+// verifySnapshot 在只读事务内读取系统目录快照并比对计划期望。
+func verifySnapshot(ctx context.Context, db *sql.DB,
+	schema string) (event.VerifyReport, error) {
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return event.VerifyReport{}, fmt.Errorf("postgrec: verify: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	snap, err := postgresschema.ReadSnapshot(ctx, sqlQueryer{q: tx}, cfg.schema)
+	snap, err := postgresschema.ReadSnapshot(ctx, sqlQueryer{q: tx}, schema)
 	if err != nil {
 		return event.VerifyReport{}, fmt.Errorf("postgrec: verify: %w", err)
 	}
-	report := postgresschema.Diff(postgresschema.ExpectedObjects(cfg.schema), snap)
-	if !report.OK() {
-		return report, &event.VerifyError{Report: report}
-	}
-	return report, nil
+	return postgresschema.Diff(postgresschema.ExpectedObjects(schema), snap), nil
 }
 
 // Statements 返回计划内全部语句（不含迁移锁），按执行顺序排列；与执行器

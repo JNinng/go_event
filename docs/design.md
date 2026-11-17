@@ -201,6 +201,7 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 生产    | Publisher                     | Publish 发布；ID 与元数据缺省自动填充；ID 生成器等构造级注入；outbox 拓展见生产化能力                                                                                                                |
 | 消费编排  | Runner + Subscribe            | 订阅级声明消费方式（广播/认领命名式入口，同一 Runner 可混合承载）与消费者身份（仅认领消费，构造默认 + 订阅级覆盖）、并发、租约、轮询间隔、重试上限与退避（仅认领消费；广播消费失败即跳过，见 §5.2）；两种方式同一订阅签名（强类型糖）；签名见 docs/api.md                                              |
 | 后端缝合点 | Driver                        | 单次原子操作，需求条件（订阅类型集 + 租约过期判据 + 可认领/水位条件）在单条 Fetch/Claim 内下推：Append / Fetch、HeadPosition（广播消费，水位条件与基线锚点由 core 传入）/ Claim、Heartbeat、Complete、Fail（认领消费）；语义见 §5 与 ADR |
+| 可观测    | otel 指标 + slog + Observer     | 跟随全局装配（未配置 noop 静默，热路径只打点不打日志）；core 计量 driver 操作与消费编排，后端仅计量迁移生命周期（单一发射点，无重复计量）；类型化 Observer 纯旁路（同步回调、库内 recover）；见 ADR 0008 与 api.md §2.9 |
 
 ## 7. 仓库布局
 
