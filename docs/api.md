@@ -16,7 +16,8 @@ github.com/jninng/go_event/eventtest/inmem     # 进程内 Driver
 github.com/jninng/go_event/eventtest/simmigrate # 迁移契约测试的进程内模拟 backend
 ```
 
-- **接口面只有 `Driver` 一个**（core 是它的消费方，接口定义在 core）。
+- **必选接口面只有 `Driver` 一个**（core 是它的消费方，接口定义在 core）；
+  查询面 `Inspector` 为只读可选接口，按能力探测接入（见 §2.10）。
   Go 接口不支持泛型方法，强类型入口落在具体类型上：
   `Publisher`（发布实现）与 `Runner`（消费编排）为具体类型，`Event[T]`
   是**无状态声明值**，承载强类型糖方法，依赖经参数显式传入。
@@ -160,7 +161,7 @@ OccurredAt 同样保留首写）。**跨事件类型复用同一 ID 不报错**�
 才能当 ID 用。若确需跨类型复用同一业务键，必须改主键模型，不能只靠文档
 约定；进程内串行锁不能跨实例去重，不能替代该语义。
 
-### 2.4 Driver（唯一接口，最小缝合点）
+### 2.4 Driver（必选接口，最小缝合点）
 
 ```go
 // Driver 单次原子操作（design.md §4、ADR 0004）：全部编排逻辑在 core 的
@@ -602,6 +603,102 @@ type StopEvent struct{ TimedOut bool }
 `ok` / `handler_error` / `handler_panic`（消费）；`error` / `canceled`（轮询）。
 `Mode`：`broadcast` / `claim`。
 
+### 2.10 Inspector（只读查询面，可选）
+
+查询面与运行面分离（design.md §6/§9.2）：`Inspector` 不进入 `Driver`
+契约，只读、不参与认领/完成路径；调用方按能力探测接入——对后端 Driver
+做 `event.Inspector` 类型断言，或经后端 `NewInspector` 显式构造（与
+`Driver` 共享连接与命名空间选项）。可选拓展接口 + 能力探测的模式见
+[ADR 0005](adr/0005-backend-capability-boundary.md)。
+
+```go
+// Inspector 只读查询面（可选接口）：三类查询。结果仅在保留窗口内可见
+// （超窗且无活跃租约的行被惰性清理删除后自然不可见，Inspector 不做
+// 额外过滤——硬边界，design.md §5.2）。
+type Inspector interface {
+    // ClaimState 返回（事件 × 消费者身份）认领行的当前状态与重试计数。
+    // ok 为 false 表示该身份对该事件无认领行——事件不存在、已超保留
+    // 窗口被清理、或该身份尚未认领，三者即「待处理」态（与 CountStates
+    // 的 Pending 档同口径）；查询故障经 error 返回，不得折叠为 ok=false。
+    ClaimState(ctx context.Context, eventID, consumerType string) (ClaimState, bool, error)
+
+    // CountStates 按消费者身份对某事件类型做状态分档计数：五档互斥且
+    // 完备，合计等于该类型事件总数。分档口径与 Claim/Fail/Complete 的
+    // 落库事实严格对齐：Pending = 该身份无认领行（「待处理」口径即此，
+    // 而非「退避中」）；Retrying = 认领行 status='retrying'；
+    // Processing = status='active'（该身份落库持有租约，不做租约过期
+    // 推断——接管由认领路径发生）；Failed / Done = 终态，done 为归档档，
+    // 不计入其余四档。
+    CountStates(ctx context.Context, typ, consumerType string) (StateCounts, error)
+
+    // FailedEvents 返回 failed 终态事件的分页列表，排序与分页边界见
+    // FailedQuery。
+    FailedEvents(ctx context.Context, q FailedQuery) ([]FailedEvent, error)
+}
+
+// ClaimStatus 认领行的查询面状态：processing 对应落库列值 active
+// （持有租约），其余取值与落库列值一致。
+type ClaimStatus string
+
+const (
+    ClaimRetrying   ClaimStatus = "retrying"   // 已失败退避中，待重认领
+    ClaimProcessing ClaimStatus = "processing" // 租约内处理中（落库 status='active'）
+    ClaimDone       ClaimStatus = "done"       // 完成终态（幂等、不可逆）
+    ClaimFailed     ClaimStatus = "failed"     // 失败终态（重放归 Admin，后续项）
+)
+
+// ClaimState （事件 × 消费者身份）的当前查询面状态。Attempts 是已计入的
+// 重试计数（claim_count 落库事实，ADR 0006）：显式 Fail 计一次、接管
+// 认领计一次；与租约/信封的 Attempts（含本次认领，= 本值 + 1）相差
+// 一次当前投递——processing / done 行的实际尝试次数为本值 + 1。
+type ClaimState struct {
+    Status   ClaimStatus
+    Attempts int
+}
+
+// StateCounts 某事件类型在某消费者身份下的状态分档计数（口径见
+// Inspector.CountStates）。
+type StateCounts struct {
+    Pending    int // 待处理：该身份无认领行
+    Retrying   int // 重试中：Fail 未达终态
+    Processing int // processing：落库持有租约（status='active'）
+    Failed     int // failed 终态
+    Done       int // done 终态（归档档）
+}
+
+// FailedQuery failed 分页列表条件。Type / ConsumerType 空串表示不限
+// （跨类型 / 跨身份列出全部 failed 行）。
+//
+// 分页语义（偏移分页，边界写死）：Offset < 0 视为 0；Limit <= 0 返回
+// 空列表（nil）且不发起查询；首页 Offset=0 返回排序后的前 Limit 条；
+// 末页剩余不足 Limit 条时返回剩余条（可少于 Limit）；越界（Offset 不
+// 小于结果总数）返回空列表（非错误）。排序固定为 failed_at 降序（最新
+// 在前），同一时刻按事件 ID 升序保证确定性。稳定性边界：偏移分页以
+// 每次查询时刻的数据为准，无快照——跨页间隙发生的终态变化（新增
+// failed、超窗清理、管理面重放）可能造成跨页重复或遗漏。
+type FailedQuery struct {
+    Type         string
+    ConsumerType string
+    Offset       int
+    Limit        int
+}
+
+// FailedEvent failed 列表行：认领键（事件 × 消费者身份）+ 事件类型 +
+// 失败摘要事实。LastError 是最近一次终态失败的错误摘要（清洗后文本），
+// 空串表示未提供摘要——接管终态（只写 failed_at）与 Error 为空串的
+// 终态 Fail 均落 NULL（ADR 0009）。FailedAt 是进入 failed 终态的时刻；
+// 不变式「failed_at 非空 ⟺ 行处于 failed 终态」仅对 v2 加列后的写路径
+// 成立（ADR 0009）：v2 是 ADD COLUMN、无回填，升级前已存在的 failed 行
+// 该列为 NULL，列表中映射为零值 time.Time（升级边界）。
+type FailedEvent struct {
+    EventID      string
+    Type         string
+    ConsumerType string
+    LastError    string
+    FailedAt     time.Time
+}
+```
+
 **指标清单**（`<scope>.<动作>`；计数单位 `1`，耗时直方图单位 `s`；Prometheus
 导出侧自动转 `.`→`_` 并按单位追加 `_total`/`_seconds`）：
 
@@ -651,6 +748,12 @@ package postgrec // github.com/jninng/go_event/postgrec（标准库 database/sql
 // 时持迁移锁幂等应用版本计划全量语句。WithMigrateMode 只对本构造函数生效。
 func NewDriver(db *sql.DB, opts ...Option) event.Driver
 
+// NewInspector 构造只读查询面 event.Inspector（§2.10）：与 NewDriver 共享
+// 连接与命名空间选项（同一 schema、同一迁移模式语义——首次查询按模式
+// 处理持久结构）。探测方式：对 NewDriver 返回值做 event.Inspector 类型
+// 断言（本后端 Driver 同时实现该接口），或经本构造函数显式构造。
+func NewInspector(db *sql.DB, opts ...Option) event.Inspector
+
 // Migrate 幂等应用版本计划（Create 语义）：单事务内取迁移锁、做接管校验
 // （对象集合与计划期望比对，仅缺对象放行）、执行计划内全部语句（基线与
 // 各版本，全部幂等），任何一步失败整体回滚；中断后重跑即收敛。可重复执行。
@@ -684,6 +787,11 @@ package pgxc // github.com/jninng/go_event/pgxc（pgx v5）
 // NewDriver 基于 pgx v5 连接池构造 event.Driver。迁移模式语义与 postgrec
 // 相同（缺省 Create）；WithMigrateMode 只对本构造函数生效。
 func NewDriver(pool *pgxpool.Pool, opts ...Option) event.Driver
+
+// NewInspector 构造只读查询面 event.Inspector（§2.10）：与 NewDriver 共享
+// 连接与命名空间选项。探测方式：对 NewDriver 返回值做 event.Inspector
+// 类型断言（本后端 Driver 同时实现该接口），或经本构造函数显式构造。
+func NewInspector(pool *pgxpool.Pool, opts ...Option) event.Inspector
 
 // Migrate 幂等应用版本计划（Create 语义），与 postgrec.Migrate 相同的
 // 接管校验、整版单事务与失败回滚语义。
@@ -776,6 +884,13 @@ type ClaimStateReader interface {
 // newDriver 须为每个用例返回配置了保留窗口（≤ 2s，推荐 2s）的
 // 全新 Driver 实例（清理簿记按 Driver 实例记忆，共享实例会被节流跳过）。
 func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver)
+
+// RunInspectorSuite 运行只读查询面 event.Inspector 的契约测试
+// （design.md §6/§9.2）：三类查询与 Claim/Fail/Complete 落库事实比对。
+// d 须实现 event.Inspector（inmem 原生实现；Postgres 后端的 Driver 同时
+// 实现该接口），探测失败按 ClaimStateReader 先例 Fatal 终止——提供查询面
+// 的后端必须全过本套件。
+func RunInspectorSuite(t *testing.T, d event.Driver)
 
 // RunMigrationSuite 运行迁移契约测试。suite 本身不读环境变量；门控
 // （如 TEST_POSTGRES_DSN）在具体后端的测试内完成。
@@ -884,6 +999,11 @@ package inmem // github.com/jninng/go_event/eventtest/inmem
 // New 构造进程内 Driver：供契约测试与使用方本地测试/示例使用。
 // 条件过滤在内存模拟，能力边界表注明「模拟」档（ADR 0005）。
 func New(opts ...Option) event.Driver
+
+// NewInspector 构造进程内只读查询面 event.Inspector（§2.10）：与 New
+// 共享同一实现（*Driver 同时实现 Inspector），查询口径与 Postgres 后端
+// 一致——返回落库事实，不做租约过期推断。
+func NewInspector(opts ...Option) event.Inspector
 
 // Capabilities 返回零值能力声明：无持久结构，迁移为 no-op（无 DDL
 // 原子性、无锁、无探测、无错误分类）。
@@ -1081,3 +1201,4 @@ func TestVectorizeFlow(t *testing.T) {
 | 迁移能力声明用于契约测试与文档判定（§8、ADR 0007） | `MigrationCapabilities` + `FaultPoint` + `Capabilities()`                          |
 | 校验报告结构化、错误可 `errors.As`（§8）          | `VerifyReport`/`VerifyIssue`/`VerifyProblem` + `*VerifyError`                        |
 | 保留窗口惰性清理（§5.2、ADR 0006）            | `pgxc.WithRetention` / `postgrec.WithRetention`                              |
+| 查询面按能力探测接入（§6、ADR 0005）          | `event.Inspector` + 后端 `NewInspector`（后端 Driver 同时实现，类型断言探测） |

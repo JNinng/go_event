@@ -4,7 +4,8 @@
 // 进程内就近消费。
 //
 // 能力面与语义的单一事实源是 docs/design.md 与 docs/adr/；签名见
-// docs/api.md。接口面只有 Driver 一个（单次原子操作，最小缝合点），
-// 全部编排逻辑在本包的 Runner 完成；Publisher 与 Runner 为具体类型，
+// docs/api.md。必选接口面只有 Driver 一个（单次原子操作，最小缝合点），
+// 全部编排逻辑在本包的 Runner 完成；查询面 Inspector 为只读可选接口，
+// 按能力探测接入（ADR 0005）；Publisher 与 Runner 为具体类型，
 // 依赖经构造函数显式注入，无包级可变状态。
 package event

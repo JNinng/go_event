@@ -9,6 +9,9 @@
 - **失败错误摘要落库**：认领消费进入 `failed` 终态时，`event_claim` 行留存错误摘要（`last_error`）与终态时刻（`failed_at`），直接查库即可定位失败原因，无需回源应用日志。
   - Postgres 后端由版本计划 v2 自动加列，升级随部署隐式发生；不变式：`failed_at` 非空 ⟺ 行当前处于 `failed` 终态（接管终态只写 `failed_at`）。
 - **`FailRequest` 新增 `Error` 字段**：记录失败时可携带错误文本，core 的 `Runner` 自动下推 handler 错误；文本按不可信输入清洗为摘要（去除 Unicode 控制字符、截断 4 KiB、不含堆栈，口径见 `event.SanitizeErrorSummary`），仅终态写入。
+- **`Inspector` 只读查询面（可选接口，按能力探测，不加入 `Driver`）**：三类查询——某（事件 × 消费者身份）的当前状态与重试计数；按消费者身份的状态分档计数（「待处理」= 该身份无认领行，retrying / processing / failed / done 按认领行 `status` 分档，done 为归档档）；failed 事件偏移分页列表（错误摘要与 `failed_at` 随行返回，按 `failed_at` 降序、同刻按事件 ID 升序）。
+  - pgxc / postgrec / inmem 均已提供：`NewInspector` 构造（与 `Driver` 共享连接与命名空间选项），或对 `Driver` 做 `event.Inspector` 类型断言探测。
+  - 只读边界：不产生簿记、不参与认领/完成路径、不做租约过期推断；结果仅在保留窗口内可见（硬边界，超窗行被清理后自然不可见）。`eventtest` 新增 `RunInspectorSuite` 契约套件（三类查询与 Claim/Fail/Complete 落库事实比对）。
 
 ### 破坏性变更与兼容期
 

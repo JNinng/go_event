@@ -513,6 +513,8 @@ drv := postgrec.NewDriver(db,
 
 DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语句、期望对象与共享执行器，无驱动依赖），两个后端使用同一份计划。首次操作是否建表、建到什么程度由迁移模式决定，见 [§8.4](#84-迁移模式与权限)。缺省模式 `Create` 会在首次操作时以构造 Driver 的连接（通常是运行账号）幂等应用版本计划全量语句。
 
+只读查询面 `event.Inspector`（可选接口，pgxc / postgrec 均已提供）直接查询这两张表：状态与分档计数按 `event_claim` 行的 `status` 列与「无认领行」分档，failed 列表取 `status='failed'` 行并随行返回 `last_error` / `failed_at`——查询与落库事实严格对齐，见 [§11](#11-运维注意事项) 的「failed 事件查询」。`NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL，只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
+
 ### 8.4 迁移模式与权限
 
 `event.MigrateMode` 有三种模式（没有 `Upgrade`：升级随部署隐式发生，见
@@ -628,6 +630,8 @@ func TestMyBackendRetention(t *testing.T) {
 
 `RunRetentionSuite` 的 `newDriver` 不能复用实例：清理簿记按 Driver 实例记忆并有节流，共享实例会让部分用例被跳过。
 
+提供只读查询面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunInspectorSuite`：套件对传入的 Driver 做 `event.Inspector` 类型断言探测，失败即 Fatal——查询结果与 Claim/Fail/Complete 落库事实的比对是查询面契约的一部分。
+
 迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
 ### 9.3 Postgres 集成测试
@@ -709,7 +713,13 @@ func TestMyBackendRetention(t *testing.T) {
 - **停机**：`Stop` 等待在途 handler；handler 本身过长会拖住停机，给 `Stop` 传超时 ctx 作为兜底。
 - **轮询开销**：默认 5s 轮询一次；低频场景可调大，需要低延迟时注入 `LocalWake`（仅同进程）或后续使用 LISTEN/NOTIFY（P1）。
 - **消费者身份变更**：新增身份会重放窗口内全部历史事件；改名等同于新身份，不是断点续跑。
-- **failed 事件**：当前版本没有管理面接口；P1 将提供 failed 查询与手工重放（仅 `failed` 可重放，`done` 不可逆）。失败原因已落库：查 `event_claim` 的 `last_error` / `failed_at`（`failed_at IS NOT NULL` 即当前 failed 行，见 [§6.4](#64-成功与失败)）。
+- **failed 事件查询（Inspector）**：只读查询面 `event.Inspector` 已提供三类查询，按能力探测接入（对 Driver 做 `event.Inspector` 类型断言，或经后端 `NewInspector` 显式构造，与 Driver 共享连接与命名空间选项）：
+  - 某（事件 × 消费者身份）的当前状态与重试计数：无认领行即「待处理」（ok=false），其余按落库 `status` 报 processing / retrying / done / failed（不做租约过期推断）；
+  - 按消费者身份对事件类型的分档计数：**「待处理」= 该身份无认领行**（而非「退避中」），retrying / processing / failed / done 按认领行 `status` 分档，五档互斥且合计等于该类型事件总数；
+  - failed 事件偏移分页列表：`last_error` / `failed_at` 随行返回，按 `failed_at` 降序（最新在前）、同刻按事件 ID 升序；Offset 越界返回空列表（非错误），`Limit <= 0` 返回空，偏移分页无快照——跨页间隙的终态变化可能造成重复或遗漏。**升级边界**：不变式「`failed_at` 非空 ⟺ failed」仅对 v2 加列后的写路径成立——v2 是 `ADD COLUMN`、无回填，升级前已存在的 failed 行该列为 NULL，列表中映射为零值。
+  - 结果仅在**保留窗口内可见**（硬边界）：超窗行被惰性清理删除后自然查不到，Inspector 不做额外过滤。
+  - `NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL——只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
+  - 手工重放（仅 `failed` 可重放，`done` 不可逆）由管理面 `Admin` 承载，尚未提供；也可直接查库定位：`event_claim` 的 `last_error` / `failed_at`（`failed_at IS NOT NULL` 即当前 failed 行，见 [§6.4](#64-成功与失败)）。
 
 ## 12. 错误与排查
 
@@ -741,7 +751,7 @@ func TestMyBackendRetention(t *testing.T) {
 **认领订阅不处理事件**
 
 1. 身份是否设置（`WithIdentity` 或 `WithConsumerType`）？
-2. 事件是否已处于该身份的 `done`/`failed` 终态？终态不会再次认领。`failed` 行可查 `last_error` / `failed_at` 定位原因（[§6.4](#64-成功与失败)）。
+2. 事件是否已处于该身份的 `done`/`failed` 终态？终态不会再次认领。`failed` 行可经 `event.Inspector` 查询定位原因（`LastError` / `FailedAt`），或直接查库 `last_error` / `failed_at`（[§6.4](#64-成功与失败)、[§11](#11-运维注意事项)）。
 3. 是否处于退避窗口？失败后要等 `next_eligible_at` 到期。
 4. 数据库连接与 schema 是否正确？
 

@@ -1,6 +1,8 @@
 // Package inmem 构造进程内 event.Driver：供 eventtest 契约测试与使用方
 // 本地测试/示例使用。条件过滤在内存模拟，能力边界注明「模拟」档
-// （ADR 0005）。
+// （ADR 0005）。同一实现同时提供只读查询面 event.Inspector（经
+// NewInspector 构造或对 Driver 类型断言探测）：查询口径与 Postgres
+// 后端一致，返回落库事实、不做租约过期推断。
 package inmem
 
 import (
@@ -29,6 +31,12 @@ func WithRetention(d time.Duration) Option {
 
 // New 构造进程内 Driver。
 func New(opts ...Option) event.Driver {
+	return newDriver(opts...)
+}
+
+// newDriver 构造具体 Driver（*Driver 同时实现 event.Inspector，供
+// NewInspector 与调用方的类型断言探测共用）。
+func newDriver(opts ...Option) *Driver {
 	d := &Driver{
 		events: make(map[string]*storedEvent),
 		claims: make(map[claimKey]*storedClaim),

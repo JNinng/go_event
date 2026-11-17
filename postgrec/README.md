@@ -31,6 +31,7 @@ drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
 | 心跳 / 迟到 Complete / Fail 不生效（CAS） | 原生 | `lease_token` 条件更新，不命中静默返回 |
 | 递增退避 | 原生 | Fail 事务内按 `Backoff.Next` 计算 `next_eligible_at` |
 | 错误摘要与终态时刻（Fail 落库） | 原生 | 终态 UPDATE 写 `last_error`（`SanitizeErrorSummary` 清洗：去除 Unicode 控制字符、4 KiB 截断、不落堆栈）与 `failed_at`；接管终态仅写 `failed_at`；重试中与迟到 Fail 不写（ADR 0009） |
+| 查询面 Inspector（状态 / 分档计数 / failed 列表） | 原生 | SQL 直查 `event` / `event_claim`：状态与计数按认领行 `status` 与「无认领行」分档（「待处理」= 无认领行，不做租约过期推断）；failed 列表按 `failed_at` 降序偏移分页，`last_error` / `failed_at` 随行返回（ADR 0009）；只读、不参与认领路径；结果仅在保留窗口内可见（硬边界）。`NewInspector` 构造（与 Driver 共享连接与命名空间）或对 Driver 做 `event.Inspector` 类型断言探测 |
 | 惰性清理 | 原生 | 超窗且无活跃租约（无论终态）行删除，`event_claim` 经 FK ON DELETE CASCADE 级联；墙钟节流，随 Append 机会性执行 |
 
 ## 迁移能力
@@ -59,6 +60,7 @@ drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
 
 | 能力 | 支持度 |
 | --- | --- |
+| 查询面 Inspector | 已支持：`NewInspector` 构造或对 `Driver` 做 `event.Inspector` 类型断言（契约套件 `eventtest.RunInspectorSuite` 全过） |
 | 延迟事件（deliver_at） | P1 可选拓展，Postgres 原生可实现 |
 | LISTEN/NOTIFY 推送唤醒 | 不支持（P1 由 pgxc 提供；本后端退化回轮询） |
 | outbox（TransactionalAppender） | P1 可选拓展 |

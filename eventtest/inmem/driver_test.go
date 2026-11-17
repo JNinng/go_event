@@ -67,6 +67,11 @@ func TestInmemContractSuite(t *testing.T) {
 	eventtest.RunSuite(t, inmem.New())
 }
 
+// Inspector 查询面契约：inmem 原生实现（可选能力按类型断言探测，ADR 0005）。
+func TestInmemInspectorSuite(t *testing.T) {
+	eventtest.RunInspectorSuite(t, inmem.New())
+}
+
 // 保留窗口惰性清理契约：每用例独立的短窗口全新 Driver（design.md §5.2）。
 func TestInmemRetentionSuite(t *testing.T) {
 	eventtest.RunRetentionSuite(t, func(t *testing.T) event.Driver {

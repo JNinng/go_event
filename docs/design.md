@@ -68,8 +68,9 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   可认领/水位条件）在单条 Fetch/Claim 操作内下推，保证原子性
   （见 [ADR 0004](adr/0004-demand-driven-pull.md)）；广播消费的已读水位仅存
   于实例内存，由 core 在 Fetch 时作为条件传入，不在存储侧簿记。
-- **依赖注入友好**：注入面只有三个（Publisher / Runner / Driver），Go 接口
-  仅 Driver 一个（Publisher 与 Runner 为具体类型，见 docs/api.md §1）；全部
+- **依赖注入友好**：注入面只有三个（Publisher / Runner / Driver），必选
+  Go 接口仅 Driver 一个（查询面 Inspector 为只读可选接口，按能力探测
+  接入；Publisher 与 Runner 为具体类型，见 docs/api.md §1）；全部
   构造器 `NewX(依赖, opts...)` 显式注入，无包级可变状态、无 init 魔法；
   接口定义遵循 Go 惯例放在消费侧。core 不引 DI 框架依赖（wire 用普通构造
   函数即可装配），必要时消费方自建 ProviderSet。
@@ -213,6 +214,7 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 生产    | Publisher                     | Publish 发布；ID 与元数据缺省自动填充；ID 生成器等构造级注入；outbox 拓展见生产化能力                                                                                                                |
 | 消费编排  | Runner + Subscribe            | 订阅级声明消费方式（广播/认领命名式入口，同一 Runner 可混合承载）与消费者身份（仅认领消费，构造默认 + 订阅级覆盖）、并发、租约、轮询间隔、重试上限与退避（仅认领消费；广播消费失败即跳过，见 §5.2）；两种方式同一订阅签名（强类型糖）；签名见 docs/api.md                                              |
 | 后端缝合点 | Driver                        | 单次原子操作，需求条件（订阅类型集 + 租约过期判据 + 可认领/水位条件）在单条 Fetch/Claim 内下推：Append / Fetch、HeadPosition（广播消费，水位条件与基线锚点由 core 传入）/ Claim、Heartbeat、Complete、Fail（认领消费）；语义见 §5 与 ADR |
+| 查询面（可选） | Inspector                 | 只读查询，按能力探测接入（ADR 0005）：（事件 × 消费者身份）状态与重试计数；按身份的状态分档计数——「待处理」= 该身份无认领行，retrying / processing / failed / done 按认领行 status 分档（done 为归档档，五档互斥且完备）；failed 事件偏移分页列表（错误摘要与 failed_at 随行返回，ADR 0009）。与 Driver 共享连接与命名空间选项；只读、不参与认领/完成路径；结果仅在保留窗口内可见（硬边界，§5.2） |
 | 可观测    | otel 指标 + slog + Observer     | 跟随全局装配（未配置 noop 静默，热路径只打点不打日志）；core 计量 driver 操作与消费编排，后端仅计量迁移生命周期（单一发射点，无重复计量）；类型化 Observer 纯旁路（同步回调、库内 recover）；见 ADR 0008 与 api.md §2.9 |
 
 ## 7. 仓库布局
@@ -376,7 +378,9 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   持久结构初始化的幂等可重复执行；迁移契约 `RunMigrationSuite`（空库/
   完整/部分/冲突、三模式 Driver 首启、导出物、并发首启、锁释放、
   Lock=none、语句边界故障注入与回滚/收敛）；保留窗口清理资格
-  （RunRetentionSuite））。
+  （RunRetentionSuite）；只读查询面 Inspector（`RunInspectorSuite`：
+  三类查询与 Claim/Fail/Complete 落库事实比对——状态与重试计数、分档
+  口径含 done 归档、failed 分页边界与摘要事实、只读稳定性））。
 
 ### 9.2 生产化能力（P1）
 
@@ -387,12 +391,16 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   failed 的数量；`Lease` 不再承担接管标记（v0.x 允许破坏性变更）。基础
   观测面（otel 指标 + slog + 类型化 Observer）已在 P0 落地，见 §9.1 与
   ADR 0008。
-- **管理面**：滞留/failed 事件查询、手工重放（仅针对 `failed` 终态重新置为
-  可认领；`done` 不可逆、不重放）、dead-letter 处置钩子、存量消费者身份的
-  重命名迁移（§5.1）。失败信息留存（最后错误摘要与终态时刻）已落地
-  （§5.3、[ADR 0009](adr/0009-error-summary-persistence.md)），是 Inspector
-  查询与重放的数据源。迁移侧无台账，
-  不需要 reset/stamp 入口；schema 异常经迁移重跑或人工修复。
+- **管理面**：查询面 `Inspector` 已落地（§6 表格「查询面（可选）」行）：
+  只读可选接口、按能力探测接入，提供（事件 × 消费者身份）状态与重试
+  计数、按身份的状态分档计数（「待处理」= 该身份无认领行）、failed 事件
+  偏移分页列表；结果仅在保留窗口内可见（硬边界）。剩余项仍在规划：手工
+  重放（仅针对 `failed` 终态重新置为可认领；`done` 不可逆、不重放，由
+  `Admin` 承载）、dead-letter 处置钩子、存量消费者身份的重命名迁移
+  （§5.1）。失败信息留存（最后错误摘要与终态时刻）已落地（§5.3、
+  [ADR 0009](adr/0009-error-summary-persistence.md)），是 Inspector 查询
+  与重放的数据源。迁移侧无台账，不需要 reset/stamp 入口；schema 异常经
+  迁移重跑或人工修复。
 - **延迟事件**：deliver\_at 定时投递（Postgres 原生；其余后端为可选能力，见
   能力边界）；未到投递时间的行不满足 Fetch/Claim 的下推条件，与广播消费
   组合的边界（延迟行被内存水位越过即不再投递）写进文档。

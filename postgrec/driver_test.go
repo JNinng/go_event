@@ -115,6 +115,13 @@ func TestPostgrecContractSuite(t *testing.T) {
 	})
 }
 
+// Inspector 查询面契约（design.md §6/§9.2；探测方式：postgrec Driver 即
+// event.Inspector）。
+func TestPostgrecInspectorSuite(t *testing.T) {
+	_, drv, _ := testDB(t)
+	eventtest.RunInspectorSuite(t, drv)
+}
+
 // 保留窗口惰性清理契约：每用例独立 schema + 短保留窗口的全新 Driver
 // （design.md §5.2）。
 func TestPostgrecRetentionSuite(t *testing.T) {
@@ -126,4 +133,59 @@ func TestPostgrecRetentionSuite(t *testing.T) {
 		return postgrec.NewDriver(db, postgrec.WithSchema(schema),
 			postgrec.WithRetention(2*time.Second))
 	})
+}
+
+// 遗留 failed 行（v2 加列前 failed_at 落 NULL，加列无回填）：FailedEvents
+// 不报错，该行 FailedAt 映射为零值、摘要可见（升级边界，docs/api.md
+// §2.10）。inmem 无 NULL 语义，不模拟该场景。
+func TestPostgrecLegacyFailedRow_FailedEvents_MapsNullFailedAtToZeroValue(t *testing.T) {
+	db, drv, schema := testDB(t)
+	ctx := context.Background()
+	typ := t.Name()
+
+	if err := drv.Append(ctx, event.RawEnvelope{
+		ID: "legacy-1", Type: typ, Payload: []byte(`{}`), OccurredAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	ls, err := drv.Claim(ctx, event.ClaimQuery{
+		Type: typ, ConsumerType: "legacy", Lease: time.Minute, Limit: 1,
+		RetryLimit: 5, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(ls) != 1 {
+		t.Fatalf("claim: %+v", ls)
+	}
+	if err := drv.Fail(ctx, event.FailRequest{
+		EventID: ls[0].Envelope.ID, ConsumerType: ls[0].ConsumerType, LeaseToken: ls[0].LeaseToken,
+		Error: "legacy boom", RetryLimit: 1,
+		Backoff: event.LinearBackoff(time.Millisecond, time.Millisecond), Now: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	// 模拟遗留行：v2 升级前已存在的 failed 行 failed_at 为 NULL。
+	if _, err := db.Exec(fmt.Sprintf(
+		`UPDATE %s.event_claim SET failed_at = NULL WHERE event_id = $1`, schema), "legacy-1"); err != nil {
+		t.Fatalf("null out failed_at: %v", err)
+	}
+
+	insp, ok := drv.(event.Inspector) // postgrec Driver 即 Inspector（类型断言探测）
+	if !ok {
+		t.Fatalf("driver %T must implement event.Inspector", drv)
+	}
+	out, err := insp.FailedEvents(ctx, event.FailedQuery{Type: typ, ConsumerType: "legacy", Limit: 10})
+	if err != nil {
+		t.Fatalf("failed events on NULL failed_at must not error: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("failed events len = %d, want 1", len(out))
+	}
+	if !out[0].FailedAt.IsZero() {
+		t.Fatalf("failed_at = %v, want zero value (NULL legacy row)", out[0].FailedAt)
+	}
+	if out[0].LastError != "legacy boom" {
+		t.Fatalf("last_error = %q, want %q", out[0].LastError, "legacy boom")
+	}
 }

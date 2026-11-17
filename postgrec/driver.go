@@ -49,6 +49,12 @@ type Driver struct {
 // NewDriver 基于 *sql.DB 构造 event.Driver。schema 名在构造期校验（所有
 // 模式一致）：非法名记录为 initErr，首次操作直接返回 ErrInvalidSchema。
 func NewDriver(db *sql.DB, opts ...Option) event.Driver {
+	return newDriver(db, opts...)
+}
+
+// newDriver 构造具体 Driver（*Driver 同时实现 event.Inspector，供
+// NewInspector 与调用方的类型断言探测共用）。
+func newDriver(db *sql.DB, opts ...Option) *Driver {
 	cfg := newConfig(opts)
 	d := &Driver{
 		db:        db,
