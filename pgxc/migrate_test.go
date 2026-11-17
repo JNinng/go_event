@@ -77,7 +77,7 @@ func TestCapabilities(t *testing.T) {
 // WithMigrateMode 只对 NewDriver 有意义：显式传给 Migrate 返回哨兵错误。
 func TestMigrateWithModeOption(t *testing.T) {
 	t.Run("ExplicitMode_Migrate_ReturnsUnsupported", func(t *testing.T) {
-		// 模式检查发生在任何 DB 访问之前，nil *sql.DB 是安全的。
+		// 模式检查发生在任何 DB 访问之前，nil *pgxpool.Pool 是安全的。
 		err := pgxc.Migrate(context.Background(), nil,
 			pgxc.WithMigrateMode(event.MigrateNone))
 		if !errors.Is(err, event.ErrMigrateModeUnsupported) {

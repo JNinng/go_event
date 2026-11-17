@@ -23,7 +23,7 @@ func TestMigrationSuite(t *testing.T) {
 }
 
 // suiteBackend 是 postgrec 的 MigrationBackend 适配器：每个子测试使用独立
-// schema；支持快速路径与 before/after step 故障注入（映射到既有 step 钩子）。
+// schema；支持 before/after statement 故障注入（映射到执行器语句钩子）。
 type suiteBackend struct {
 	db          *sql.DB
 	schema      string
@@ -109,18 +109,19 @@ func (b *suiteBackend) Prepare(t *testing.T, scene eventtest.MigrationScene) {
 	}
 }
 
-// execBaseline 顺序执行基线步骤；lastObject 非空时执行到该对象为止。
+// execBaseline 顺序执行计划语句（与期望对象按序配对）；lastObject 非空时
+// 执行到该对象为止。
 func (b *suiteBackend) execBaseline(t *testing.T, ctx context.Context, lastObject string) {
 	t.Helper()
-	steps, err := postgresschema.Baseline(b.schema)
+	paired, err := postgresschema.PlannedStatements(b.schema)
 	if err != nil {
-		t.Fatalf("baseline steps: %v", err)
+		t.Fatalf("planned statements: %v", err)
 	}
-	for i, step := range steps {
-		if _, err := b.db.ExecContext(ctx, step.Statement); err != nil {
-			t.Fatalf("prepare statement %d: %v\n%s", i, err, step.Statement)
+	for i, ps := range paired {
+		if _, err := b.db.ExecContext(ctx, ps.SQL); err != nil {
+			t.Fatalf("prepare statement %d: %v\n%s", i, err, ps.SQL)
 		}
-		if lastObject != "" && step.Object == lastObject {
+		if lastObject != "" && ps.Object.Name == lastObject {
 			return
 		}
 	}
@@ -174,17 +175,9 @@ func (b *suiteBackend) Reset(t *testing.T) {
 	t.Cleanup(func() { b.drop() })
 }
 
-// ForcePath：真实后端默认即 fast，显式切 fast 是成功的 no-op；step 不支持。
-func (b *suiteBackend) ForcePath(path event.MigrationPath) error {
-	if path == event.MigrationPathFast {
-		return nil
-	}
-	return eventtest.ErrUnsupportedByBackend
-}
-
-// InjectFault 把 before/after step 映射到既有 step 钩子：
-//   - FaultBeforeStep：首个 step 执行前返回错误；
-//   - FaultAfterStep：首个 step 成功执行后（第二个 step 前）返回错误。
+// InjectFault 把语句边界故障映射到执行器钩子：
+//   - FaultBeforeStatement：首条语句执行前返回错误；
+//   - FaultAfterStatement：首条语句成功执行后（第二条语句前）返回错误。
 //
 // 其余故障点不支持。
 func (b *suiteBackend) InjectFault(point event.FaultPoint, err error) error {
@@ -193,14 +186,14 @@ func (b *suiteBackend) InjectFault(point event.FaultPoint, err error) error {
 		return nil
 	}
 	switch point {
-	case event.FaultBeforeStep, event.FaultAfterStep:
+	case event.FaultBeforeStatement, event.FaultAfterStatement:
 	default:
 		return eventtest.ErrUnsupportedByBackend
 	}
 	calls := 0
-	b.restoreHook = postgrec.SetStepHookForTest(func(postgresschema.Step) error {
+	b.restoreHook = postgrec.SetStatementHookForTest(func(postgresschema.PlannedStatement) error {
 		calls++
-		if point == event.FaultBeforeStep {
+		if point == event.FaultBeforeStatement {
 			return err
 		}
 		if calls == 2 {

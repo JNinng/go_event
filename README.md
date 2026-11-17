@@ -17,7 +17,7 @@
 - **多身份**：一个进程可承载多个消费者身份，各身份独立认领；同一 `Runner` 可混合承载广播与认领订阅。
 - **就近唤醒**：同进程发布触发本实例 poller 立即拉取；仅信号，不跳过存储，跨实例与信号丢失由轮询兜底。
 - **幂等发布**：发布侧生成或通过 `WithEventID` 显式指定唯一事件 ID，重复 `Append` 同 ID 幂等（首写为准）；元数据块原样透传（如 `trace_id`）。
-- **迁移模式**：`Create`（缺省，首次操作建基线）/ `Verify`（只读自检）/ `None`；运行账号只有 DML 权限时用后两者，部署期由高权限连接建表。
+- **迁移模式**：`Create`（缺省，首次操作持迁移锁幂等应用版本计划全量语句；升级随部署隐式发生）/ `Verify`（只读自检）/ `None`；运行账号只有 DML 权限时用后两者，部署期由高权限连接建表。
 - **最小缝合点**：`Driver` 只做单次原子操作，全部编排（轮询、心跳、重试、并发、优雅停机）在 core 的 `Runner`。
 - **多 module**：core 只依赖标准库，后端依赖按需引入；接口语义由 `eventtest` 契约测试约束。
 
@@ -48,7 +48,8 @@ go get github.com/jninng/go_event/eventtest  # 用 inmem 做本地测试 / 编�
 
 ## 快速开始
 
-以下示例使用 `pgxc`。缺省迁移模式 `Create` 会在首次操作时持迁移锁建表；
+以下示例使用 `pgxc`。缺省迁移模式 `Create` 会在首次操作时持迁移锁幂等应用
+版本计划全量语句；
 若表已由部署流程建好、运行账号只有 DML 权限，改用
 `pgxc.WithMigrateMode(event.MigrateVerify)`（启动自检）或
 `pgxc.WithMigrateMode(event.MigrateNone)`（完全交给部署流程）。
@@ -163,8 +164,8 @@ TEST_POSTGRES_DSN='postgres://user:pass@localhost:5432/postgres' go test ./...
 
 ## 状态与路线
 
-- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、基线接管校验、迁移能力声明与 `RunMigrationSuite`。
-- **P1（规划）**：版本化迁移 `Upgrade` 与台账、outbox、可注入 `Metrics` 观测、管理面（failed 查询/重放、版本 reset/stamp）、延迟事件、LISTEN/NOTIFY 推送唤醒。
+- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`。
+- **P1（规划）**：错误摘要落库与 `Fail` 扩展、`Inspector` 查询面与 `Admin` 管理面（failed 查询/重放）、outbox、可注入 `Metrics` 观测、延迟事件、LISTEN/NOTIFY 推送唤醒。
 - **P2（规划）**：NATS JetStream / RocketMQ / Redis Stream / RabbitMQ 后端、事件链、批量认领、限流背压。
 
 详见 [docs/design.md §9](docs/design.md)。

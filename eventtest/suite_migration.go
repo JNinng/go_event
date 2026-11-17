@@ -50,13 +50,14 @@ func (s MigrationScene) String() string {
 type MigrationBackend interface {
 	// NewDriver 按迁移模式构造 Driver，与 Migrate/Verify 共享同一持久结构。
 	NewDriver(t *testing.T, mode event.MigrateMode) event.Driver
-	// Migrate 执行基线迁移（幂等）。
+	// Migrate 幂等应用版本计划（Create 语义）。
 	Migrate(ctx context.Context) error
-	// Verify 只读校验基线对象，发现问题返回 *event.VerifyError。
+	// Verify 只读校验计划期望对象，发现问题返回 *event.VerifyError。
 	Verify(ctx context.Context) (event.VerifyReport, error)
-	// Statements 返回基线语句（不含迁移锁与账号授权）。
+	// Statements 返回计划内全部语句（不含迁移锁与账号授权）。
 	Statements() ([]string, error)
-	// SQL 返回手工脚本（BEGIN 后设 lock_timeout 并取迁移锁，随后是基线语句）。
+	// SQL 返回手工脚本（BEGIN 后设 lock_timeout 并取迁移锁，随后是计划内
+	// 全部语句）。
 	SQL() (string, error)
 	// Capabilities 返回后端迁移能力声明。
 	Capabilities() event.MigrationCapabilities
@@ -64,8 +65,6 @@ type MigrationBackend interface {
 	Prepare(t *testing.T, scene MigrationScene)
 	// Reset 清空到初始状态。
 	Reset(t *testing.T)
-	// ForcePath 强制执行路径；不支持时返回 ErrUnsupportedByBackend。
-	ForcePath(path event.MigrationPath) error
 	// InjectFault 在指定边界注入错误（err 为 nil 表示清除）；不支持时返回
 	// ErrUnsupportedByBackend。
 	InjectFault(point event.FaultPoint, err error) error
@@ -73,27 +72,20 @@ type MigrationBackend interface {
 	Cleanup(t *testing.T)
 }
 
-// ErrUnsupportedByBackend 表示后端不支持某项可选能力（强制路径 / 故障注入）。
+// ErrUnsupportedByBackend 表示后端不支持某项可选能力（故障注入）。
 var ErrUnsupportedByBackend = errors.New("eventtest: backend does not support")
 
-// ProbeObserver 是可选观察接口：统计 step 路径的对象探测次数。真实后端
-// 不实现；模拟 backend 实现，用于断言 fast 路径不逐对象探测。
-type ProbeObserver interface {
-	ProbeCount() int
-	ResetProbeCount()
-}
-
 // ApplyObserver 是可选观察接口：统计每个对象被成功应用的次数（按限定
-// 标识）。模拟 backend 实现，用于断言 step 路径探测跳过已应用对象。
+// 标识）。模拟 backend 实现，用于断言并发首启下每个对象恰好应用一次。
 type ApplyObserver interface {
 	ApplyCount(object string) int
 	ResetApplyCounts()
 }
 
-// FaultObserver 是可选观察接口：报告本次 Migrate 已尝试的步骤数（失败或
+// FaultObserver 是可选观察接口：报告本次 Migrate 已尝试的语句数（失败或
 // 回滚后仍保留）。用于证明故障注入确实发生在推进之后，而不是入口即失败。
 type FaultObserver interface {
-	AttemptedSteps() int
+	AttemptedStatements() int
 	ResetAttempts()
 }
 
@@ -116,8 +108,8 @@ type LockNoneProvider interface {
 	LockNoneBackend(t *testing.T) MigrationBackend
 }
 
-// ObjectDescriber 是可选接口：返回基线期望对象的限定名列表。冲突用例用它
-// 断言「原本缺失的对象仍缺失」。
+// ObjectDescriber 是可选接口：返回基线期望对象的限定名列表。None 模式
+// 与精确断言用例用它解析期望对象名；冲突用例仅以其存在性作跳过门控。
 type ObjectDescriber interface {
 	ExpectedObjects() []string
 }
@@ -143,7 +135,7 @@ type SchemaExporter interface {
 
 // RunMigrationSuite 运行迁移契约测试。覆盖空库/完整/部分/冲突场景的
 // Migrate 与 Verify、三种迁移模式的 Driver 首次操作、导出物、并发首启、
-// 锁释放、Lock=none 变体，以及 fast / step 两条执行路径（含故障注入）。
+// 锁释放、Lock=none 变体，以及语句边界故障注入（回滚收敛）。
 //
 // 用例命名遵循三段式「条件_动作_预期结果」；不依赖 sleep，全部使用
 // barrier 或确定性计数。
@@ -195,20 +187,8 @@ func RunMigrationSuite(t *testing.T, b MigrationBackend) {
 	t.Run("LockNoneVariant_Migrate_UnsupportedVerifyReadable", func(t *testing.T) {
 		testMigrationLockNone(t, b)
 	})
-	t.Run("FastPath_FaultInjection_RollsBackAllObjects", func(t *testing.T) {
-		testMigrationFastFaults(t, b)
-	})
-	t.Run("FastPath_EmptyDatabase_SkipsObjectProbe", func(t *testing.T) {
-		testMigrationFastNoProbe(t, b)
-	})
-	t.Run("TransactionalBackend_DefaultMigrate_NoObjectProbe", func(t *testing.T) {
-		testMigrationDefaultFast(t, b)
-	})
-	t.Run("StepPath_EmptyDatabase_MigrateSucceeds", func(t *testing.T) {
-		testMigrationStepSuccess(t, b)
-	})
-	t.Run("StepPath_FaultInjection_RetryConvergesWithoutReapply", func(t *testing.T) {
-		testMigrationStepFaults(t, b)
+	t.Run("StatementFault_Migrate_RollsBackAllObjects", func(t *testing.T) {
+		testMigrationStatementFaults(t, b)
 	})
 	t.Run("Capabilities_LockDeclaration_MatchesVariantBehavior", func(t *testing.T) {
 		testMigrationLockCapability(t, b)
@@ -575,27 +555,22 @@ func testMigrationLockNone(t *testing.T, b MigrationBackend) {
 	}
 }
 
-// ---- fast 路径 ----
+// ---- 语句边界故障注入 ----
 
-func testMigrationFastFaults(t *testing.T, b MigrationBackend) {
-	if b.Capabilities().Atomicity != event.DDLAtomicTransactional {
-		t.Skip("backend does not support transactional DDL; fast path not applicable")
-	}
-	if !forceMigrationPath(t, b, event.MigrationPathFast) {
-		t.Skip("backend does not support forcing the fast path")
-	}
+// testMigrationStatementFaults 覆盖单一执行路径的语句边界故障：任何边界
+// 失败 → 整体回滚（对象集合不变），清除故障后重跑收敛、每个对象恰好
+// 应用一次。后端不支持某故障点时跳过该子测试。
+func testMigrationStatementFaults(t *testing.T, b MigrationBackend) {
 	stmts, err := b.Statements()
 	if err != nil {
 		t.Fatalf("statements: %v", err)
 	}
 	for _, point := range []event.FaultPoint{
-		event.FaultAfterStep, event.FaultBeforeCommit,
+		event.FaultAfterLock, event.FaultBeforeStatement,
+		event.FaultAfterStatement, event.FaultBeforeCommit,
 	} {
-		t.Run("FastPath_"+string(point)+"Fault_RollsBackAllObjects", func(t *testing.T) {
+		t.Run("StatementFault_"+string(point)+"_RollsBackAndConverges", func(t *testing.T) {
 			resetTo(t, b, MigrationSceneEmpty)
-			if !forceMigrationPath(t, b, event.MigrationPathFast) {
-				t.Fatal("backend stopped supporting the fast path")
-			}
 			injected := errors.New("injected migration fault")
 			if !changeFault(t, b, point, injected) {
 				return
@@ -603,22 +578,23 @@ func testMigrationFastFaults(t *testing.T, b MigrationBackend) {
 			if err := b.Migrate(t.Context()); err == nil {
 				t.Fatalf("migrate with fault at %s = nil, want error", point)
 			}
-			// 证明故障发生在推进之后：AfterStep 至少推进 1 步，
-			// BeforeCommit 已尝试全部步骤。
+			// 故障发生在推进之后的证据：AfterStatement / BeforeCommit 至少
+			// / 全部语句已尝试（失败或回滚后计数仍保留）。
 			if observer, ok := b.(FaultObserver); ok {
-				got := observer.AttemptedSteps()
+				got := observer.AttemptedStatements()
 				switch point {
-				case event.FaultAfterStep:
+				case event.FaultAfterStatement:
 					if got < 1 {
-						t.Fatalf("attempted steps = %d after %s fault, want >= 1", got, point)
+						t.Fatalf("attempted statements = %d after %s fault, want >= 1", got, point)
 					}
 				case event.FaultBeforeCommit:
 					if got != len(stmts) {
-						t.Fatalf("attempted steps = %d before commit fault, want %d",
+						t.Fatalf("attempted statements = %d before commit fault, want %d",
 							got, len(stmts))
 					}
 				}
 			}
+			// 整体回滚：对象集合不变，全部期望对象仍缺失。
 			report, _ := requireMigrationVerifyError(t, b)
 			if objs := migrationExpectedObjects(b); objs != nil {
 				for _, obj := range objs {
@@ -633,154 +609,16 @@ func testMigrationFastFaults(t *testing.T, b MigrationBackend) {
 				t.Fatalf("migrate after clearing fault at %s: %v", point, err)
 			}
 			requireMigrationVerifyOK(t, b)
-		})
-	}
-}
-
-func testMigrationFastNoProbe(t *testing.T, b MigrationBackend) {
-	if b.Capabilities().Atomicity != event.DDLAtomicTransactional {
-		t.Skip("backend does not support transactional DDL; fast path not applicable")
-	}
-	if !forceMigrationPath(t, b, event.MigrationPathFast) {
-		t.Skip("backend does not support forcing the fast path")
-	}
-	resetTo(t, b, MigrationSceneEmpty)
-	if !forceMigrationPath(t, b, event.MigrationPathFast) {
-		t.Fatal("backend stopped supporting the fast path")
-	}
-	observer, ok := b.(ProbeObserver)
-	if !ok {
-		t.Skip("backend does not implement ProbeObserver; probe behavior not observable")
-	}
-	observer.ResetProbeCount()
-	if err := b.Migrate(t.Context()); err != nil {
-		t.Fatalf("fast migrate on empty database: %v", err)
-	}
-	if got := observer.ProbeCount(); got != 0 {
-		t.Fatalf("fast path probed %d objects, want 0", got)
-	}
-	requireMigrationVerifyOK(t, b)
-}
-
-// testMigrationDefaultFast 断言事务档后端在不调用 ForcePath 时仍走 fast：
-// 空库 Migrate 不做逐对象探测（不得静默降级为 step）。
-func testMigrationDefaultFast(t *testing.T, b MigrationBackend) {
-	if b.Capabilities().Atomicity != event.DDLAtomicTransactional {
-		t.Skip("backend is not transactional; default fast path not applicable")
-	}
-	observer, ok := b.(ProbeObserver)
-	if !ok {
-		t.Skip("backend does not implement ProbeObserver; cannot observe default path")
-	}
-	resetTo(t, b, MigrationSceneEmpty)
-	observer.ResetProbeCount()
-	if err := b.Migrate(t.Context()); err != nil {
-		t.Fatalf("default migrate on empty database: %v", err)
-	}
-	if got := observer.ProbeCount(); got != 0 {
-		t.Fatalf("default transactional migrate probed %d objects, want 0", got)
-	}
-	requireMigrationVerifyOK(t, b)
-}
-
-// ---- step 路径 ----
-
-func testMigrationStepSuccess(t *testing.T, b MigrationBackend) {
-	if !forceMigrationPath(t, b, event.MigrationPathStep) {
-		t.Skip("backend does not support step path (real Postgres runs fast; step is covered by the simulated backend)")
-	}
-	resetTo(t, b, MigrationSceneEmpty)
-	if !forceMigrationPath(t, b, event.MigrationPathStep) {
-		t.Fatal("backend stopped supporting the step path")
-	}
-	if err := b.Migrate(t.Context()); err != nil {
-		t.Fatalf("step migrate on empty database: %v", err)
-	}
-	requireMigrationVerifyOK(t, b)
-}
-
-func testMigrationStepFaults(t *testing.T, b MigrationBackend) {
-	if !forceMigrationPath(t, b, event.MigrationPathStep) {
-		t.Skip("backend does not support step path (real Postgres runs fast; step is covered by the simulated backend)")
-	}
-	stmts, err := b.Statements()
-	if err != nil {
-		t.Fatalf("statements: %v", err)
-	}
-	points := []event.FaultPoint{
-		event.FaultAfterLock, event.FaultBeforeStep,
-		event.FaultAfterStep, event.FaultBeforeCommit,
-	}
-	for _, point := range points {
-		t.Run("StepPath_"+string(point)+"Fault_RetryConvergesWithoutReapply", func(t *testing.T) {
-			resetTo(t, b, MigrationSceneEmpty)
-			if !forceMigrationPath(t, b, event.MigrationPathStep) {
-				t.Fatal("backend stopped supporting the step path")
-			}
-			injected := errors.New("injected migration fault")
-			if !changeFault(t, b, point, injected) {
-				return
-			}
-			if err := b.Migrate(t.Context()); err == nil {
-				t.Fatalf("migrate with fault at %s = nil, want error", point)
-			}
-			// 故障边界后的进度证据（失败/残留仍可观察）。
+			// 重跑收敛：每个对象恰好应用一次（不重复构造）。
 			if observer, ok := b.(ApplyObserver); ok {
 				objs := migrationExpectedObjects(b)
 				if objs == nil {
 					t.Fatal("ApplyObserver without SchemaNamer cannot resolve expected objects")
 				}
-				switch point {
-				case event.FaultBeforeStep:
-					for _, obj := range objs {
-						if got := observer.ApplyCount(obj.Name); got != 0 {
-							t.Fatalf("object %s applied %d times before-step fault, want 0",
-								obj.Name, got)
-						}
+				for _, obj := range objs {
+					if got := observer.ApplyCount(obj.Name); got != 1 {
+						t.Fatalf("object %s applied %d times after retry, want 1", obj.Name, got)
 					}
-				case event.FaultAfterStep:
-					applied := 0
-					for _, obj := range objs {
-						if observer.ApplyCount(obj.Name) > 0 {
-							applied++
-						}
-					}
-					if applied < 1 {
-						t.Fatal("after-step fault left no applied object, want >= 1")
-					}
-				case event.FaultBeforeCommit:
-					for _, obj := range objs {
-						if got := observer.ApplyCount(obj.Name); got != 1 {
-							t.Fatalf("object %s applied %d times before-commit fault, want 1",
-								obj.Name, got)
-						}
-					}
-				}
-			}
-			if observer, ok := b.(FaultObserver); ok && point == event.FaultBeforeCommit {
-				if got := observer.AttemptedSteps(); got != len(stmts) {
-					t.Fatalf("attempted steps = %d before commit fault, want %d",
-						got, len(stmts))
-				}
-			}
-			if !changeFault(t, b, point, nil) {
-				return
-			}
-			if err := b.Migrate(t.Context()); err != nil {
-				t.Fatalf("retry after fault at %s: %v", point, err)
-			}
-			requireMigrationVerifyOK(t, b)
-			observer, ok := b.(ApplyObserver)
-			if !ok {
-				return
-			}
-			objs := migrationExpectedObjects(b)
-			if objs == nil {
-				t.Fatal("ApplyObserver without SchemaNamer cannot resolve expected objects")
-			}
-			for _, obj := range objs {
-				if got := observer.ApplyCount(obj.Name); got != 1 {
-					t.Fatalf("object %s applied %d times after retry, want 1", obj.Name, got)
 				}
 			}
 		})
@@ -991,18 +829,6 @@ func qualifiedName(names []string, suffix string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func forceMigrationPath(t *testing.T, b MigrationBackend, path event.MigrationPath) bool {
-	t.Helper()
-	err := b.ForcePath(path)
-	if errors.Is(err, ErrUnsupportedByBackend) {
-		return false
-	}
-	if err != nil {
-		t.Fatalf("force migration path %v: %v", path, err)
-	}
-	return true
 }
 
 // changeFault 注入或清除故障；点不受支持时跳过（不是失败）。

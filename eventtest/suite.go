@@ -1,16 +1,9 @@
 // Package eventtest 契约测试套件：接口的语义就是这套测试，新后端必须
-// 全过（design.md §1、§9.1）。RunSuite 覆盖公共语义（幂等 Append 首写为
-// 准、元数据透传、HeadPosition 基线锚点）、广播消费读取（类型过滤/水位
-// 严格大于且升序/限额/只读/无效水位报错）、认领消费（互斥/并发互斥/
-// 接管计入重试/心跳/退避/终态/迟到 Complete 与 Fail 不生效/新身份重放/
-// 超限行不占限额槽位）与 core 编排行为（广播基线在 Start 同步确立/失败
-// 跳过且不阻塞/各自全收/水位单调/无参事件/类型间不互相饿死/端到端认领/
-// 重试与耗尽/尝试次数与最后一次标记/挂死接管/优雅停机/就近唤醒/订阅守卫）。
-// RunRetentionSuite 覆盖保留窗口惰性清理资格（design.md §5.2）。
-// RunMigrationSuite 通过 MigrationBackend 适配接口覆盖初始化面：空库/完整
-// 基线/部分存量/定义冲突的 Migrate 与 Verify、三种迁移模式的 Driver 首次
-// 操作、导出物、并发首启与锁语义、Lock=none 变体，以及 fast / step 两条
-// 执行路径（含故障注入与回滚/收敛断言）。
+// 全过（design.md §1、§9.1）。RunSuite 覆盖公共、广播读取、认领消费与
+// core 编排语义；RunRetentionSuite 覆盖保留窗口惰性清理资格（design.md
+// §5.2）；RunMigrationSuite 经 MigrationBackend 适配接口覆盖初始化面
+// （Migrate/Verify、三种迁移模式、导出物、并发首启与锁语义、Lock=none
+// 变体、语句边界故障注入）。用例级清单以各 Run 入口的注册表为准。
 //
 // 用例命名遵循三段式「条件_动作_预期结果」。
 package eventtest
@@ -25,7 +18,8 @@ import (
 	"github.com/jninng/go_event"
 )
 
-// RunSuite 运行全套契约测试（design.md §9.1 列举的全部语义）。
+// RunSuite 运行公共、广播读取、认领消费与编排语义的契约测试；迁移与
+// 保留窗口另经 RunMigrationSuite / RunRetentionSuite（design.md §9.1）。
 // 新后端必须全过；语义即测试。
 func RunSuite(t *testing.T, d event.Driver) {
 	// ---- 公共语义 ----

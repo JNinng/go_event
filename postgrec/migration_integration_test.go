@@ -175,6 +175,44 @@ func requireIssue(t *testing.T, report event.VerifyReport, object string,
 	t.Fatalf("issue %s not found in %+v", object, report.Issues)
 }
 
+// SQL 导出的手工脚本整段可重放：空库以简单协议整批执行（等价 psql 整段
+// 执行，脚本自带 BEGIN/COMMIT）两次，均可成功且执行后 Verify 通过。
+func TestSQLScriptReplayable(t *testing.T) {
+	pool := migrationDB(t)
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	scriptDB, err := sql.Open("pgx", dsn+sep+"default_query_exec_mode=simple_protocol")
+	if err != nil {
+		t.Fatalf("open script db: %v", err)
+	}
+	t.Cleanup(func() { _ = scriptDB.Close() })
+
+	schema := newMigrationSchema(t, pool)
+	script, err := postgrec.SQL(postgrec.WithSchema(schema))
+	if err != nil {
+		t.Fatalf("sql: %v", err)
+	}
+	ctx := context.Background()
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := scriptDB.ExecContext(ctx, script); err != nil {
+			t.Fatalf("execute script pass %d: %v", pass, err)
+		}
+	}
+	report, err := postgrec.Verify(ctx, pool, postgrec.WithSchema(schema))
+	if err != nil {
+		t.Fatalf("verify after script: %v", err)
+	}
+	if !report.OK() {
+		t.Fatalf("verify issues after script: %+v", report.Issues)
+	}
+	if !relationExists(t, pool, schema, "event_claim") {
+		t.Fatal("event_claim table missing after script execution")
+	}
+}
+
 func TestCreateOnEmptyDatabase(t *testing.T) {
 	db := migrationDB(t)
 	ctx := context.Background()
@@ -251,7 +289,7 @@ func TestMigrateFillsPartialBaseline(t *testing.T) {
 
 	t.Run("PartialBaseline_Migrate_FillsMissingObjects", func(t *testing.T) {
 		schema := newMigrationSchema(t, db)
-		// 只建 schema 与 event 表（含其约束），模拟部分存量基线。
+		// 只建 schema 与 event 裸表（约束与索引留给 Migrate 补齐），模拟部分存量。
 		stmts, err := postgrec.Statements(postgrec.WithSchema(schema))
 		if err != nil {
 			t.Fatalf("statements: %v", err)
@@ -645,7 +683,9 @@ func TestMigrationLockTimeoutAndRelease(t *testing.T) {
 	}
 }
 
-func TestFastMigrationRollback(t *testing.T) {
+// 中途失败（同名 enum 类型令 CREATE TABLE event_claim 失败）：此前所有
+// 语句已在同一事务内执行，必须整体回滚。
+func TestMigrationMidwayFailureRollback(t *testing.T) {
 	db := migrationDB(t)
 	ctx := context.Background()
 
@@ -705,14 +745,14 @@ SELECT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnames
 	})
 }
 
-// 最后一步失败（注入）：此前所有步骤已执行，事务必须整体回滚。
-func TestFastMigrationLastStepRollback(t *testing.T) {
+// 最后一条语句失败（注入）：此前所有语句已执行，事务必须整体回滚。
+func TestMigrationLastStatementRollback(t *testing.T) {
 	db := migrationDB(t)
 	schema := newMigrationSchema(t, db)
 	ctx := context.Background()
-	injected := errors.New("injected last-step failure")
-	restore := postgrec.SetStepHookForTest(func(step postgresschema.Step) error {
-		if step.Object == schema+".event_claim_eligible_idx" {
+	injected := errors.New("injected last-statement failure")
+	restore := postgrec.SetStatementHookForTest(func(stmt postgresschema.PlannedStatement) error {
+		if stmt.Object.Name == schema+".event_claim_eligible_idx" {
 			return injected
 		}
 		return nil
@@ -724,10 +764,10 @@ func TestFastMigrationLastStepRollback(t *testing.T) {
 		t.Fatalf("migrate = %v, want injected failure", err)
 	}
 	if schemaExists(t, db, schema) {
-		t.Fatal("schema must be rolled back on last-step failure")
+		t.Fatal("schema must be rolled back on last-statement failure")
 	}
 	if relationExists(t, db, schema, "event") || relationExists(t, db, schema, "event_claim") {
-		t.Fatal("tables must be rolled back on last-step failure")
+		t.Fatal("tables must be rolled back on last-statement failure")
 	}
 }
 
@@ -823,7 +863,7 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %[1]s TO %[2]s;`, schema, quotedR
 	})
 }
 
-// 迁移锁必须在第一条 DDL 之前取得：在首个 step 回调里另开连接探测必须失败。
+// 迁移锁必须在第一条 DDL 之前取得：在首条语句钩子里另开连接探测必须失败。
 func TestLockAcquiredBeforeFirstDDL_ProbeFails(t *testing.T) {
 	db := migrationDB(t)
 	schema := newMigrationSchema(t, db)
@@ -836,7 +876,7 @@ func TestLockAcquiredBeforeFirstDDL_ProbeFails(t *testing.T) {
 		probeAcquire bool
 		probeErr     error
 	)
-	restore := postgrec.SetStepHookForTest(func(postgresschema.Step) error {
+	restore := postgrec.SetStatementHookForTest(func(postgresschema.PlannedStatement) error {
 		if probed {
 			return nil
 		}
@@ -851,13 +891,13 @@ func TestLockAcquiredBeforeFirstDDL_ProbeFails(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	if !probed {
-		t.Fatal("step hook did not run")
+		t.Fatal("statement hook did not run")
 	}
 	if probeErr != nil {
 		t.Fatalf("probe lock: %v", probeErr)
 	}
 	if probeAcquire {
-		t.Fatal("migration lock must be held before the first DDL step")
+		t.Fatal("migration lock must be held before the first DDL statement")
 	}
 }
 

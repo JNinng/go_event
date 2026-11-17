@@ -395,7 +395,7 @@ if err != nil {
 defer db.Close()
 
 // 可选：部署/启动期显式迁移（与缺省 Create 模式同义，需 DDL 权限）；
-// 缺省 Create 也会在首次操作时执行基线。
+// 缺省 Create 也会在首次操作时幂等应用版本计划。
 _ = postgrec.Migrate(ctx, db, postgrec.WithSchema("public"))
 
 drv := postgrec.NewDriver(db,
@@ -415,27 +415,31 @@ drv := postgrec.NewDriver(db,
 - `event`：`id` 主键、`type`、`payload bytea`、`metadata jsonb`、`occurred_at`、`position bigserial`，并有 `(type, id)` 唯一约束与 `(type, position)` 索引。
 - `event_claim`：主键 `(event_id, consumer_type)`，含 `lease_token`、`lease_until`、`claim_count`、`status`、`next_eligible_at`；`event_id` 外键级联删除。
 
-DDL 定义在共享的 `postgresschema` 方言包中（结构化步骤与派生语句，无驱动依赖），两个后端使用同一份基线。首次操作是否建表、建到什么程度由迁移模式决定，见 [§8.4](#84-迁移模式与权限)。缺省模式 `Create` 会在首次操作时以构造 Driver 的连接（通常是运行账号）执行基线。
+DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语句、期望对象与共享执行器，无驱动依赖），两个后端使用同一份计划。首次操作是否建表、建到什么程度由迁移模式决定，见 [§8.4](#84-迁移模式与权限)。缺省模式 `Create` 会在首次操作时以构造 Driver 的连接（通常是运行账号）幂等应用版本计划全量语句。
 
 ### 8.4 迁移模式与权限
 
-`event.MigrateMode` 有三种模式（P1 计划增加 `Upgrade` 做版本化自动升级）：
+`event.MigrateMode` 有三种模式（没有 `Upgrade`：升级随部署隐式发生，见
+[ADR 0007](docs/adr/0007-migration-mode-and-protocol.md)）：
 
 | 模式 | Driver 首次操作时 | 所需连接权限 | 适用场景 |
 | --- | --- | --- | --- |
-| `Create`（缺省） | 持迁移锁执行基线 DDL：建 schema、两表、约束与索引；只建基线，不升级存量表 | DDL + DML | 部署/启动期用高权限连接初始化空库或幂等补齐基线 |
-| `Verify` | 只读校验对象集合与定义，不执行 DDL；不一致时首次操作返回 `*event.VerifyError` | DML + 系统目录只读 | 部署期已建表、运行账号只给 DML 时的启动自检 |
+| `Create`（缺省） | 持迁移锁幂等应用版本计划全量语句（基线与各版本）：建 schema、两表、约束与索引；升级随部署隐式发生 | DDL + DML | 部署/启动期用高权限连接初始化空库、幂等补齐缺失对象或随新二进制隐式升级 |
+| `Verify` | 只读校验对象集合与计划期望（全量版本）一致，不执行 DDL；缺失表示待升级，定义冲突时首次操作返回 `*event.VerifyError` | DML + 系统目录只读 | 部署期已建表、运行账号只给 DML 时的启动自检 |
 | `None` | 不建表也不校验，完全交给部署流程 | 仅 DML | schema 由外部流程严格管理，库不做检查 |
-| `Upgrade`（P1 计划） | 在基线上应用待升级版本 | DDL + DML | 版本化自动升级 |
+
+迁移执行为单一执行路径（无台账）：取锁 → 接管校验（对象集合与计划期望
+比对：仅缺对象放行、定义冲突报差异错误）→ 整版单事务依次执行计划内全部
+语句，任何失败整体回滚；中断后重跑即收敛。
 
 - **无 DDL 权限的运行连接不能自动迁移**：`Create` 与显式 `Migrate` 同义，都以构造 Driver 的连接（通常是运行账号）执行 DDL。权限不足时返回 `event.ErrMigrationPermissionDenied` 并 fail-fast；正确做法是在部署期用高权限连接建表（调用 `Migrate` 或执行 `SQL` 导出的脚本），运行期改用 `Verify` 或 `None`。若后端锁能力为无（`LockNone`），`Create` 返回 `event.ErrMigrationUnsupported`；DDL 原子性为无是另一维度，同样只能 `Verify`/`None`。
 - **失败缓存与重试有界**：`ensure` 的失败按 Driver 实例负缓存。瞬时错误（数据库不可用、`ErrMigrationLockTimeout`）按指数退避重试（100ms 起、封顶 30s），窗口内所有操作返回同一错误，不会在每次 Append/Claim 时重跑全部 DDL；永久配置错误（权限不足、对象定义冲突、非法 schema、后端不支持自动迁移）直接 fail-fast，不再重试。调用方取消不算迁移结论，不写入负缓存。
 - **部署补建后需重启或重建 Driver**：永久配置错误在 Driver 生命周期内保持；`Verify` 首次通过后同样缓存「已检查」。表结构在运行期被改动时，只有重建 Driver 才会重新判定。
-- **`Verify` 报告结构**：`event.VerifyReport` 含 `Issues []event.VerifyIssue`，每项含对象标识、对象类型、问题类别与处置说明（`Action`）；`Issues` 为空表示与基线一致。P0 的问题类别为 `missing`（对象缺失，基线可补齐）与 `outdated`（定义与基线不一致，不自动修复）；`too_new` / `failed` 为 P1 版本台账预留。列级缺失或定义不一致必须走版本化迁移，基线只建表。
-- **`Statements` / `SQL` 导出物**：`Statements` 返回基线语句清单（不含迁移锁）；`SQL` 返回可手工执行的整段脚本：以 `BEGIN` 开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于全部基线 DDL 之前），末尾 `COMMIT`。手工执行 `SQL` 无需额外取锁；若按 `Statements` 逐条手工执行，必须先自行取锁，否则并发首启会出现 DDL 竞态。P1 的 step 路径只导出步骤清单与探测方式，手工整段执行不可重放。
+- **`Verify` 报告结构**：`event.VerifyReport` 含 `Issues []event.VerifyIssue`，每项含对象标识、对象类型、问题类别与处置说明（`Action`）；`Issues` 为空表示与计划期望一致。问题类别为 `missing`（对象缺失：待升级，处置为执行迁移；缺失基线列例外——迁移不修改既有表，须人工加列）与 `outdated`（定义与计划期望不一致，不自动修复）；`too_new` / `failed` 为预留枚举，当前模型不产生。
+- **`Statements` / `SQL` 导出物**：两者由同一版本计划派生。`Statements` 返回计划内全部语句清单（不含迁移锁）；`SQL` 返回可手工执行的整段脚本：以 `BEGIN` 开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于全部 DDL 之前），随后依次输出计划内全部语句（基线 + 各版本，全部幂等），末尾 `COMMIT`。脚本整段可重放（中断重跑收敛）；手工执行 `SQL` 无需额外取锁；若按 `Statements` 逐条手工执行，必须先自行取锁并整段执行，否则并发首启会出现 DDL 竞态。
 - **保留窗口不受影响**：迁移模式只决定持久结构的初始化方式，不改变 [§8.5](#85-保留窗口与惰性清理) 的保留期与惰性清理语义。
 
-推荐组合：部署/启动期用高权限连接以 `Create`（P1 可改用 `Upgrade`）完成基线或升级；运行期用 `Verify` 做启动自检，或 `None` 完全交给部署流程——两者都不要求运行账号具备 DDL 权限。
+推荐组合：部署/启动期用高权限连接以 `Create` 完成初始化或随新二进制隐式升级；运行期用 `Verify` 做启动自检，或 `None` 完全交给部署流程——两者都不要求运行账号具备 DDL 权限。
 
 ### 8.5 保留窗口与惰性清理
 
@@ -525,7 +529,7 @@ func TestMyBackendRetention(t *testing.T) {
 
 `RunRetentionSuite` 的 `newDriver` 不能复用实例：清理簿记按 Driver 实例记忆并有节流，共享实例会让部分用例被跳过。
 
-迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`ForcePath`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可强制 fast/step 路径并注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`ForcePath`/`InjectFault` 不支持时返回 `eventtest.ErrUnsupportedByBackend`。
+迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
 ### 9.3 Postgres 集成测试
 
@@ -592,7 +596,8 @@ func TestMyBackendRetention(t *testing.T) {
 - **重复处理是正常的**：慢 handler 被误接管、心跳丢失等场景会出现并发重复处理；库不在消费路径做去重。
 - **预取不会让租约空转过期**：认领按空闲并发槽位限额，认领后立即可派发并续租。但进程崩溃、停机（停止派发，未开始的租约到期后由其他实例接管）与 handler 超过 `MaxProcessing`（停止续租）仍会被接管，属 at-least-once 的正常表现，不是异常。
 - **保留窗口要够长**：尤其认领消费，窗口必须覆盖最坏重试路径，否则未完成事件会被清理而丢失。
-- **数据库权限**：自动建表（`Create`）与显式 `Migrate` 同义，都需要 DDL 权限，且 `ensure` 在运行期以构造 Driver 的连接执行 DDL。**无 DDL 权限的运行连接不能自动迁移**：在部署期用高权限连接调用 `Migrate`（或执行 `SQL` 脚本）建表，运行期用 `WithMigrateMode(event.MigrateVerify)` 做启动自检，或 `None` 完全交给部署流程。
+- **数据库权限**：自动迁移（`Create`）与显式 `Migrate` 同义，都需要 DDL 权限，且 `ensure` 在运行期以构造 Driver 的连接执行 DDL。**无 DDL 权限的运行连接不能自动迁移**：在部署期用高权限连接调用 `Migrate`（或执行 `SQL` 脚本）建表，运行期用 `WithMigrateMode(event.MigrateVerify)` 做启动自检，或 `None` 完全交给部署流程。
+- **升级随部署隐式发生**：新二进制包含新版本语句时，`Create` 的首次操作（或显式 `Migrate`、重放 `SQL` 脚本）会幂等补齐缺失对象，没有独立的升级命令与停服窗口控制；升级语义要求每个版本的语句向后兼容，或停服迁移。
 - **停机**：`Stop` 等待在途 handler；handler 本身过长会拖住停机，给 `Stop` 传超时 ctx 作为兜底。
 - **轮询开销**：默认 5s 轮询一次；低频场景可调大，需要低延迟时注入 `LocalWake`（仅同进程）或后续使用 LISTEN/NOTIFY（P1）。
 - **消费者身份变更**：新增身份会重放窗口内全部历史事件；改名等同于新身份，不是断点续跑。

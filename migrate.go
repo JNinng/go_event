@@ -10,12 +10,13 @@ import (
 type MigrateMode int
 
 const (
-	// MigrateCreate 缺省模式：首次使用时执行基线（持迁移锁）。
-	// 只建基线，不升级存量表；需要 DDL 权限。
+	// MigrateCreate 缺省模式：首次使用时持迁移锁幂等应用版本计划全量
+	// 语句（基线与各版本；升级随部署隐式发生，无独立 Upgrade 模式）。
+	// 需要 DDL 权限。
 	MigrateCreate MigrateMode = iota
 
-	// MigrateVerify 只读校验：不执行 DDL，只校验对象是否与基线一致。
-	// 表须由部署流程创建；运行账号可只授 DML。
+	// MigrateVerify 只读校验：不执行 DDL，只校验对象是否与计划期望一致。
+	// 表须由部署流程创建（或手工脚本）；运行账号可只授 DML。
 	MigrateVerify
 
 	// MigrateNone 不建表也不校验，完全交给调用方（部署流程与权限自担）。
@@ -50,13 +51,17 @@ const (
 type VerifyProblem string
 
 const (
-	// ProblemMissing 对象缺失（可由基线补齐）。
+	// ProblemMissing 对象缺失（可由版本计划补齐；对后续版本对象表示
+	// 库落后于二进制，处置为执行迁移）。
 	ProblemMissing VerifyProblem = "missing"
-	// ProblemOutdated 对象已存在但定义与基线不一致（基线不自动修复）。
+	// ProblemOutdated 对象已存在但定义与计划期望不一致（不自动修复）。
 	ProblemOutdated VerifyProblem = "outdated"
-	// ProblemTooNew 预留 P1：库内版本高于二进制要求。
+	// ProblemTooNew 预留：库内对象超出计划期望且需判定为「库版本高于
+	// 二进制」时使用；无台账模型（对象集合即事实）当前不产生该问题，
+	// 保留枚举以稳定 API。
 	ProblemTooNew VerifyProblem = "too_new"
-	// ProblemFailed 预留 P1：版本处于 failed 状态。
+	// ProblemFailed 预留：迁移台账被否决（见 ADR 0007），当前模型不产生
+	// 该问题，保留枚举以稳定 API。
 	ProblemFailed VerifyProblem = "failed"
 )
 
@@ -165,10 +170,9 @@ type ErrorClasses struct {
 	Transient  bool // 瞬时错误（可退避重试）
 }
 
-// MigrationCapabilities 是后端迁移能力声明，供契约测试与文档判定；P1
-// 执行器按声明选择路径。锁能力为无（LockNone）时 Create 返回
-// ErrMigrationUnsupported；DDL 原子性为无（DDLAtomicNone）时同样返回该错误
-// （P0 无此档后端）。
+// MigrationCapabilities 是后端迁移能力声明，供契约测试与文档判定。锁能力
+// 为无（LockNone）时 Create 返回 ErrMigrationUnsupported；DDL 原子性为无
+// （DDLAtomicNone）时同样返回该错误。
 type MigrationCapabilities struct {
 	Atomicity   DDLAtomicity
 	IfNotExists map[ObjectKind]NativeSupport
@@ -179,31 +183,21 @@ type MigrationCapabilities struct {
 	Completion  DDLCompletion
 	// ImplicitCommit 表示 DDL 是否隐式提交（把语句放进事务也无法整体回滚）。
 	ImplicitCommit bool
-	// NonTransactionalSteps 表示迁移计划可声明必须在事务外执行的步骤
-	// （如并发建索引）；含此类步骤的版本不得走 fast 路径。
+	// NonTransactionalSteps 表示计划可包含必须在事务外执行的语句
+	// （如并发建索引）；Postgres 单一执行路径当前只执行可事务化语句，
+	// 含此类语句的版本引入时按当时能力扩展执行器。
 	NonTransactionalSteps bool
 }
 
-// MigrationPath 是单版本迁移的执行路径；P0 由迁移契约测试使用，P1 台账/
-// step 状态机复用。
-type MigrationPath int
-
-const (
-	// MigrationPathFast 单事务：锁、基线、版本 DDL、台账同事务。
-	MigrationPathFast MigrationPath = iota
-	// MigrationPathStep 逐步探测/执行（无跨语句事务或含不可事务化步骤）。
-	MigrationPathStep
-)
-
-// FaultPoint 是迁移执行器可注入故障的边界点；供迁移契约测试使用，P1
-// 状态机复用。
+// FaultPoint 是迁移执行器可注入故障的边界点（语句边界：单条语句执行前后
+// 与事务提交前）；供迁移契约测试使用。
 type FaultPoint string
 
 const (
-	FaultAfterLock    FaultPoint = "after_lock"
-	FaultBeforeStep   FaultPoint = "before_step"
-	FaultAfterStep    FaultPoint = "after_step"
-	FaultBeforeCommit FaultPoint = "before_commit"
+	FaultAfterLock       FaultPoint = "after_lock"
+	FaultBeforeStatement FaultPoint = "before_statement"
+	FaultAfterStatement  FaultPoint = "after_statement"
+	FaultBeforeCommit    FaultPoint = "before_commit"
 )
 
 // IsPermanentMigrationError 报告迁移失败是否属于永久配置错误：此类错误

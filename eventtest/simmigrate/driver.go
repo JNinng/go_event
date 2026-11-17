@@ -50,7 +50,6 @@ func (d *driver) ensure(ctx context.Context) error {
 			err = &event.VerifyError{Report: report}
 		}
 	case event.MigrateNone:
-		// 不建表也不校验。
 	default:
 		err = fmt.Errorf("simmigrate: unsupported migrate mode %d: %w",
 			int(d.mode), event.ErrMigrateModeUnsupported)

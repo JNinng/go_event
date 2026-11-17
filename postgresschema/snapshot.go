@@ -266,7 +266,7 @@ func Diff(expected []Object, snap Snapshot) event.VerifyReport {
 		case event.KindSchema:
 			if !snap.SchemaExists {
 				issues = append(issues, newIssue(obj.Name, obj.Kind, event.ProblemMissing,
-					"create the schema (baseline Create)"))
+					"run the migration (Create) or the SQL script to create the schema"))
 			}
 		case event.KindTable:
 			issues = append(issues, diffTable(obj, snap)...)
@@ -283,11 +283,11 @@ func diffTable(obj Object, snap Snapshot) []event.VerifyIssue {
 	state, ok := snap.Tables[obj.Table]
 	if !ok {
 		return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemMissing,
-			"create the table (baseline Create)")}
+			"run the migration (Create) or the SQL script to create the table")}
 	}
 	if state.RelKind != "r" && state.RelKind != "p" {
 		return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemOutdated,
-			"replace the conflicting relation with a table of the baseline definition")}
+			"replace the conflicting relation with a table of the planned definition")}
 	}
 	var issues []event.VerifyIssue
 	for _, want := range obj.Columns {
@@ -295,13 +295,13 @@ func diffTable(obj Object, snap Snapshot) []event.VerifyIssue {
 		name := obj.Name + "." + want.Name
 		if !found {
 			issues = append(issues, newIssue(name, event.KindColumn, event.ProblemMissing,
-				"add the column through a versioned migration (baseline only creates tables)"))
+				"add the column manually to match the plan (the migration does not alter existing tables)"))
 			continue
 		}
 		if actual.DataType != want.DataType || actual.NotNull != want.NotNull ||
 			(want.Sequence && !actual.HasSequenceDefault) {
 			issues = append(issues, newIssue(name, event.KindColumn, event.ProblemOutdated,
-				"align the column definition with the baseline through a versioned migration"))
+				"align the column definition with the plan manually (not auto-repaired)"))
 		}
 	}
 	return issues
@@ -317,11 +317,11 @@ func diffConstraint(obj Object, snap Snapshot) []event.VerifyIssue {
 	pk, ok := findConstraint(snap, obj.Table, func(c ConstraintState) bool { return c.Type == "p" })
 	if !ok {
 		return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemMissing,
-			"add the primary key (baseline Create)")}
+			"run the migration (Create) or the SQL script to add the primary key")}
 	}
 	if !equalColumns(pk.Columns, obj.KeyColumns) {
 		return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemOutdated,
-			"align the primary key columns with the baseline through a versioned migration")}
+			"align the primary key columns with the plan manually (not auto-repaired)")}
 	}
 	return nil
 }
@@ -330,7 +330,7 @@ func diffUnique(obj Object, snap Snapshot) []event.VerifyIssue {
 	if actual, ok := snap.Constraints[unqualified(obj.Name)]; ok && actual.Table == obj.Table {
 		if !equalColumns(actual.Columns, obj.KeyColumns) {
 			return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemOutdated,
-				"align the unique constraint columns with the baseline through a versioned migration")}
+				"align the unique constraint columns with the plan manually (not auto-repaired)")}
 		}
 		return nil
 	}
@@ -341,7 +341,7 @@ func diffUnique(obj Object, snap Snapshot) []event.VerifyIssue {
 		return nil // 同列的唯一约束已存在（名称不同不影响语义）
 	}
 	return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemMissing,
-		"add the unique constraint (baseline Create)")}
+		"run the migration (Create) or the SQL script to add the unique constraint")}
 }
 
 func diffForeignKey(obj Object, snap Snapshot) []event.VerifyIssue {
@@ -350,7 +350,7 @@ func diffForeignKey(obj Object, snap Snapshot) []event.VerifyIssue {
 			actual.RefTable != obj.ForeignKey.RefTable ||
 			!equalColumns(actual.RefColumns, obj.ForeignKey.RefColumns) {
 			return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemOutdated,
-				"align the foreign key definition with the baseline through a versioned migration")}
+				"align the foreign key definition with the plan manually (not auto-repaired)")}
 		}
 		return nil
 	}
@@ -363,24 +363,27 @@ func diffForeignKey(obj Object, snap Snapshot) []event.VerifyIssue {
 		return nil
 	}
 	return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemMissing,
-		"add the foreign key (baseline Create)")}
+		"run the migration (Create) or the SQL script to add the foreign key")}
 }
 
 func diffIndex(obj Object, snap Snapshot) []event.VerifyIssue {
 	idx, ok := snap.Indexes[unqualified(obj.Name)]
 	if !ok {
 		return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemMissing,
-			"create the index (baseline Create)")}
+			"run the migration (Create) or the SQL script to create the index")}
 	}
 	if idx.Table != obj.Table || idx.Unique != obj.Unique || !equalColumns(idx.Columns, obj.KeyColumns) {
 		return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemOutdated,
-			"align the index definition with the baseline through a versioned migration")}
+			"align the index definition with the plan manually (not auto-repaired)")}
 	}
 	return nil
 }
 
-// Repairable 报告问题集合是否能由基线 DDL 补齐：缺失的 schema/表/索引/
-// 约束可补齐；列级问题与定义冲突（outdated）不能，必须人工处置。
+// Repairable 报告问题集合是否能由版本计划补齐：缺失的 schema/表/索引/
+// 约束可由计划的幂等语句构造；缺失的基线列不能（其构造语句是
+// CREATE TABLE IF NOT EXISTS，对已存在的表不生效，属定义偏差，必须人工
+// 处置；后续版本以 ADD COLUMN IF NOT EXISTS 加列时再放开该档）；定义
+// 冲突（outdated）不能，必须人工处置。
 func Repairable(report event.VerifyReport) bool {
 	for _, issue := range report.Issues {
 		if issue.Problem != event.ProblemMissing {

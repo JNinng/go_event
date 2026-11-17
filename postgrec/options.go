@@ -2,8 +2,9 @@
 // event / event_claim 两表、FOR UPDATE SKIP LOCKED 认领、惰性清理
 // （design.md §7、§9.1）。
 //
-// 持久结构按 NewDriver 的迁移模式处理：缺省 Create 在首次使用时自动执行
-// 基线（持迁移锁）；Verify 只读校验，None 不建也不校验——后两种模式要求
+// 持久结构按 NewDriver 的迁移模式处理：缺省 Create 在首次使用时持迁移锁
+// 幂等应用版本计划全量语句（基线与各版本，升级随部署隐式发生，协议见
+// docs/adr/0007）；Verify 只读校验，None 不建也不校验——后两种模式要求
 // 表已由部署流程创建。运行账号只授 DML 权限时用 Verify / None；Create
 // 需要 DDL 权限。
 //
@@ -41,8 +42,9 @@ func WithRetention(d time.Duration) Option {
 }
 
 // WithMigrateMode 设置运行面迁移模式（缺省 Create）：Create 首次使用时
-// 执行基线；Verify 只读校验、不执行 DDL；None 不建表也不校验。该选项
-// 只对 NewDriver 有意义，显式传给 Migrate 返回 ErrMigrateModeUnsupported。
+// 幂等应用版本计划全量语句（基线与各版本）；Verify 只读校验、不执行 DDL；
+// None 不建表也不校验。该选项只对 NewDriver 有意义，显式传给 Migrate
+// 返回 ErrMigrateModeUnsupported。
 func WithMigrateMode(m event.MigrateMode) Option {
 	return func(c *config) {
 		c.mode = m

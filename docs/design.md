@@ -82,10 +82,10 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   语义；暂用于携带 trace\_id（使用方可注入 otel TraceID 等追踪上下文）做事件流
   与调用链的关联。
 - **依赖策略**：core 依赖 stdlib（slog），不携带任何数据库驱动，也不依赖
-  具体方言；方言 DDL（基线/版本步骤、期望对象、锁语句）放在独立
+  具体方言；方言 DDL（版本计划、期望对象、锁语句与共享执行器）放在独立
   `postgresschema` 模块，只做构造、不 import 驱动；各后端 require 该模块并
-  做连接适配。core 的初始化面只定义契约类型（迁移模式、校验报告、能力声明），
-  不内置任何后端 DDL。
+  做连接适配与错误分类。core 的初始化面只定义契约类型（迁移模式、校验报告、
+  能力声明），不内置任何后端 DDL。
 - **观测策略**：以可注入的 `Metrics` 接口接入（P1 计划），实现方适配 otel；
   不把 otel 依赖强加进 core，未配置时静默、零开销。P0 只用 slog（见 §9.2）。
 - **强类型与无参事件并存**：泛型声明式事件（`Declare[T](name)`）提供强类型
@@ -214,9 +214,9 @@ go_event/
 │   codec.go / errors.go / localwake.go / migrate.go         # core：契约与编排、迁移契约类型
 ├── postgrec/        # Postgres 后端（标准库）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── pgxc/            # Postgres 后端（pgx v5）：event/event_claim 表、SKIP LOCKED、迁移执行
-├── postgresschema/  # Postgres 方言 DDL 单一事实源：结构化步骤、期望对象、锁语句（无驱动依赖）
+├── postgresschema/  # Postgres 方言 DDL 单一事实源：版本计划、期望对象、共享执行器（无驱动依赖）
 ├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunMigrationSuite
-│   └── simmigrate/  # 迁移契约测试的进程内模拟 backend（可强制 step、可注入故障）
+│   └── simmigrate/  # 迁移契约测试的进程内模拟 backend（语句边界故障注入）
 └── docs/
     ├── api.md       # API 文档
     ├── design.md    # 本文
@@ -232,52 +232,50 @@ go_event/
 
 **持久结构初始化按迁移模式处理**（[ADR 0007](adr/0007-migration-mode-and-protocol.md)）：
 
-- `Create`（缺省）：首次操作时以构造 Driver 的连接持迁移锁执行基线
-  （schema、表、约束、索引）；只建基线、不升级存量表，需要 DDL 权限。
-- `Verify`：只读校验对象集合与定义，不执行 DDL；不一致时首次操作返回
-  `VerifyError`。表须由部署流程创建，运行账号可只授 DML（另需系统目录读）。
+- `Create`（缺省）：首次操作时以构造 Driver 的连接持迁移锁幂等应用版本
+  计划全量语句（基线与各版本；schema、表、约束、索引）；升级随部署隐式
+  发生，无独立 `Upgrade` 模式，需要 DDL 权限。
+- `Verify`：只读校验对象集合与计划期望（全量版本）一致，不执行 DDL；
+  缺失表示待升级（处置为执行迁移），定义冲突时首次操作返回 `VerifyError`。
+  表须由部署流程创建，运行账号可只授 DML（另需系统目录读）。
 - `None`：不建表也不校验，完全交给调用方。
-- P1 增加 `Upgrade`：在基线上应用版本化迁移。引入版本台账后，`Create`
-  检出库内版本低于二进制要求时 fail-fast 并提示改用 `Upgrade`，不静默运行
-  在旧 schema 上；库代码不得读取仅在 `Upgrade` 后存在的列，除非当前模式
-  已确认版本。
 
-迁移执行：
+迁移执行（单一执行路径，无台账）：
 
-- **统一锁**：基线建表与版本升级共用同一锁键（含 schema 命名空间）、同一
-  状态记录语义（P1 台账）与同一份步骤定义；先取锁再执行任何 DDL。锁原语
-  按能力从优到劣：事务级锁 → 原生会话锁 → 锁行租约（P1）；等待有界，超时按瞬时
-  错误退避，不得无限阻塞。锁能力为无（`LockNone`）时，`Create` 返回
-  `ErrMigrationUnsupported`，只能 `Verify`/`None`；DDL 原子性为无
-  （`DDLAtomicNone`）时 `Create` 同样返回 `ErrMigrationUnsupported`（P0
-  无此档后端，P1 执行器按声明返回）。`Upgrade` 同属 P1，锁能力为无时同样
-  拒绝。
-- **fast 路径**：后端支持跨语句事务且该版本全部步骤可事务化时，锁、基线、
-  P1 版本 DDL 与台账同事务，全成或全败；失败回滚即恢复，不逐对象探测
-  （基线接管校验除外）、不写 `applying`。事务档后端在全可事务化版本上必须
-  走 fast，不得静默降级。
-- **step 路径**：无跨语句事务或含不可事务化步骤时，逐 step 探测后执行；
-  已存在且定义一致则跳过，缺失则执行，定义不一致报差异错误；每步可安全
-  重入，崩溃后重跑整版依赖探测收敛。P0 两个 Postgres 后端的基线全部可
-  事务化，执行器只走 fast；step 路径的协议与恢复由模拟 backend 的契约
-  测试覆盖，随 P1 台账落到后端执行器。
-- **基线接管校验**：无论哪条路径，表已存在（P0 无台账或 P1 台账无该版本
-  记录）时都要校验对象集合（名称、列与类型、主键/唯一/外键引用/索引列）。
-  已有对象与期望定义一致且仅缺对象 → 补齐并收敛（P1 补记基线版本）；任一
-  已有对象定义冲突或无法判定归属 → 返回差异错误，不自动修复，也不自动补
-  记台账。
+- **版本计划**：迁移单元是幂等 DDL 单语句（expand-only：建表/加列/建索引），
+  由版本 `Version{Number, Statements}` 构成计划，版本号自基线 1 起严格
+  递增；版本号只存在于计划中，库内不落版本记录——对象集合即事实。一条
+  语句恰好构造期望对象集合中的一个对象；约束不在建表语句中内联，统一用
+  探测后条件执行的 DO 块创建（`ADD CONSTRAINT` 无 `IF NOT EXISTS`）。
+  后续版本以追加方式进入计划，不修改既有版本语句。
+- **统一锁**：基线与升级共用同一锁键（含 schema 命名空间）与同一份语句
+  定义；执行任何 DDL 前先取锁（并发 `IF NOT EXISTS` 类 DDL 存在元数据
+  竞态，不能依赖语句幂等替代锁）。事务级 advisory 锁，随提交/回滚释放；
+  等待有界（try-lock + 退避，DDL 自身锁等待由 `lock_timeout` 限定），超时
+  映射为瞬时错误，不得无限阻塞。锁能力为无（`LockNone`）时，`Create`
+  返回 `ErrMigrationUnsupported`，只能 `Verify`/`None`；DDL 原子性为无
+  （`DDLAtomicNone`）时同样拒绝。
+- **整版单事务**：取锁 → 接管校验（对象集合与计划期望比对：仅缺对象 →
+  放行执行；任一定义冲突 → 差异错误，不修复）→ 依次执行计划内全部语句，
+  任何失败整体回滚；中断后重跑即收敛。不做逐对象探测、不写执行状态、
+  无恢复矩阵。
+- **基线接管校验**：表已存在（旧二进制、手工脚本或其他工具创建）时校验
+  对象集合（名称、列与类型、主键/唯一/外键引用/索引列）。已有对象与期望
+  定义一致且仅缺对象 → 补齐并收敛；任一已有对象定义冲突或无法判定归属 →
+  返回差异错误，不自动修复。
 - **不支持先查后建**：不用 `Verify` 作为 `Migrate` 的前置门——检查与创建
-  无法组成原子操作；原子性由锁 + 事务（fast）或执行器探测 + 单语句原子
-  （step）保证。
-- **失败处理**：`ensure` 失败按 Driver 实例负缓存。瞬时错误（数据库不可用、
-  锁等待超时）有界指数退避（100ms 起、封顶 30s）；永久配置错误（权限、
-  定义冲突、非法 schema、后端不支持）fail-fast。`Verify` 首次通过后在
-  Driver 内缓存「已检查」，部署补建或定义修复后需重启/重建 Driver。
-- **导出物**：`Statements` 为基线语句清单（不含锁）；`SQL` 以 `BEGIN`
-  开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于全部基线 DDL 之前），
-  末尾 `COMMIT`，整段须在同一事务执行。导出只覆盖当前基线，列/索引变更
-  必须走版本化迁移。step 路径只导出步骤清单与探测方式，手工整段执行不可
-  重放（P1）。
+  无法组成原子操作；原子性由锁 + 整版事务保证。
+- **失败处理**：迁移失败直接返回错误（不持久化）。`ensure` 失败按 Driver
+  实例负缓存：瞬时错误（数据库不可用、锁等待超时）有界指数退避（100ms
+  起、封顶 30s）；永久配置错误（权限、定义冲突、非法 schema、后端不支持）
+  fail-fast。`Verify` 首次通过后在 Driver 内缓存「已检查」，部署补建或
+  定义修复后需重启/重建 Driver。
+- **导出物**：`Statements` 为计划内全部语句清单（不含锁）；`SQL` 由版本
+  计划派生：以 `BEGIN` 开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于
+  全部 DDL 之前），随后依次输出计划内全部语句（基线 + 各版本，全部幂等），
+  末尾 `COMMIT`，整段须在同一事务执行、整段可重放。脚本与执行器共用同一
+  份语句定义，不维护第二份拷贝；人工执行必须先取锁、整段执行，不得拆分
+  跳过。
 
 **能力矩阵**（值以各后端 `Capabilities()` 声明为准）：
 
@@ -290,22 +288,21 @@ go_event/
 | 锁原语 | 事务级 advisory 锁 | 事务级 advisory 锁 | `LockNone` |
 | 锁释放 | 提交/回滚自动释放 | 提交/回滚自动释放 | 零值（无锁，无实际语义） |
 | DDL 完成语义 | 同步 | 同步 | 零值（无 DDL） |
-| 步骤事务性 | 可声明事务外步骤（如并发建索引） | 同 postgrec | false（零值） |
+| 事务外语句 | 计划可包含事务外语句（如并发建索引） | 同 postgrec | false（零值） |
 | DDL 是否隐式提交 | 否（事务内可整体回滚） | 同 postgrec | false（零值） |
-| 自动迁移 | 支持（P0 基线走 fast；P1 Upgrade 计划） | 支持（P0 基线走 fast；P1 Upgrade 计划） | no-op，不参与 DDL |
+| 自动迁移 | 支持（版本计划走整版单事务） | 支持（版本计划走整版单事务） | no-op，不参与 DDL |
 
 inmem 无持久结构，零值能力声明不触发「锁能力为无」的拒绝分支。
 
 **连接权限矩阵**：
 
-| 模式 | 所需权限 | 推荐场景 | 现状 |
-| --- | --- | --- | --- |
-| `Create` | DDL + DML | 部署/启动期高权限连接初始化空库或幂等补齐基线 | P0 |
-| `Verify` | DML + 系统目录只读 | 运行期自检；运行账号仅 DML，表由部署期建好 | P0 |
-| `None` | 仅 DML | schema 完全由部署流程管理，库不做检查 | P0 |
-| `Upgrade` | DDL + DML | 版本化自动升级 | P1 计划 |
+| 模式 | 所需权限 | 推荐场景 |
+| --- | --- | --- |
+| `Create` | DDL + DML | 部署/启动期高权限连接初始化空库或幂等补齐版本计划全量对象（升级随部署隐式发生） |
+| `Verify` | DML + 系统目录只读 | 运行期自检；运行账号仅 DML，表由部署期建好 |
+| `None` | 仅 DML | schema 完全由部署流程管理，库不做检查 |
 
-自动迁移（P0 `Create`；P1 `Upgrade`）需要 DDL 权限；无 DDL 权限的运行连接不能自动
+自动迁移（`Create`）需要 DDL 权限；无 DDL 权限的运行连接不能自动
 迁移，只能 `Verify`/`None`。库不负责账号或授权管理。
 
 Driver 保持**拉形状**（Claim/Fetch 返回批次），推送型后端经其拉式 API 适配
@@ -339,16 +336,17 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   批大小为 `min(WithFetchLimit, 空闲并发槽位)`，无空闲槽位时不认领；派发前
   由 core 按租约尝试序号与订阅 RetryLimit 注入 Attempts/LastAttempt。
 - **就近消费**：同进程发布唤醒本实例立即拉取/认领（仅信号，不跳过存储）。
-- **Postgres 后端**：event / event\_claim 两表、幂等基线 DDL、SKIP LOCKED
+- **Postgres 后端**：event / event\_claim 两表、幂等版本计划 DDL、SKIP LOCKED
   认领、惰性清理（资格：超窗且无活跃租约，无论状态；保留窗口可配，历史
   重放仅限窗口内，认领消费窗口须覆盖最坏重试路径）。
-- **持久结构初始化与迁移三模式**：`Create`（缺省，首次操作持迁移锁执行
-  基线）/ `Verify`（只读校验）/ `None`（不建不校验）；`Create` 做基线接管
-  校验，定义冲突返回差异错误、不自动修复；`Statements`/`SQL` 导出基线语句
-  与含锁脚本；能力声明（`Capabilities`）用于契约测试与文档判定，P1 执行器
-  按声明选择路径；运行期无 DDL 权限
+- **持久结构初始化与迁移三模式**：`Create`（缺省，首次操作持迁移锁幂等
+  应用版本计划全量语句；升级随部署隐式发生）/ `Verify`（只读校验）/
+  `None`（不建不校验）；`Create` 做基线接管校验，定义冲突返回差异错误、
+  不自动修复；`Statements`/`SQL` 导出计划全量语句与含锁手工脚本；
+  能力声明（`Capabilities`）用于契约测试与文档判定；运行期无 DDL 权限
   只能 `Verify`/`None`。迁移失败按 Driver 负缓存：瞬时错误有界退避，永久
-  配置错误 fail-fast。P1 增 `Upgrade` 与版本台账。
+  配置错误 fail-fast。迁移协议见 [ADR 0007](adr/0007-migration-mode-and-protocol.md)
+  （幂等语句、单一执行路径、无台账）。
 - **契约测试**：inmem Driver + eventtest 套件，覆盖上述全部语义（广播消费
   基线锚定与起点语义/失败跳过且不阻塞/广播各自全收/水位单调；无参事件
   的广播与认领；类型间不互相饿死；认领消费互斥（含并发认领）/接管/
@@ -357,7 +355,7 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   ID 唯一与幂等 Append 首写为准、元数据透传、HeadPosition 基线锚点；
   持久结构初始化的幂等可重复执行；迁移契约 `RunMigrationSuite`（空库/
   完整/部分/冲突、三模式 Driver 首启、导出物、并发首启、锁释放、
-  Lock=none、fast/step 路径与故障注入）；保留窗口清理资格
+  Lock=none、语句边界故障注入与回滚/收敛）；保留窗口清理资格
   （RunRetentionSuite））。
 
 ### 9.2 生产化能力（P1）
@@ -369,9 +367,9 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   `ClaimResult{Leases, Takeovers, TerminalFailed}`，`Lease` 不再承担接管
   标记（v0.x 允许破坏性变更）。
 - **管理面**：滞留/failed 事件查询、手工重放（仅针对 `failed` 终态重新置为
-  可认领；`done` 不可逆、不重放）、版本台账 failed 重置与基线补记
-  （`Admin` reset/stamp）、dead-letter 处置钩子、失败信息留存（最后错误
-  摘要）、存量消费者身份的重命名迁移（§5.1）。
+  可认领；`done` 不可逆、不重放）、dead-letter 处置钩子、失败信息留存
+  （最后错误摘要）、存量消费者身份的重命名迁移（§5.1）。迁移侧无台账，
+  不需要 reset/stamp 入口；schema 异常经迁移重跑或人工修复。
 - **延迟事件**：deliver\_at 定时投递（Postgres 原生；其余后端为可选能力，见
   能力边界）；未到投递时间的行不满足 Fetch/Claim 的下推条件，与广播消费
   组合的边界（延迟行被内存水位越过即不再投递）写进文档。

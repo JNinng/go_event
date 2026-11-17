@@ -28,47 +28,72 @@ func TestValidateSchema(t *testing.T) {
 	}
 }
 
-func TestBaseline(t *testing.T) {
-	t.Run("InvalidSchema_Baseline_ReturnsError", func(t *testing.T) {
-		steps, err := postgresschema.Baseline("bad-name")
+func TestPlan(t *testing.T) {
+	t.Run("InvalidSchema_Plan_ReturnsError", func(t *testing.T) {
+		versions, err := postgresschema.Plan("bad-name")
 		if err == nil {
-			t.Fatal("Baseline(invalid) = nil error, want error")
+			t.Fatal("Plan(invalid) = nil error, want error")
 		}
-		if steps != nil {
-			t.Fatalf("Baseline(invalid) returned %d steps, want nil", len(steps))
+		if versions != nil {
+			t.Fatalf("Plan(invalid) returned %d versions, want nil", len(versions))
+		}
+		if _, err := postgresschema.PlanStatements("bad-name"); err == nil {
+			t.Fatal("PlanStatements(invalid) = nil error, want error")
+		}
+		if _, err := postgresschema.PlannedStatements("bad-name"); err == nil {
+			t.Fatal("PlannedStatements(invalid) = nil error, want error")
 		}
 	})
-	t.Run("Default_Steps_AreTransactionalVerifiableAndStable", func(t *testing.T) {
-		first, err := postgresschema.Baseline("public")
+	t.Run("Default_Plan_VersionsStrictlyIncreasingWithStatements", func(t *testing.T) {
+		plan, err := postgresschema.Plan("public")
 		if err != nil {
-			t.Fatalf("Baseline: %v", err)
+			t.Fatalf("Plan: %v", err)
 		}
-		second, err := postgresschema.Baseline("public")
+		if len(plan) == 0 {
+			t.Fatal("Plan = empty, want baseline v1")
+		}
+		prev := 0
+		for _, v := range plan {
+			if v.Number != prev+1 {
+				t.Fatalf("version number %d after %d, want strictly increasing from 1", v.Number, prev)
+			}
+			if len(v.Statements) == 0 {
+				t.Fatalf("version %d has no statements", v.Number)
+			}
+			prev = v.Number
+		}
+		if plan[0].Number != 1 {
+			t.Fatalf("baseline version = %d, want 1", plan[0].Number)
+		}
+	})
+	t.Run("Default_BaselineStatements_PairWithExpectedObjectsOneToOne", func(t *testing.T) {
+		paired, err := postgresschema.PlannedStatements("public")
 		if err != nil {
-			t.Fatalf("Baseline second call: %v", err)
+			t.Fatalf("PlannedStatements: %v", err)
 		}
-		if !reflect.DeepEqual(first, second) {
-			t.Fatal("Baseline is not stable across calls")
+		if len(paired) != 9 {
+			t.Fatalf("plan statements = %d, want 9 (baseline v1)", len(paired))
 		}
-		if len(first) != 9 {
-			t.Fatalf("Baseline steps = %d, want 9", len(first))
+		objs := postgresschema.ExpectedObjects("public")
+		if len(objs) != len(paired) {
+			t.Fatalf("expected objects = %d, statements = %d, want 1:1", len(objs), len(paired))
 		}
-		for _, step := range first {
-			if step.Kind == event.KindSchema {
-				if step.Table != "" {
-					t.Fatalf("schema step table = %q, want empty", step.Table)
+		// 每条语句的所属对象与配对期望对象一致；建表语句不含内联约束。
+		for i, ps := range paired {
+			if ps.SQL == "" {
+				t.Fatalf("statement %d is empty", i)
+			}
+			if ps.Object.Kind == event.KindSchema {
+				if ps.Object.Table != "" {
+					t.Fatalf("schema statement %d has owning table %q", i, ps.Object.Table)
 				}
-			} else if step.Table == "" {
-				t.Fatalf("step %s has empty owning table", step.Object)
+			} else if ps.Object.Table == "" {
+				t.Fatalf("statement %d pairs with object %s without owning table", i, ps.Object.Name)
 			}
-			if !step.Transactional {
-				t.Fatalf("step %s is not transactional", step.Object)
-			}
-			if !step.Verifiable {
-				t.Fatalf("step %s is not verifiable", step.Object)
-			}
-			if step.Statement == "" {
-				t.Fatalf("step %s has empty statement", step.Object)
+		}
+		for _, ps := range paired {
+			if strings.Contains(ps.SQL, "CONSTRAINT ") && strings.Contains(ps.SQL, "CREATE TABLE") {
+				t.Fatalf("table DDL must not inline constraints (constraints go through DO blocks): %s", ps.SQL)
 			}
 		}
 	})

@@ -324,13 +324,14 @@ func TestClassifyMigrationError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// 与生产同形：Table 未限定，错误报告使用 Object/Kind。
-			step := postgresschema.Step{
-				Object: constraintObject,
-				Kind:   event.KindConstraint,
-				Table:  "event",
+			// 与生产同形：配对期望对象，错误报告使用 Object/Kind。
+			stmt := postgresschema.PlannedStatement{
+				Object: postgresschema.Object{
+					Name: constraintObject,
+					Kind: event.KindConstraint,
+				},
 			}
-			err := classifyMigrationError("pgxc", step, &pgconn.PgError{
+			err := classifyMigrationError("pgxc", stmt, &pgconn.PgError{
 				Code: tt.code, ConstraintName: tt.constraintName, Message: "test",
 			})
 			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
@@ -365,7 +366,7 @@ func TestClassifyMigrationError(t *testing.T) {
 	}
 	t.Run("UnknownError_WrappedNotPermanent", func(t *testing.T) {
 		cause := errors.New("boom")
-		err := classifyMigrationError("pgxc", postgresschema.Step{}, cause)
+		err := classifyMigrationError("pgxc", postgresschema.PlannedStatement{}, cause)
 		if !errors.Is(err, cause) {
 			t.Fatalf("err = %v, want wrapped cause", err)
 		}

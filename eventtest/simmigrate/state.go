@@ -102,20 +102,13 @@ func (s *state) snapshot() postgresschema.Snapshot {
 	return snap
 }
 
-// applyBaseline 直接应用基线步骤构造存量场景（limit<=0 表示全部）。
+// applyBaseline 直接应用基线期望对象构造存量场景（limit<=0 表示全部）。
 func (s *state) applyBaseline(limit int) error {
-	steps, err := postgresschema.Baseline(schema)
-	if err != nil {
-		return err
+	objs := postgresschema.ExpectedObjects(schema)
+	if limit > 0 && limit < len(objs) {
+		objs = objs[:limit]
 	}
-	if limit > 0 && limit < len(steps) {
-		steps = steps[:limit]
-	}
-	for _, step := range steps {
-		obj, ok := expectedObject(step.Object)
-		if !ok {
-			return fmt.Errorf("simmigrate: unknown baseline object %q", step.Object)
-		}
+	for _, obj := range objs {
 		if _, err := s.applyObject(obj); err != nil {
 			return err
 		}
@@ -141,24 +134,8 @@ func (s *state) buildConflict() {
 	}
 }
 
-// probeObject 探测单个对象的当前状态：已存在且定义一致返回 applied=true；
-// 定义冲突或不可由基线补齐的差异返回 *event.VerifyError；缺失返回 false。
-func (s *state) probeObject(obj postgresschema.Object) (bool, error) {
-	report := postgresschema.Diff([]postgresschema.Object{obj}, s.snapshot())
-	if len(report.Issues) == 0 {
-		return true, nil
-	}
-	for _, issue := range report.Issues {
-		if issue.Problem != event.ProblemMissing || issue.Kind != obj.Kind {
-			return false, &event.VerifyError{Report: report}
-		}
-	}
-	return false, nil
-}
-
 // applyObject 直接创建/覆盖单个对象，不做探测。调用方负责探测与冲突判定：
-// step 路径先 probeObject 再按需应用；fast 路径在 staging 上直接批应用
-// （基线接管校验由 Migrate 的全局 Diff 完成，不逐对象探测）。
+// 模拟执行器在接管校验（全局 Diff）后按缺失集合在 staging 上应用。
 func (s *state) applyObject(obj postgresschema.Object) (bool, error) {
 	switch obj.Kind {
 	case event.KindSchema:

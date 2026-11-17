@@ -120,12 +120,6 @@ func TestMigrationCapabilitiesZeroValue(t *testing.T) {
 			t.Fatalf("Completion = %v, want DDLSync", c.Completion)
 		}
 	})
-	t.Run("ZeroValue_Path_IsFast", func(t *testing.T) {
-		var p event.MigrationPath
-		if p != event.MigrationPathFast {
-			t.Fatalf("MigrationPath = %v, want MigrationPathFast", p)
-		}
-	})
 	t.Run("ZeroValue_ImplicitCommitAndNonTransactional_AreFalse", func(t *testing.T) {
 		var c event.MigrationCapabilities
 		if c.ImplicitCommit {
