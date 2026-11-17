@@ -864,6 +864,45 @@ type Admin interface {
 }
 ```
 
+### 2.12 事务性入队（outbox，可选；core 不定义接口）
+
+outbox 让「业务事务提交」与「事件入队」原子生效：调用方在自己的业务事务
+内追加事件，事件 INSERT 与业务写共享同一事务，随事务原子提交/回滚；不
+需要事务内发布的场景可跳过本面（普通 Publish 语义不变）。语义与广播位置
+边界的定稿见 [ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)。
+
+**core 不定义 `TransactionalAppender` 接口**（与 Inspector 的可选接口形态
+不同）：事务性入队的第一个参数是调用方业务事务的载体——pgxc 为 `pgx.Tx`、
+postgrec 为 `*sql.Tx`、inmem 为包内缓冲事务——core 接口只能以 `any` 承载，
+丢失全部类型安全与自文档性。各后端提供具体类型 `TransactionalAppender`
+与 `NewTransactionalAppender` 构造（与 Admin 同款：可选面、独立构造路径、
+与 Driver 共享连接与命名空间选项、不经运行面类型获得——经本构造或组合
+对象 Store 聚合），签名见 §3 与 §4。
+
+语义边界（契约硬约束，eventtest.RunTransactionalAppendSuite 钉死）：
+
+- **提交与回滚归调用方**：库不 begin、不 commit；`AppendTx` 返回成功仅
+  表示 INSERT 已在调用方事务内执行，回滚后不产生事件行。
+- **提交前对外不可见**：未提交事务内的事件对 Fetch / Claim / HeadPosition
+  均不可见——基线锚点只锚已提交行；提交后经轮询/认领可见。
+- **幂等与普通 Append 同口径**：同 ID 首写为准，不覆盖、不重投；事务内
+  重复 ID 与跨事务重复 ID 同判。
+- **广播位置边界（ADR 0006 重审定稿，ADR 0012 §2）**：就近唤醒信号不
+  覆盖事务内发布（提交后由下一个轮询周期拉取/认领）；并发提交的更大
+  position 会把广播内存水位推过晚提交的行，该行对在途广播实例永久漏投
+  ——「Start 后发布的事件必然可投递」仅对普通 Publish 路径成立（单语句
+  独立提交，理论残余窗口可忽略、非绝对保证，ADR 0012）；认领
+  消费不受影响（Claim 直接查库）。
+- **不触发惰性清理**：清理 DELETE 不落入调用方事务（不扩大其锁面），
+  机会性清理由普通 Append / Claim 等路径照常承担。
+- **不发射观测**：库侧任何发射点都在提交前，而提交归调用方——「AppendTx
+  成功」与「事务最终提交」可能被回滚打断，提交前发射会与落库事实矛盾
+  （既有观测契约以与落库事实一致为准）；业务事务成败由调用方在自己的
+  提交点计量。
+- **position 语义**：同事务内按 INSERT 序分配，不承诺跨事务连续；回滚不
+  回收（Postgres 序列不回收，缺口不进消费契约）；`AppendTx` 不返回
+  position，调用方不得把事务内的位置信息当水位使用。
+
 ## 3. Postgres 后端签名（postgrec / pgxc）
 
 两个 Postgres 后端共享同一套能力与选项语义，仅连接载体不同：`postgrec`
@@ -893,14 +932,33 @@ func NewInspector(db *sql.DB, opts ...Option) event.Inspector
 // 互斥锁并发射管理面观测（§2.9/§2.11 约束）。
 func NewAdmin(db *sql.DB, opts ...Option) event.Admin
 
+// NewTransactionalAppender 构造事务性入队面（outbox 可选面，§2.12 语义、
+// ADR 0012）：与 NewDriver 共享连接与命名空间选项。不经运行面类型获得
+// ——经本构造或组合对象 Store 聚合（同一内部构造路径）；core 不定义
+// outbox 接口（事务载体是后端具体类型 *sql.Tx）。
+func NewTransactionalAppender(db *sql.DB, opts ...Option) *TransactionalAppender
+
+// TransactionalAppender 事务性事件入队：AppendTx 把事件 INSERT 加入调用
+// 方的业务事务（*sql.Tx），随事务原子提交/回滚；提交与回滚归调用方，
+// 库不 begin、不 commit。幂等与普通 Append 同口径（同 ID 首写为准）；
+// 提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；不触发
+// 惰性清理、不发射观测（语义见 §2.12 与 ADR 0012）。
+type TransactionalAppender struct{ /* 不透明 */ }
+
+// AppendTx 在调用方业务事务 tx 内追加事件。position 在 INSERT 时分配，
+// 回滚不回收（Postgres 序列不回收，缺口不进消费契约）；调用方不得把
+// 事务内的位置信息当水位使用。
+func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *sql.Tx, e event.RawEnvelope) error
+
 // Store 组合对象（便利构造，非能力面）：形态与语义同 pgxc.Store——一个
-// 对象同时持有 Driver / Inspector / Admin 三面，选项解析一次、经同一份
-// 配置传导三面；内部只建一个 Driver 实例，各面行为与独立构造完全等价。
-// Store 不实现任何能力接口，构造不触发迁移。
+// 对象同时持有 Driver / Inspector / Admin / TransactionalAppender 各面，
+// 选项解析一次、经同一份配置传导；内部只建一个 Driver 实例，各面行为与
+// 独立构造完全等价。Store 不实现任何能力接口，构造不触发迁移。
 type Store struct {
-	Driver    event.Driver
-	Inspector event.Inspector
-	Admin     event.Admin
+	Driver                event.Driver
+	Inspector             event.Inspector
+	Admin                 event.Admin
+	TransactionalAppender *TransactionalAppender
 }
 
 // NewStore 构造组合对象 Store。
@@ -953,17 +1011,37 @@ func NewInspector(pool *pgxpool.Pool, opts ...Option) event.Inspector
 // 约束）。
 func NewAdmin(pool *pgxpool.Pool, opts ...Option) event.Admin
 
+// NewTransactionalAppender 构造事务性入队面（outbox 可选面，§2.12 语义、
+// ADR 0012）：与 NewDriver 共享连接与命名空间选项。不经运行面类型获得
+// ——经本构造或组合对象 Store 聚合（同一内部构造路径）；core 不定义
+// outbox 接口（事务载体是后端具体类型 pgx.Tx）。
+func NewTransactionalAppender(pool *pgxpool.Pool, opts ...Option) *TransactionalAppender
+
+// TransactionalAppender 事务性事件入队：AppendTx 把事件 INSERT 加入调用
+// 方的业务事务（pgx.Tx），随事务原子提交/回滚；提交与回滚归调用方，
+// 库不 begin、不 commit。幂等与普通 Append 同口径（同 ID 首写为准）；
+// 提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；不触发
+// 惰性清理、不发射观测（语义见 §2.12 与 ADR 0012）。
+type TransactionalAppender struct{ /* 不透明 */ }
+
+// AppendTx 在调用方业务事务 tx 内追加事件。position 在 INSERT 时分配，
+// 回滚不回收（Postgres 序列不回收，缺口不进消费契约）；调用方不得把
+// 事务内的位置信息当水位使用。
+func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx pgx.Tx, e event.RawEnvelope) error
+
 // Store 组合对象（便利构造，非能力面）：一个对象同时持有 Driver /
-// Inspector / Admin 三面。选项与 NewDriver 一致且解析一次、经同一份配置
-// 传导三面（观测共享同一 scope 与 logger / Observer）；内部只建一个
-// Driver 实例——Inspector 视图与 Admin 复用同一实例（共享 ensure 状态
-// 与失败负缓存），各面行为与独立构造完全等价。组合而非合并接口：Store
-// 不实现任何能力接口，core 也不定义 event.Store；构造不触发迁移（沿
-// NewDriver 现状，首次操作按迁移模式处理持久结构）。
+// Inspector / Admin / TransactionalAppender 各面。选项与 NewDriver 一致且
+// 解析一次、经同一份配置传导各面（观测共享同一 scope 与 logger /
+// Observer）；内部只建一个 Driver 实例——Inspector 视图、Admin 与
+// TransactionalAppender 复用同一实例（共享 ensure 状态与失败负缓存），
+// 各面行为与独立构造完全等价。组合而非合并接口：Store 不实现任何能力
+// 接口，core 也不定义 event.Store；构造不触发迁移（沿 NewDriver 现状，
+// 首次操作按迁移模式处理持久结构）。
 type Store struct {
-	Driver    event.Driver
-	Inspector event.Inspector
-	Admin     event.Admin
+	Driver                event.Driver
+	Inspector             event.Inspector
+	Admin                 event.Admin
+	TransactionalAppender *TransactionalAppender
 }
 
 // NewStore 构造组合对象 Store。
@@ -1090,6 +1168,31 @@ func RunAdminReplaySuite(t *testing.T, d event.Driver, admin event.Admin)
 // （如 TEST_POSTGRES_DSN）在具体后端的测试内完成。
 func RunMigrationSuite(t *testing.T, b MigrationBackend)
 
+// RunStoreSuite 运行组合对象三面同源契约（便利构造，非能力面）：
+// d / insp / admin 须为同一 Store 的三面（后端 NewStore 构造传入），
+// 任一缺失 Fatal 终止——提供组合对象的后端必须全过。
+func RunStoreSuite(t *testing.T, d event.Driver, insp event.Inspector, admin event.Admin)
+
+// RunTransactionalAppendSuite 运行 outbox 事务性入队契约（可选面，
+// design.md §6 表格「事务入队（可选）」行、ADR 0012）：回滚零事件、
+// 中途回滚连带先前 Append 一起丢弃（钉住「不逐条自治提交」）、提交前
+// 对外不可见（隔离性与 HeadPosition 锚点）、提交后广播/认领可见、事务
+// 内幂等（首写为准）、回滚 position 缺口不破坏消费、乱序边界（并发业务
+// 事务交错提交下广播漏投、认领不受影响）。d 与 beginTx 须同源（同一
+// 后端、同一命名空间）；beginTx 为 nil Fatal 终止——提供事务性入队的
+// 后端必须全过本套件。套件不绑定后端事务载体（pgxc 为 pgx.Tx、postgrec
+// 为 *sql.Tx、inmem 为缓冲模拟），由装配函数打包成 TxSession。
+func RunTransactionalAppendSuite(t *testing.T, d event.Driver, beginTx func(t *testing.T) TxSession)
+
+// TxSession 事务性 Append 套件的事务载体适配：同一 TxSession 的三次
+// 调用共享同一后端事务（装配处不得逐调用开新事务）；全部方法 Fatalf
+// 风格，失败立即终止用例。
+type TxSession interface {
+    AppendTx(t *testing.T, e event.RawEnvelope) // 业务事务内追加事件
+    Commit(t *testing.T)                        // 提交业务事务
+    Rollback(t *testing.T)                      // 回滚业务事务
+}
+
 // ErrUnsupportedByBackend 表示后端不支持某项可选能力（强制路径 / 故障注入）。
 var ErrUnsupportedByBackend = errors.New("eventtest: backend does not support")
 
@@ -1206,14 +1309,36 @@ func NewInspector(opts ...Option) event.Inspector
 // 等待上限，契约套件缩短用）。
 func NewAdmin(d event.Driver, opts ...AdminOption) event.Admin
 
+// NewTransactionalAppender 构造进程内事务性入队面（outbox 可选面，§2.12
+// 语义、ADR 0012）：与传入的 Driver（须为本包 New 构造）共享同一份内存
+// 状态；传入其他实现的 Driver 视为装配错误（panic，与 NewAdmin 同义）。
+// 进程内事务为最小缓冲模拟：BeginTx 开启 *Tx，AppendTx 在 Driver 锁内
+// 分配 position 并缓冲（对外不可见），Commit 单次锁内原子应用、Rollback
+// 丢弃；position 分配即消耗、回滚不回收（与 Postgres 序列对齐，ADR 0012）。
+func NewTransactionalAppender(d event.Driver) *TransactionalAppender
+
+// AppendTx / BeginTx / Tx 语义见 §2.12：事务控制归调用方（Commit /
+// Rollback），已终结事务再操作返回错误；非本 appender 开启的事务拒绝。
+type TransactionalAppender struct{ /* 不透明 */ }
+
+func (ta *TransactionalAppender) BeginTx(ctx context.Context) (*Tx, error)
+func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *Tx, e event.RawEnvelope) error
+
+type Tx struct{ /* 不透明 */ }
+
+func (tx *Tx) Commit() error
+func (tx *Tx) Rollback() error
+
 // Store 组合对象（便利构造，非能力面）：一个对象同时持有 Driver /
-// Inspector / Admin 三面，共享同一份内存状态与互斥锁。Admin 为缺省构造
-// （无 Observer、缺省锁等待）；需要观测注入或缩短锁等待的测试可经
-// NewAdmin(st.Driver, ...) 构造等价 Admin 替换（共享同一底层实例）。
+// Inspector / Admin / TransactionalAppender 各面，共享同一份内存状态与
+// 互斥锁。Admin 为缺省构造（无 Observer、缺省锁等待）；需要观测注入或
+// 缩短锁等待的测试可经 NewAdmin(st.Driver, ...) 构造等价 Admin 替换
+// （共享同一底层实例）。
 type Store struct {
-	Driver    event.Driver
-	Inspector event.Inspector
-	Admin     event.Admin
+	Driver                event.Driver
+	Inspector             event.Inspector
+	Admin                 event.Admin
+	TransactionalAppender *TransactionalAppender
 }
 
 // NewStore 构造组合对象 Store（选项与 New 一致）。

@@ -6,7 +6,8 @@
 // 变体、语句边界故障注入）；RunInspectorSuite 覆盖只读查询面
 // event.Inspector（可选能力，按类型断言探测，ADR 0005）；RunStoreSuite
 // 覆盖后端组合对象 Store 的三面同源（便利构造，各面完整语义仍由上述
-// 套件约束）。用例级清单以
+// 套件约束）；RunTransactionalAppendSuite 覆盖 outbox 事务性入队（可选
+// 面，经 TxSession 适配注入事务载体，ADR 0012）。用例级清单以
 // 各 Run 入口的注册表为准。
 //
 // 用例命名遵循三段式「条件_动作_预期结果」。

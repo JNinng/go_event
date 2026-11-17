@@ -5,13 +5,15 @@ import (
 )
 
 // Store 后端组合对象（便利构造，非能力面）：一个对象同时持有运行面
-// Driver、只读查询面 Inspector 与管理面 Admin，三面共享同一份内存状态
-// 与互斥锁。
+// Driver、只读查询面 Inspector、管理面 Admin 与事务性入队
+// TransactionalAppender，各面共享同一份内存状态与互斥锁。
 //
 // 组合而非合并接口（design.md §6 三面分离）：Store 不实现任何能力接口，
 // core 也不定义 event.Store 接口——NewPublisher / NewRunner 仍接收
 // Store.Driver，各面语义与独立构造完全等价。Store 持有 Admin 是容器
-// 聚合，不是把管理写路径挂到 Driver 类型上（ADR 0010）。
+// 聚合，不是把管理写路径挂到 Driver 类型上（ADR 0010）；持有
+// TransactionalAppender 同为容器聚合（事务载体类型为本包具体类型，
+// core 不定义 outbox 接口，ADR 0012）。
 //
 // Admin 为缺省构造（无 Observer、缺省锁等待）：需要观测注入或缩短锁
 // 等待的测试可经 NewAdmin(st.Driver, ...) 构造等价 Admin 替换——与
@@ -25,16 +27,20 @@ type Store struct {
 	Inspector event.Inspector
 	// Admin 管理面写操作（当前仅 failed 手工重放，ADR 0010）。
 	Admin event.Admin
+	// TransactionalAppender 事务性入队（outbox 可选面，ADR 0012）：与
+	// Driver 共享同一份内存状态；BeginTx / AppendTx 的调用与提交归调用方。
+	TransactionalAppender *TransactionalAppender
 }
 
-// NewStore 构造组合对象：内部只建一个 Driver 实例——Inspector 视图与
-// Admin 复用同一实例（共享内存状态与互斥锁），供契约套件与本地测试
-// 三面同源使用。选项与 New 一致。
+// NewStore 构造组合对象：内部只建一个 Driver 实例——Inspector 视图、
+// Admin 与 TransactionalAppender 复用同一实例（共享内存状态与互斥锁），
+// 供契约套件与本地测试各面同源使用。选项与 New 一致。
 func NewStore(opts ...Option) *Store {
 	d := newDriver(opts...)
 	return &Store{
-		Driver:    d,
-		Inspector: d,
-		Admin:     &Admin{d: d, exclWait: adminLockWait},
+		Driver:                d,
+		Inspector:             d,
+		Admin:                 &Admin{d: d, exclWait: adminLockWait},
+		TransactionalAppender: &TransactionalAppender{d: d},
 	}
 }

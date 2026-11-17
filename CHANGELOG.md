@@ -6,6 +6,9 @@
 
 ### 新特性
 
+- **outbox 事务性入队 `TransactionalAppender`（可选面，不进 `Driver` 契约）**：调用方在自己的业务事务内追加事件，事件 INSERT 与业务写共享同一事务，随事务原子提交/回滚；事务回滚不产生事件行，提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行），提交后经轮询/认领可见。**core 不定义接口**——事务载体是后端具体类型（pgxc 为 `pgx.Tx`、postgrec 为 `*sql.Tx`、inmem 为最小缓冲事务模拟），各后端提供 `NewTransactionalAppender` 构造（与 `Driver` 共享连接与命名空间选项）或经组合对象 `Store` 聚合（`Store.TransactionalAppender`），不经运行面类型获得。语义边界（ADR 0012）：幂等与普通 Append 同口径（同 ID 首写为准）；提交与回滚归调用方（库不 begin/commit）；不触发惰性清理（清理 DELETE 不落入调用方事务）；不发射观测（库侧发射点在提交前，与回滚后的落库事实可能矛盾）；position 同事务内按追加序分配、不承诺跨事务连续，回滚不回收（Postgres 序列不回收，缺口不进消费契约）。
+  - **广播位置语义重审（ADR 0006 定稿修订，ADR 0012）**：事务内发布不发就近唤醒信号（提交后由轮询兜底）；并发提交的更大 position 会把广播实例的内存水位推过晚提交的行，该行对在途广播实例**可能永久漏投**——「Start 后发布的事件必然可投递」收窄为普通 Publish 路径（单语句独立提交，理论残余窗口可忽略、非绝对保证）；认领消费不受影响（Claim 直接查库）。已否决的修复备选（已广播集合/缺口水位重排、同事务 NOTIFY）与理由见 ADR 0012。
+  - `eventtest` 新增 `RunTransactionalAppendSuite` 契约套件（经 `TxSession` 适配注入事务载体，三后端统一跑、无门控）：回滚零事件、中途回滚连带先前 Append 一起丢弃、提交前对外不可见、提交后广播/认领可见、同事务多事件原子可见、事务内与跨事务幂等（首写为准）、回滚 position 缺口不破坏消费、乱序边界（并发业务事务交错提交下广播漏投、认领可见）。
 - **后端组合对象 `Store`（便利构造，非能力面）**：pgxc / postgrec / inmem 均提供 `NewStore`，一个对象同时持有 `Driver` / `Inspector` / `Admin` 三面（组合而非合并接口，核心仍保持独立能力，core 不定义 `event.Store`）。选项解析一次、经同一份配置传导三面（观测三面共享同一 scope 与 logger / Observer）；内部只建一个 Driver 实例——Inspector 视图与 Admin 复用同一实例（共享 ensure 状态与失败负缓存），各面行为与独立构造完全等价，`eventtest.RunStoreSuite` 契约钉住三面同源。持有 Admin 是容器聚合而非把管理写路径挂到 Driver 类型上（对 Driver 做 `event.Admin` 类型断言仍不成立，ADR 0010 口径不变）；构造不触发迁移（沿 `NewDriver` 现状，首次操作按迁移模式处理持久结构）。inmem 的 `Store.Admin` 为缺省构造（无 Observer），需要观测注入时可经 `inmem.NewAdmin(st.Driver, ...)` 构造等价 Admin 替换。
 - **认领轮事实汇总（接管与终态计数）**：`Driver.Claim` 返回 `ClaimResult{Leases, Takeovers, TerminalFailed}`——本轮发放的租约、接管过期租约而发放的数量（含接管后直接置 failed 的终态接管）、认领动作直接置 failed 的数量。计数取自后端落库事实（SQL 后端为终态 UPDATE 影响行数与认领接管标记，inmem 为内存计数），与 `Inspector.ClaimState` / `claim_count` 可对账；接管计数覆盖发放与终态两条路径。当前认领语义下置终态的下推条件要求租约已过期，认领侧终态必经接管路径（恒有 `TerminalFailed ≤ Takeovers`），一次终态接管同时计入两者；无主首认与 Fail 退避期满的重认领不计接管。决策记录见 [ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)。
   - **观测面**：新增指标 `<scope>.claim.takeover`（接管发放数）与 `<scope>.claim.terminal_failed`（认领侧直接置 failed 数，属性 `event` + `identity`，与 `<scope>.claim.granted` 同风格，仅计数非零时打点）；`Observer` 非破坏性演进至 `ObserverV4`（嵌入 V3），新增 `OnClaim(ClaimEvent)` 认领轮计数事件（仅成功轮次分发）。`Attempts > 1` 混合 Fail 重试与过期接管，不能代替接管计数（usage.md §6.7/§6.8）。
@@ -33,5 +36,6 @@
 - 新增 [ADR 0009](docs/adr/0009-error-summary-persistence.md)：错误摘要落库口径与 `Fail` 接口扩展的决策记录。
 - 新增 [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)：管理面写操作的承载形态（独立 `Admin`、不经 `Driver` 类型暴露）与 failed 手工重放语义的决策记录，含加固口径（与迁移的命名空间互斥、操作来源观测、错误分类）。
 - 新增 [ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)：`Claim` 返回认领轮事实（`ClaimResult`）与接管/终态计数口径的决策记录；[ADR 0008](docs/adr/0008-observability.md) 补充接管指标与 `ObserverV4`（解除「无接管专属指标」的已知口径限制）。
+- 新增 [ADR 0012](docs/adr/0012-outbox-transactional-append-and-broadcast-ordering.md)：outbox 事务性入队的承载形态（core 不定义接口、各后端 `TransactionalAppender`）与 ADR 0006 广播位置语义重审定稿（事务内发布下广播投递为尽力而为、认领不受影响；观测不发射、清理不落调用方事务、position 回滚不回收）的决策记录。
 
 [Unreleased]: https://github.com/JNinng/go_event/compare/v0.1.1...HEAD

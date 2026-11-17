@@ -195,7 +195,8 @@ func (d *Driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 	return strconv.FormatInt(pos, 10), nil
 }
 
-// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）。
+// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）。INSERT 语句与
+// 事务性 AppendTx 共用同一份定义（appendInsertSQL，ADR 0012）。
 func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
@@ -205,10 +206,7 @@ func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 		return err
 	}
 	// 幂等 Append：同 ID 首写为准，不覆盖、不重投（design.md §4）。
-	_, err = d.db.ExecContext(ctx, fmt.Sprintf(`
-INSERT INTO %s.event (id, type, payload, metadata, occurred_at)
-VALUES ($1, $2, $3, $4::jsonb, $5)
-ON CONFLICT (id) DO NOTHING`, d.schema),
+	_, err = d.db.ExecContext(ctx, fmt.Sprintf(appendInsertSQL, d.schema),
 		e.ID, e.Type, e.Payload, meta, e.OccurredAt)
 	if err != nil {
 		return fmt.Errorf("postgrec: append: %w", err)

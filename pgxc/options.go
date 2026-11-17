@@ -2,6 +2,12 @@
 // （*pgxpool.Pool）。event / event_claim 两表、FOR UPDATE SKIP LOCKED
 // 认领、惰性清理；与 postgrec 共享同一套能力与选项语义（docs/api.md §3）。
 //
+// 可选能力面（均不经运行面类型获得，与各自 Driver 共享连接与命名空间
+// 选项）：只读查询面 Inspector（NewInspector 或对 Driver 类型断言探测）、
+// 管理面 Admin（NewAdmin，写路径不挂 Driver 类型，ADR 0010）、事务性
+// 入队 TransactionalAppender（NewTransactionalAppender，调用方在自己的
+// pgx.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）。
+//
 // 持久结构按 NewDriver 的迁移模式处理：缺省 Create 在首次使用时持迁移锁
 // 幂等应用版本计划全量语句（基线与各版本，升级随部署隐式发生，协议见
 // docs/adr/0007）；Verify 只读校验，None 不建也不校验——后两种模式要求

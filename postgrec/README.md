@@ -11,16 +11,18 @@ drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
 // 运行账号仅 DML（+ 系统目录读）、表已由部署流程建好时：
 // drv := postgrec.NewDriver(db, postgrec.WithMigrateMode(event.MigrateVerify))
 
-// 组合对象（可选便利）：一个对象持有 Driver / Inspector / Admin 三面。
+// 组合对象（可选便利）：一个对象持有 Driver / Inspector / Admin /
+// TransactionalAppender 各面。
 st := postgrec.NewStore(db, postgrec.WithRetention(7*24*time.Hour))
 // st.Driver 传给 NewPublisher / NewRunner；st.Inspector 查询状态与
-// failed 列表；st.Admin 重放 failed 事件。
+// failed 列表；st.Admin 重放 failed 事件；st.TransactionalAppender 在
+// 业务事务内追加事件（outbox，ADR 0012）。
 ```
 
 缺省迁移模式 `Create` 在首次操作时持迁移锁幂等应用版本计划全量语句
 （基线与各版本；升级随部署隐式发生）；`Verify` 只读校验；`None` 不建表
 也不校验。无 DDL 权限的运行连接不能自动迁移，只能用后两者。`NewStore`
-是便利构造（组合而非合并接口，非能力面）：选项解析一次、三面共享同一
+是便利构造（组合而非合并接口，非能力面）：选项解析一次、各面共享同一
 连接与命名空间、观测口径一致，内部只建一个 Driver 实例，各面行为与
 独立构造完全等价；构造不触发迁移（沿 `NewDriver` 现状）。
 
@@ -42,6 +44,7 @@ st := postgrec.NewStore(db, postgrec.WithRetention(7*24*time.Hour))
 | 查询面 Inspector（状态 / 分档计数 / failed 列表） | 原生 | SQL 直查 `event` / `event_claim`：状态与计数按认领行 `status` 与「无认领行」分档（「待处理」= 无认领行，不做租约过期推断）；failed 列表按 `failed_at` 降序偏移分页，`last_error` / `failed_at` 随行返回（ADR 0009）；只读、不参与认领路径；结果仅在保留窗口内可见（硬边界）。`NewInspector` 构造（与 Driver 共享连接与命名空间）或对 Driver 做 `event.Inspector` 类型断言探测 |
 | 管理面 Admin（failed 手工重放） | 原生 | `NewAdmin` 构造（与 Driver 共享连接与命名空间选项；写路径不经 Driver 类型暴露，ADR 0010）：`ReplayFailed` 以单条条件更新（`WHERE status='failed'` 的 CAS，行归属校验即 CAS——主键 + status 条件 + 构造期 schema 命名空间）置 `retrying`、`claim_count=0`、清 `lease_token`、`lease_until` / `next_eligible_at` 置重放时刻、`failed_at=NULL`、`last_error` 保留（ADR 0009）；done / active / retrying 与行不存在统一 `ok=false` 且不改动；重放窗口 = 保留窗口。写路径在事务内持与迁移执行共用的命名空间互斥锁（键含 schema，等待有界，超时 `ErrAdminLockTimeout`）；操作来源观测：`<scope>.admin.replay` 指标（result=ok/no_effect/canceled/lock_timeout/error + schema）+ slog 审计日志 + `AdminReplayEvent`（`WithObserver` 注入，ObserverV3 分发）；无自动 down。契约套件 `eventtest.RunAdminReplaySuite`（含互斥与观测注入断言）全过 |
 | 惰性清理 | 原生 | 超窗且无活跃租约（无论终态）行删除，`event_claim` 经 FK ON DELETE CASCADE 级联；墙钟节流，随 Append 机会性执行 |
+| 事务性入队 outbox（TransactionalAppender） | 原生 | `NewTransactionalAppender` 构造（与 Driver 共享连接与命名空间选项；不经运行面类型获得，ADR 0012）：`AppendTx(ctx, tx *sql.Tx, e)` 把事件 INSERT 加入调用方业务事务（INSERT 语句与普通 Append 共用同一份定义，同 ID 首写为准），随事务原子提交/回滚——提交与回滚归调用方，事务回滚不产生事件行；提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；不触发惰性清理（清理 DELETE 不落入调用方事务）、不发射观测（库侧发射点在提交前，与回滚后的事实可能矛盾）；就近唤醒信号不覆盖事务内发布，广播消费下可能被并发提交的更大 position 越过水位而漏投（ADR 0006 广播位置语义重审定稿，ADR 0012——认领消费不受影响）；position 回滚不回收，缺口不进消费契约。契约套件 `eventtest.RunTransactionalAppendSuite` 全过 |
 
 ## 迁移能力
 
@@ -73,4 +76,4 @@ st := postgrec.NewStore(db, postgrec.WithRetention(7*24*time.Hour))
 | 管理面 Admin（failed 重放） | 已支持：`NewAdmin` 构造（写路径不经 Driver 类型暴露；持与迁移执行共用的命名空间互斥锁、操作来源观测 `WithObserver`、`ErrAdminLockTimeout` 瞬时锁超时；契约套件 `eventtest.RunAdminReplaySuite` 全过） |
 | 延迟事件（deliver_at） | P1 可选拓展，Postgres 原生可实现 |
 | LISTEN/NOTIFY 推送唤醒 | 不支持（P1 由 pgxc 提供；本后端退化回轮询） |
-| outbox（TransactionalAppender） | P1 可选拓展 |
+| outbox（TransactionalAppender，事务性入队） | 已支持：`NewTransactionalAppender` 构造或经 `Store.TransactionalAppender` 聚合（与 Driver 共享连接与命名空间；不经运行面类型获得，ADR 0012），`AppendTx` 加入调用方业务事务（`*sql.Tx`）随事务原子提交/回滚；广播投递边界见能力边界表（契约套件 `eventtest.RunTransactionalAppendSuite` 全过） |

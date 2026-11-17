@@ -292,8 +292,61 @@ err = pub.PublishNoPayload(ctx, cacheFlush)
   ID 是事件主键、**全局唯一**；重复发布同一 ID 首写为准，不校验 payload，新 payload 被丢弃（Metadata 与 OccurredAt 同样保留首写）。**跨事件类型复用同一 ID 不会报错**，而是静默视为同一事件、丢弃第二个 payload，因此业务键必须按类型加前缀（或与类型绑定）后才能当 ID 用。空串返回 `event.ErrEmptyEventID`；进程内锁不能跨实例去重，不要用它替代 ID 去重。
 - **幂等 Append**：重复发布同一 ID 视为成功，首写为准，不覆盖既有行、不触发重投。若需要“业务键去重”，应使用 `WithEventID` 传入按类型加前缀的稳定业务键。
 - **元数据透传**：`WithMetadata` 合并进事件元数据，后端原样存取。
-- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）属 P1 能力。
+- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）见 [§4.4](#44-事务内发布outbox)。
 - 发布成功后若注入了 `LocalWake`，会向本进程对应类型的订阅发一次非阻塞唤醒信号。
+
+### 4.4 事务内发布（outbox）
+
+需要「业务写与事件入队原子生效」（outbox 模式）时，在**自己的业务事务**
+内用后端的 `TransactionalAppender` 追加事件；不需要事务内发布的场景可跳
+过本面。core 不定义接口（事务载体是后端具体类型），各后端以
+`NewTransactionalAppender` 构造或经 `Store.TransactionalAppender` 获得：
+
+```go
+ta := pgxc.NewTransactionalAppender(pool, pgxc.WithSchema("public"))
+
+tx, err := pool.Begin(ctx)
+if err != nil {
+    return err
+}
+defer tx.Rollback(ctx)
+
+if _, err := tx.Exec(ctx,
+    "INSERT INTO orders (id, amount) VALUES ($1, $2)", orderID, amount,
+); err != nil {
+    return err
+}
+// 事件 INSERT 与业务写共享同一事务，随事务原子提交/回滚（ADR 0012）。
+if err := ta.AppendTx(ctx, tx, event.RawEnvelope{
+    ID:         "order.created:" + orderID, // 业务键按类型加前缀
+    Type:       "order.created",
+    Payload:    payload,
+    OccurredAt: time.Now().UTC(),
+}); err != nil {
+    return err
+}
+if err := tx.Commit(ctx); err != nil {
+    return err
+}
+```
+
+语义边界（契约，`eventtest.RunTransactionalAppendSuite` 钉死）：
+
+- **提交与回滚归调用方**：库不 begin、不 commit；事务回滚不产生事件行，
+  幂等口径与普通发布一致（同 ID 首写为准）。
+- **提交前对外不可见**：未提交事务内的事件对 Fetch / Claim /
+  HeadPosition 均不可见；提交后经轮询/认领可见。
+- **广播投递边界（务必知晓）**：事务内发布不发就近唤醒信号；并发提交
+  的更大 position 会把广播实例的内存水位推过晚提交的行，该行对在途广播
+  实例可能**永久漏投**（详见 [§5.2](#52-语义)）。需要可靠投递的业务事件
+  用认领消费——Claim 直接查库，不受水位影响。
+- **不发射观测、不触发清理**：库侧发射点都在提交前、与回滚后的落库事实
+  可能矛盾，故 `AppendTx` 不发指标/日志/Observer 事件（业务事务成败在
+  调用方自己的提交点计量）；惰性清理 DELETE 不落入调用方事务，由普通
+  发布/认领路径照常机会性承担。
+- **position**：同事务内按追加序分配、不承诺跨事务连续；回滚消耗的序号
+  不回收（Postgres 序列不回收），缺口不影响消费契约（Fetch 严格大于、
+  升序）；`AppendTx` 不返回 position，不要把事务内的位置信息当水位用。
 
 ## 5. 广播消费
 
@@ -318,7 +371,8 @@ err := docUploaded.SubscribeBroadcast(run,
 
 - **发完即忘**：不承诺 at-least-once，不承诺保序；handler 返回错误或 panic 仅记日志并跳过，不重试、不阻塞、不设死信。
 - **存储侧无簿记**：已读水位保存在实例内存中，按订阅在 `Fetch` 时下推，只进不退。
-- **起点在 `Start`**：`Runner.Start` 内对每个广播订阅调用 `Driver.HeadPosition`，把水位锚定到该类型当前最大位置。**Start 返回之后发布的事件才会被投递**；停机期间与 Start 之前发布的事件不补投。
+- **起点在 `Start`**：`Runner.Start` 内对每个广播订阅调用 `Driver.HeadPosition`，把水位锚定到该类型当前最大位置。**Start 返回之后发布的事件才会被投递**；停机期间与 Start 之前发布的事件不补投。锚点只锚已提交行（[§4.4](#44-事务内发布outbox) 未提交事务内的事件不进基线）。
+- **事务内发布可能漏投（outbox 边界，ADR 0012）**：position 分配序与提交可见序在事务内发布下可能乱序——并发提交的更大 position 会把内存水位推过晚提交的行，该行对所有在途广播实例**永久不可见**（重启实例的基线锚定同样不含）。「Start 后发布的事件必然可投递」仅对普通发布路径成立（单语句独立提交，理论残余窗口可忽略——Postgres 无提交序全局串行化，幂等 Append 同 ID 冲突会等待在途事务，窗口非绝对为零、非绝对保证）；需要可靠投递的业务事件用认领消费（Claim 直接查库，不受水位影响）。
 - **多实例各自全收**：每个活跃实例独立拉取并处理全部事件，实例间互不感知；实例数不影响语义。
 - **只接受通用选项**：广播订阅只允许 `WithConcurrency` 与 `WithFetchLimit`；传入认领专属选项返回 `event.ErrNotClaimSubscription`。
 - **基线失败不启动**：任一广播订阅的 `HeadPosition` 查询失败，`Start` 返回错误且整体不启动，修复后可重试。
@@ -580,13 +634,16 @@ drv := inmem.New()                          // 缺省不清理
 drv = inmem.New(inmem.WithRetention(time.Minute))
 ```
 
-条件过滤在内存模拟，仅供测试使用。
+条件过滤在内存模拟，仅供测试使用。事务性入队（outbox，[§4.4](#44-事务内发布outbox)）
+同样可用：`inmem.NewTransactionalAppender(drv)` 提供最小缓冲事务模拟
+（`BeginTx` / `AppendTx` / `Commit` / `Rollback`），便于业务代码在单元
+测试中走与生产一致的 outbox 路径。
 
 ### 8.7 组合对象 Store
 
-若调用方希望一个对象同时持有运行面 / 查询面 / 管理面，后端提供便利构造
-`NewStore`（组合而非合并接口；核心仍保持独立能力）。三后端形态一致
-（结构兼容、非接口契约——core 不定义 `event.Store`）：
+若调用方希望一个对象同时持有运行面 / 查询面 / 管理面 / 事务性入队，后端
+提供便利构造 `NewStore`（组合而非合并接口；核心仍保持独立能力）。三后端
+形态一致（结构兼容、非接口契约——core 不定义 `event.Store`）：
 
 ```go
 st := pgxc.NewStore(pool, pgxc.WithSchema("public")) // postgrec / inmem 同构
@@ -595,6 +652,8 @@ pub := event.NewPublisher(st.Driver, event.WithLocalWake(wake))
 run := event.NewRunner(st.Driver, event.WithIdentity("worker"))
 // 排障与运维：st.Inspector 查询状态与 failed 列表；st.Admin 重放 failed
 admin := st.Admin
+// outbox：st.TransactionalAppender 在业务事务内追加事件（§4.4）
+ta := st.TransactionalAppender
 ```
 
 要点：
@@ -691,6 +750,8 @@ func TestMyBackendRetention(t *testing.T) {
 
 提供组合对象 `Store` 的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunStoreSuite(t, st.Driver, st.Inspector, st.Admin)`：套件只验证「三面同源、行为与独立构造等价」——同一 Store 的 Driver 落库事实对 Inspector 可见、Admin 重放对 Driver 生效（重放行可被再次认领并完成）；各面完整语义仍由上述三套件约束，不重复。
 
+提供事务性入队（outbox）的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunTransactionalAppendSuite(t, d, beginTx)`：套件不绑定后端事务载体（pgxc 为 `pgx.Tx`、postgrec 为 `*sql.Tx`、inmem 为缓冲模拟），由测试装配把「事务内 Append / 提交 / 回滚」打包成 `eventtest.TxSession` 传入。覆盖回滚零事件、中途回滚连带先前 Append 一起丢弃（钉住「不逐条自治提交」）、提交前对外不可见（隔离性与 HeadPosition 锚点）、提交后广播/认领可见、事务内幂等（首写为准）、回滚 position 缺口不破坏消费、乱序边界（并发业务事务交错提交下广播漏投、认领不受影响，ADR 0012）。
+
 迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
 ### 9.3 Postgres 集成测试
@@ -766,6 +827,7 @@ func TestMyBackendRetention(t *testing.T) {
 
 - **选型**：通知类用广播；需要补投、失败重试、完成追踪的任务用认领。
 - **广播不补投**：Start 之前与停机期间发布的事件不会投递；重启从当前头部开始。关键业务不要依赖广播保证送达。
+- **outbox 事件与广播的组合边界**：事务内发布（[§4.4](#44-事务内发布outbox)）的事件可能被并发提交的更大 position 越过广播水位而**永久漏投**（ADR 0012）；outbox 模式下承载业务事实的事件应走认领消费，广播订阅只接受「漏掉可容忍」的通知类事件。`AppendTx` 不发射库侧观测（发射点在提交前，与回滚后的事实可能矛盾）——业务事务的成败指标在调用方自己的提交点计量；惰性清理不落入调用方事务，事件行仍受保留窗口约束。
 - **幂等**：认领消费一定按 at-least-once 设计 handler，以事件 ID 为幂等键。
 - **显式 ID 去重是全局的**：ID 全局唯一，不同事件类型必须使用带类型前缀的业务键；跨类型复用同一 ID 会静默丢弃第二个 payload。去重边界由存储保证，进程内锁不能跨实例去重。
 - **重复处理是正常的**：慢 handler 被误接管、心跳丢失等场景会出现并发重复处理；库不在消费路径做去重。

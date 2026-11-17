@@ -89,6 +89,169 @@ func TestInmemStoreSuite(t *testing.T) {
 	eventtest.RunStoreSuite(t, st.Driver, st.Inspector, st.Admin)
 }
 
+// 事务性入队契约（outbox 可选面，ADR 0012）：inmem 提供最小缓冲事务
+// 模拟，契约套件经 TxSession 适配统一跑，无需按后端能力门控。
+func TestInmemTransactionalAppendSuite(t *testing.T) {
+	d := inmem.New()
+	ta := inmem.NewTransactionalAppender(d)
+	eventtest.RunTransactionalAppendSuite(t, d, func(t *testing.T) eventtest.TxSession {
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		return &inmemTxSession{ta: ta, tx: tx}
+	})
+}
+
+// inmemTxSession 把 TransactionalAppender 的缓冲事务适配成套件 TxSession。
+type inmemTxSession struct {
+	ta *inmem.TransactionalAppender
+	tx *inmem.Tx
+}
+
+func (s *inmemTxSession) AppendTx(t *testing.T, e event.RawEnvelope) {
+	t.Helper()
+	if err := s.ta.AppendTx(t.Context(), s.tx, e); err != nil {
+		t.Fatalf("append tx: %v", err)
+	}
+}
+
+func (s *inmemTxSession) Commit(t *testing.T) {
+	t.Helper()
+	if err := s.tx.Commit(); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+}
+
+func (s *inmemTxSession) Rollback(t *testing.T) {
+	t.Helper()
+	if err := s.tx.Rollback(); err != nil {
+		t.Fatalf("rollback tx: %v", err)
+	}
+}
+
+// NewTransactionalAppender 传入非本包构造的 Driver 视为装配错误（panic，
+// 与 NewAdmin 同义）。
+func TestForeignDriver_NewTransactionalAppender_Panics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewTransactionalAppender with a foreign driver must panic")
+		}
+	}()
+	_ = inmem.NewTransactionalAppender(struct{ event.Driver }{})
+}
+
+// Tx 公开错误契约（docs/api.md §4）：nil 事务、非本 appender 开启的事务、
+// 已终结事务再操作三类错误路径显式断言。每子用例独立 Driver（隔离性）。
+func TestInmemTxSession_ErrorContract(t *testing.T) {
+	envelope := func(id string) event.RawEnvelope {
+		return event.RawEnvelope{
+			ID: id, Type: "txerr", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		}
+	}
+	fresh := func(t *testing.T) (*inmem.TransactionalAppender, event.Driver) {
+		t.Helper()
+		d := inmem.New()
+		return inmem.NewTransactionalAppender(d), d
+	}
+
+	t.Run("NilTx_AppendTx_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		if err := ta.AppendTx(t.Context(), nil, envelope("nil-tx")); err == nil {
+			t.Fatal("AppendTx with a nil tx must return an error")
+		}
+	})
+	t.Run("ForeignAppenderTx_AppendTx_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		other := inmem.NewTransactionalAppender(inmem.New())
+		tx2, err := other.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin foreign tx: %v", err)
+		}
+		if err := ta.AppendTx(t.Context(), tx2, envelope("foreign-tx")); err == nil {
+			t.Fatal("AppendTx with a transaction opened by another appender must return an error")
+		}
+	})
+	t.Run("CommittedTx_AppendTxAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := ta.AppendTx(t.Context(), tx, envelope("post-commit")); err == nil {
+			t.Fatal("AppendTx on a committed tx must return an error")
+		}
+	})
+	t.Run("CommittedTx_CommitAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := tx.Commit(); err == nil {
+			t.Fatal("double commit must return an error")
+		}
+	})
+	t.Run("CommittedTx_Rollback_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := tx.Rollback(); err == nil {
+			t.Fatal("rollback after commit must return an error")
+		}
+	})
+	t.Run("RolledBackTx_AppendTxAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		if err := ta.AppendTx(t.Context(), tx, envelope("post-rollback")); err == nil {
+			t.Fatal("AppendTx on a rolled-back tx must return an error")
+		}
+	})
+	t.Run("RolledBackTx_Commit_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		if err := tx.Commit(); err == nil {
+			t.Fatal("commit after rollback must return an error")
+		}
+	})
+	t.Run("RolledBackTx_RollbackAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		if err := tx.Rollback(); err == nil {
+			t.Fatal("double rollback must return an error")
+		}
+	})
+}
+
 // NewAdmin 传入非本包构造的 Driver 视为装配错误（panic）。
 func TestForeignDriver_NewAdmin_Panics(t *testing.T) {
 	defer func() {

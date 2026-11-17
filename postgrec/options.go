@@ -8,6 +8,12 @@
 // 表已由部署流程创建。运行账号只授 DML 权限时用 Verify / None；Create
 // 需要 DDL 权限。
 //
+// 可选能力面（均不经运行面类型获得，与各自 Driver 共享连接与命名空间
+// 选项）：只读查询面 Inspector（NewInspector 或对 Driver 类型断言探测）、
+// 管理面 Admin（NewAdmin，写路径不挂 Driver 类型，ADR 0010）、事务性
+// 入队 TransactionalAppender（NewTransactionalAppender，调用方在自己的
+// *sql.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）。
+//
 // 连接由使用方建立并注册驱动（如 pgx/v5/stdlib），本包不携带任何
 // 数据库驱动。
 package postgrec

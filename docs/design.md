@@ -125,10 +125,16 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   锚点查询失败则 Start 返回错误、整体不启动。停机与重启期间发布的
   事件不补投，重启从当前位置开始（对齐 Redis Pub/Sub 的发完即忘语义）。
   需要不丢、可重试、可追踪的场景应使用认领消费。基线锚点为单条语句
-  快照；Postgres 上 position 分配序（bigserial）与提交可见序在并发发布
-  下存在理论上的乱序窗口（早分配的行晚提交会被水位越过）——Publish
-  保持单语句独立提交使该窗口可忽略，若未来引入业务事务内发布
-  （outbox，P1），该语义须随 outbox 一并重审。
+  快照，只锚已提交行（事务性入队未提交的行不进基线）；Postgres 上
+  position 分配序（bigserial）与提交可见序在并发发布下存在理论上的乱序
+  窗口（早分配的行晚提交会被水位越过）——普通 Publish 保持单语句独立
+  提交使该窗口可忽略，「Start 后发布的事件必然可投递」仅在此路径成立。
+  事务性入队（outbox）把窗口放大为常态：并发提交的更大 position 会把
+  内存水位推过晚提交的行，该行对所有在途广播实例永久不可见（重启实例
+  的基线锚定同样不含）——事务内发布下的广播投递为尽力而为，认领消费
+  不受影响（Claim 直接查库，晚提交行最迟在下一次认领轮次可见；重审定稿
+  见 [ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)
+  与 §6 表格「事务入队（可选）」行）。
 - 投递语义为尽力而为：handler 失败仅记日志并跳过，不重试、不阻塞、不设
   死信；不承诺 at-least-once，也不承诺保序（轮询批次并发处理下顺序天然
   不保）——均写进契约。
@@ -244,6 +250,7 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 后端缝合点 | Driver                        | 单次原子操作，需求条件（订阅类型集 + 租约过期判据 + 可认领/水位条件）在单条 Fetch/Claim 内下推：Append / Fetch、HeadPosition（广播消费，水位条件与基线锚点由 core 传入）/ Claim、Heartbeat、Complete、Fail（认领消费）；语义见 §5 与 ADR |
 | 查询面（可选） | Inspector                 | 只读查询，按能力探测接入（ADR 0005）：（事件 × 消费者身份）状态与重试计数；按身份的状态分档计数——「待处理」= 该身份无认领行，retrying / processing / failed / done 按认领行 status 分档（done 为归档档，五档互斥且完备）；failed 事件偏移分页列表（错误摘要与 failed_at 随行返回，ADR 0009）。与 Driver 共享连接与命名空间选项；只读、不参与认领/完成路径；结果仅在保留窗口内可见（硬边界，§5.2） |
 | 管理面（可选） | Admin                     | 写操作与运行面分离、不进 Driver、不挂后端 Driver 类型（ADR 0010）：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领——仅 failed 可重放（done 不可逆），单条 CAS 条件更新防竞态；重放置 retrying、claim_count=0、清租约、next_eligible_at=now、failed_at 清空、last_error 保留；不经运行面类型获得——经后端 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径；与 Driver 共享连接与命名空间选项，鉴权归使用方）；重放窗口 = 保留窗口（§5.3）。写路径持与迁移执行共用的命名空间互斥锁（等待有界）、归属校验即 CAS、发射操作来源观测（指标/日志/Observer 事件）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接故障）；无自动 down，迁移侧无台账无需 reset/stamp 入口 |
+| 事务入队（可选） | TransactionalAppender    | outbox（[ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)）：调用方在自己的业务事务内追加事件并随事务原子提交/回滚；core 不定义接口——事务载体是后端具体类型（pgxc 为 pgx.Tx、postgrec 为 *sql.Tx、inmem 为缓冲事务模拟），各后端提供 `NewTransactionalAppender` 构造（与 Driver 共享连接与命名空间选项）或经组合对象 Store 聚合，不经运行面类型获得。语义边界：提交与回滚归调用方（库不 begin/commit）；幂等与普通 Append 同口径（同 ID 首写为准）；提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；就近唤醒信号不覆盖事务内发布，广播消费下可能被并发提交的更大 position 越过水位而漏投（§5.2），认领消费不受影响；不触发惰性清理（清理 DELETE 不落入调用方事务）；不发射观测（库侧发射点在提交前，与回滚后的落库事实可能矛盾）；position 同事务内按 INSERT 序分配、不承诺跨事务连续，回滚不回收（Postgres 序列不回收，缺口不进消费契约） |
 | 可观测    | otel 指标 + slog + Observer     | 跟随全局装配（未配置 noop 静默，热路径只打点不打日志）；core 计量 driver 操作与消费编排，后端计量迁移生命周期与管理面写操作（`<scope>.migrate` 与 `<scope>.admin.replay`，发射点各自单一，无重复计量）；类型化 Observer 纯旁路（同步回调、库内 recover）；见 ADR 0008 与 api.md §2.9 |
 
 ## 7. 仓库布局
@@ -260,7 +267,7 @@ go_event/
 ├── postgrec/        # Postgres 后端（标准库）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── pgxc/            # Postgres 后端（pgx v5）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── postgresschema/  # Postgres 方言 DDL 单一事实源：版本计划、期望对象、共享执行器（无驱动依赖）
-├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunMigrationSuite/RunInspectorSuite/RunAdminReplaySuite/RunStoreSuite
+├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunMigrationSuite/RunInspectorSuite/RunAdminReplaySuite/RunStoreSuite/RunTransactionalAppendSuite
 │   └── simmigrate/  # 迁移契约测试的进程内模拟 backend（语句边界故障注入）
 └── docs/
     ├── api.md       # API 文档
@@ -426,7 +433,15 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
 
 ### 9.2 生产化能力（P1）
 
-- **outbox**：调用方事务内追加事件并随事务原子提交（后端可选拓展接口）。
+- **outbox（事务性入队）**：已落地——见 §6 表格「事务入队（可选）」行与
+  [ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)。
+  core 不定义接口（事务载体是后端具体类型），pgxc / postgrec / inmem 各
+  提供 `TransactionalAppender`（`NewTransactionalAppender` 构造或经组合
+  对象 Store 聚合）：业务事务与事件入队原子提交/回滚，不需要事务内发布
+  的场景可跳过本面。广播位置语义已随本项重审定稿（§5.2）：事务内发布下
+  广播投递为尽力而为（可能被并发提交的更大 position 越过水位而漏投），
+  认领消费不受影响；契约套件 `RunTransactionalAppendSuite` 钉死回滚零
+  事件、提交前不可见、提交后可见、事务内幂等、回滚缺口与乱序边界。
 - **观测（接管计数）**：已落地——`Claim` 返回
   `ClaimResult{Leases, Takeovers, TerminalFailed}`：`Takeovers` 统计本次
   认领中「接管过期租约」而发放的数量（含终态接管；无主首认与 Fail 退避
@@ -467,9 +482,9 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   JetStream（首选）、RocketMQ（候选，限 5.x）、Redis Stream、RabbitMQ；
   Kafka 排除。映射与边界详见
   [ADR 0005](adr/0005-backend-capability-boundary.md)。
-- **可选拓展接口**（能力探测，能力边界表标明各后端支持度）：outbox
-  （TransactionalAppender）、延迟事件、管理面查询、NOTIFY 推送唤醒、
-  真推送投递（DeliverySource）。
+- **可选拓展接口**（能力探测，能力边界表标明各后端支持度）：延迟事件、
+  管理面查询、NOTIFY 推送唤醒、真推送投递（DeliverySource）；outbox
+  （TransactionalAppender）已提前落地（§9.2）。
 - **事件链**：correlation\_id / causation\_id 贯穿，追踪一条业务链上的事件族。
 - **批量认领**：一次抢多条，降低高吞吐下的 DB 往返。
 - **限流/背压**：按类型限速，防止下游过载。
