@@ -1,2 +1,4 @@
-github.com/jninng/go_event v0.1.0 h1:VtQos7JPpOV+dEiarao+Zty8JE9EINpYIx8yUfyI9hM=
-github.com/jninng/go_event v0.1.0/go.mod h1:+BQcbdbgB6evLI/+Qp/6szc4T4bg/iIMmwrEACm2Uvw=
+github.com/jninng/go_event v0.1.1 h1:wwdCoXmp0UBxvArtPrV78UaJKT/Gmk3r0IYmpNQr7dY=
+github.com/jninng/go_event v0.1.1/go.mod h1:+BQcbdbgB6evLI/+Qp/6szc4T4bg/iIMmwrEACm2Uvw=
+github.com/jninng/go_event/postgresschema v0.1.1 h1:ATk5bFT0Z2iGKuzIKTr1dC3M8+rvuPaoI23EM21bO/M=
+github.com/jninng/go_event/postgresschema v0.1.1/go.mod h1:pLRrpktOz0+sXRbNzQeVgAnC2l/G2zoy9uRO0h4ks3E=
