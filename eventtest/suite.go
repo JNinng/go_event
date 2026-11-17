@@ -58,6 +58,24 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("BackoffWindow_Claim_DelayedUntilEligible", func(t *testing.T) { testFailBackoff(t, d) })
 	t.Run("RetryLimitFail_Fail_TerminalNoReclaim", func(t *testing.T) { testFailRetryLimit(t, d) })
 
+	// ---- Fail 错误摘要落库口径（docs/design.md §5.3；经 ClaimStateReader
+	// ---- 断言落库事实）----
+	reader, ok := d.(ClaimStateReader)
+	if !ok {
+		t.Fatalf("driver %T must implement ClaimStateReader: the error summary "+
+			"persistence facts are part of the Driver contract", d)
+	}
+	t.Run("TerminalFailWithError_Fail_StoresSanitizedSummary", func(t *testing.T) { testFailSummaryTerminalStores(t, d, reader) })
+	t.Run("TerminalFailWithError_Fail_StoresFailedAtAtFailNow", func(t *testing.T) { testFailSummaryTerminalFailedAt(t, d, reader) })
+	t.Run("NonTerminalFail_Fail_LeavesSummaryAndFailedAtUnwritten", func(t *testing.T) { testFailSummaryRetryingUnwritten(t, d, reader) })
+	t.Run("TerminalFailEmptyError_Fail_StoresNoSummary", func(t *testing.T) { testFailSummaryEmptyError(t, d, reader) })
+	t.Run("StaleTokenWithError_Fail_DoesNotWriteSummaryOrFailedAt", func(t *testing.T) { testFailSummaryLateFailUnwritten(t, d, reader) })
+	t.Run("OverLimitTakeover_Claim_StoresFailedAtWithoutSummary", func(t *testing.T) { testFailSummaryTakeoverTerminal(t, d, reader) })
+	t.Run("ExactlyLimitError_Fail_StoresUntruncatedSummary", func(t *testing.T) { testFailSummaryExactlyLimit(t, d, reader) })
+	t.Run("OverLimitError_Fail_TruncatesSummaryToLimitBytes", func(t *testing.T) { testFailSummaryTruncated(t, d, reader) })
+	t.Run("ControlCharError_Fail_StoresStrippedSummary", func(t *testing.T) { testFailSummaryControlChars(t, d, reader) })
+	t.Run("HandlerErrorViaRunner_TerminalFail_StoresHandlerMessage", func(t *testing.T) { testFailSummaryRunnerPushdown(t, d, reader) })
+
 	// ---- core 编排（Runner/Publisher 基于 Driver 的端到端语义）----
 	t.Run("PreStartEvents_Broadcast_SkippedAndPostStartDelivered", func(t *testing.T) { testBroadcastOnlyAfterStart(t, d) })
 	t.Run("ParallelInstances_Broadcast_EachReceivesAll", func(t *testing.T) { testBroadcastAllInstances(t, d) })
@@ -101,6 +119,25 @@ func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver) {
 }
 
 // ---- 公共测试设施 ----
+
+// ClaimState 认领行的落库事实快照（事件 × 消费者身份）：Fail 的错误摘要
+// 与终态时刻写入口径以此断言（docs/design.md §5.3）。空串/零值表示对应
+// 列为 NULL（未提供/未写入）。
+type ClaimState struct {
+	Status    string    // 行状态：active / retrying / done / failed
+	LastError string    // 错误摘要（清洗后文本）
+	FailedAt  time.Time // 行进入 failed 终态的时刻
+}
+
+// ClaimStateReader 是认领行落库事实的观察接口：RunSuite 用它断言 Fail
+// 错误摘要与 failed_at 的写入时机与口径。Driver 必须实现（inmem 原生
+// 实现；Postgres 后端在测试装配处以 SQL 适配 event_claim 行）。
+type ClaimStateReader interface {
+	// ReadClaimState 返回认领行的当前落库事实；行不存在时 ok 为 false。
+	// 行缺失以外的查询失败属测试装配故障，经 t 报错终止（不得折叠为
+	// 「行不存在」）。
+	ReadClaimState(t *testing.T, eventID, consumerType string) (ClaimState, bool)
+}
 
 // baseNow 契约测试的基准时钟：Driver 判据一律取入参 Now，不依赖宿主
 // 时钟。取当前墙钟值——避免与后端保留窗口清理（以 occurred_at 对比墙钟）

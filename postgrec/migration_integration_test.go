@@ -1056,3 +1056,89 @@ func TestCanceledContext(t *testing.T) {
 		}
 	})
 }
+
+// provisionVersion 顺序执行指定版本的计划语句（模拟旧二进制创建的存量
+// 基线，供升级路径用例）。
+func provisionVersion(t *testing.T, db *sql.DB, schema string, version int) {
+	t.Helper()
+	plan, err := postgresschema.Plan(schema)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if version < 1 || version > len(plan) {
+		t.Fatalf("version %d out of plan range", version)
+	}
+	ctx := context.Background()
+	for i, stmt := range plan[version-1].Statements {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("provision v%d statement %d: %v\n%s", version, i, err, stmt)
+		}
+	}
+}
+
+func columnExists(t *testing.T, db *sql.DB, schema, table, column string) bool {
+	t.Helper()
+	var exists bool
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)`,
+		schema, table, column).Scan(&exists); err != nil {
+		t.Fatalf("column exists %s.%s.%s: %v", schema, table, column, err)
+	}
+	return exists
+}
+
+// 旧二进制（v1 基线）升级：Migrate 幂等补齐 v2 加列（last_error /
+// failed_at），升级随部署隐式发生（ADR 0007）；Verify 对 v1 基线报告
+// 缺失列（待升级）。
+func TestMigrateUpgradesV1Baseline(t *testing.T) {
+	db := migrationDB(t)
+	ctx := context.Background()
+
+	t.Run("V1Baseline_Migrate_AddsErrorSummaryColumns", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		if err := postgrec.Migrate(ctx, db, postgrec.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate over v1 baseline: %v", err)
+		}
+		if !columnExists(t, db, schema, "event_claim", "last_error") ||
+			!columnExists(t, db, schema, "event_claim", "failed_at") {
+			t.Fatal("v2 columns not added to event_claim")
+		}
+	})
+	t.Run("V1Baseline_MigrateTwice_Idempotent", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		if err := postgrec.Migrate(ctx, db, postgrec.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 1: %v", err)
+		}
+		if err := postgrec.Migrate(ctx, db, postgrec.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 2: %v", err)
+		}
+	})
+	t.Run("V1Baseline_Verify_ReportsMissingVersionColumns", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		report, err := postgrec.Verify(ctx, db, postgrec.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify on v1 baseline = %v, want *VerifyError (missing columns)", err)
+		}
+		requireIssue(t, report,
+			postgresschema.Qualified(schema, "event_claim")+".last_error",
+			event.KindColumn, event.ProblemMissing)
+		requireIssue(t, report,
+			postgresschema.Qualified(schema, "event_claim")+".failed_at",
+			event.KindColumn, event.ProblemMissing)
+	})
+	t.Run("V1Baseline_DriverFirstAppend_UpgradeConverges", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		drv := postgrec.NewDriver(db, postgrec.WithSchema(schema))
+		exerciseDML(t, drv, "t.upgrade", "up1")
+		if !columnExists(t, db, schema, "event_claim", "last_error") {
+			t.Fatal("create-mode first use must upgrade v1 baseline with new columns")
+		}
+	})
+}

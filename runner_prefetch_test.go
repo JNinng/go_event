@@ -2,6 +2,7 @@ package event_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"sync"
@@ -42,6 +43,7 @@ type claimProbeDriver struct {
 	batches   [][]event.Lease
 	beats     []event.HeartbeatRequest
 	completes []event.CompleteRequest
+	fails     []event.FailRequest
 
 	claimSignal chan struct{} // 每次 Claim 非阻塞投递一次（容量 1）
 }
@@ -100,6 +102,20 @@ func (d *claimProbeDriver) Complete(_ context.Context, c event.CompleteRequest) 
 	defer d.probeMu.Unlock()
 	d.completes = append(d.completes, c)
 	return nil
+}
+
+func (d *claimProbeDriver) Fail(_ context.Context, f event.FailRequest) error {
+	d.probeMu.Lock()
+	defer d.probeMu.Unlock()
+	d.fails = append(d.fails, f)
+	return nil
+}
+
+// failedRequests 已记录的 Fail 请求（保持调用顺序）。
+func (d *claimProbeDriver) failedRequests() []event.FailRequest {
+	d.probeMu.Lock()
+	defer d.probeMu.Unlock()
+	return append([]event.FailRequest(nil), d.fails...)
 }
 
 func (d *claimProbeDriver) claimCount() int {
@@ -641,5 +657,103 @@ func TestClaimError_Poll_ContinuesUntilSuccess(t *testing.T) {
 	})
 	if got := d.claimCount(); got < 2 {
 		t.Fatalf("claim calls = %d, want >= 2 (failure then success)", got)
+	}
+}
+
+// handler 错误下推 Fail：handler 返回错误时，core 以该错误文本作为
+// FailRequest.Error 下推（后端清洗后落库为终态摘要）。
+func TestHandlerError_Fail_CarriesHandlerErrorText(t *testing.T) {
+	d := newClaimProbeDriver()
+	d.enqueueBatch(prefetchLease("pe-1"))
+	handlerErr := errors.New("boom: delivery failed")
+
+	ctx := context.Background()
+	ev := event.Declare[runPayload](prefetchType)
+	run := event.NewRunner(d, event.WithPollInterval(2*time.Millisecond), event.WithLogger(quietLogger()))
+	if err := ev.SubscribeClaim(run,
+		func(context.Context, event.Envelope[runPayload]) error { return handlerErr },
+		event.WithConsumerType(prefetchConsumer),
+		event.WithConcurrency(1),
+		event.WithFetchLimit(10),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitForUnit(t, 2*time.Second, "fail recorded for failed handler", func() bool {
+		return len(d.failedRequests()) == 1
+	})
+	if got := d.failedRequests()[0].Error; got != handlerErr.Error() {
+		t.Fatalf("FailRequest.Error = %q, want %q", got, handlerErr.Error())
+	}
+}
+
+// handler panic 下推 Fail：panic 转为 handlerPanicError 后同样携带文本
+// 下推（认领消费 panic 计一次失败重试）。
+func TestHandlerPanic_Fail_CarriesPanicErrorText(t *testing.T) {
+	d := newClaimProbeDriver()
+	d.enqueueBatch(prefetchLease("pp-1"))
+
+	ctx := context.Background()
+	ev := event.Declare[runPayload](prefetchType)
+	run := event.NewRunner(d, event.WithPollInterval(2*time.Millisecond), event.WithLogger(quietLogger()))
+	if err := ev.SubscribeClaim(run,
+		func(context.Context, event.Envelope[runPayload]) error {
+			panic("detonate")
+		},
+		event.WithConsumerType(prefetchConsumer),
+		event.WithConcurrency(1),
+		event.WithFetchLimit(10),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitForUnit(t, 2*time.Second, "fail recorded for panicked handler", func() bool {
+		return len(d.failedRequests()) == 1
+	})
+	if got := d.failedRequests()[0].Error; got != "event: handler panic: detonate" {
+		t.Fatalf("FailRequest.Error = %q, want handler panic text", got)
+	}
+}
+
+// handler 成功不下推 Fail：只调用 Complete，不产生任何 Fail 请求。
+func TestHandlerSuccess_Complete_NoFailRecorded(t *testing.T) {
+	d := newClaimProbeDriver()
+	d.enqueueBatch(prefetchLease("ok-1"))
+
+	ctx := context.Background()
+	ev := event.Declare[runPayload](prefetchType)
+	run := event.NewRunner(d, event.WithPollInterval(2*time.Millisecond), event.WithLogger(quietLogger()))
+	if err := ev.SubscribeClaim(run,
+		func(context.Context, event.Envelope[runPayload]) error { return nil },
+		event.WithConsumerType(prefetchConsumer),
+		event.WithConcurrency(1),
+		event.WithFetchLimit(10),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitForUnit(t, 2*time.Second, "event completed", func() bool {
+		return slices.Contains(d.completedEventIDs(), "ok-1")
+	})
+	if got := d.failedRequests(); len(got) != 0 {
+		t.Fatalf("successful handler must not record Fail, got %d", len(got))
 	}
 }

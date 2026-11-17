@@ -144,6 +144,16 @@ func (s *state) applyObject(obj postgresschema.Object) (bool, error) {
 	case event.KindTable:
 		s.tables[obj.Table] = tableState{columns: slices.Clone(obj.Columns)}
 		return true, nil
+	case event.KindColumn:
+		// 版本加列：对既有表追加列（ADD COLUMN IF NOT EXISTS 的模拟）。
+		tbl, ok := s.tables[obj.Table]
+		if !ok {
+			return false, fmt.Errorf("simmigrate: table %q missing for column %s",
+				obj.Table, obj.Name)
+		}
+		tbl.columns = append(slices.Clone(tbl.columns), obj.Columns...)
+		s.tables[obj.Table] = tbl
+		return true, nil
 	case event.KindConstraint:
 		if _, ok := s.tables[obj.Table]; !ok {
 			return false, fmt.Errorf("simmigrate: table %q missing for constraint %s",

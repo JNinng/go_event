@@ -30,6 +30,7 @@ drv := postgrec.NewDriver(db, postgrec.WithRetention(7*24*time.Hour))
 | 接管计入重试、达上限置 failed | 原生 | 认领事务内终态标记 + 认领递增计数 |
 | 心跳 / 迟到 Complete / Fail 不生效（CAS） | 原生 | `lease_token` 条件更新，不命中静默返回 |
 | 递增退避 | 原生 | Fail 事务内按 `Backoff.Next` 计算 `next_eligible_at` |
+| 错误摘要与终态时刻（Fail 落库） | 原生 | 终态 UPDATE 写 `last_error`（`SanitizeErrorSummary` 清洗：去除 Unicode 控制字符、4 KiB 截断、不落堆栈）与 `failed_at`；接管终态仅写 `failed_at`；重试中与迟到 Fail 不写（ADR 0009） |
 | 惰性清理 | 原生 | 超窗且无活跃租约（无论终态）行删除，`event_claim` 经 FK ON DELETE CASCADE 级联；墙钟节流，随 Append 机会性执行 |
 
 ## 迁移能力

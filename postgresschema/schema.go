@@ -37,7 +37,9 @@ func EventColumns() []Column {
 	}
 }
 
-// EventClaimColumns 返回 event_claim 表的期望列（顺序即建表顺序）。
+// EventClaimColumns 返回 event_claim 表的期望列（顺序即建表顺序）。仅含
+// 基线 v1 建表列；基线之后以 ADD COLUMN IF NOT EXISTS 追加的列见
+// EventClaimVersionColumns（独立列对象参与期望对象集合，不进本表定义）。
 func EventClaimColumns() []Column {
 	return []Column{
 		{Name: "event_id", DataType: "text", NotNull: true},
@@ -47,6 +49,16 @@ func EventClaimColumns() []Column {
 		{Name: "claim_count", DataType: "integer", NotNull: true},
 		{Name: "status", DataType: "text", NotNull: true},
 		{Name: "next_eligible_at", DataType: "timestamp with time zone", NotNull: true},
+	}
+}
+
+// EventClaimVersionColumns 返回基线之后以 ALTER TABLE ... ADD COLUMN IF
+// NOT EXISTS 追加的 event_claim 列（顺序即版本计划 v2 语句顺序）：错误
+// 摘要 last_error 与终态时刻 failed_at，均可空、无默认值。
+func EventClaimVersionColumns() []Column {
+	return []Column{
+		{Name: "last_error", DataType: "text"},
+		{Name: "failed_at", DataType: "timestamp with time zone"},
 	}
 }
 
@@ -88,13 +100,14 @@ func Qualified(schema, name string) string {
 	return schema + "." + name
 }
 
-// ExpectedObjects 返回基线的期望对象集合（schema、两表、约束、索引），
-// 顺序稳定，供 Verify 与基线接管校验比对。非法 schema 名返回 nil。
+// ExpectedObjects 返回基线与各版本的期望对象集合（schema、两表、约束、
+// 索引、版本加列），顺序稳定、与计划语句按序一一配对，供 Verify 与基线
+// 接管校验比对。非法 schema 名返回 nil。
 func ExpectedObjects(schema string) []Object {
 	if ValidateSchema(schema) != nil {
 		return nil
 	}
-	return []Object{
+	objs := []Object{
 		{Kind: event.KindSchema, Name: schema},
 		{
 			Kind:    event.KindTable,
@@ -147,4 +160,15 @@ func ExpectedObjects(schema string) []Object {
 			KeyColumns: []string{"status", "next_eligible_at"},
 		},
 	}
+	// v2 加列版本：独立列对象，与 ALTER TABLE ... ADD COLUMN IF NOT EXISTS
+	// 语句按序一一配对；缺失可由迁移补齐。
+	for _, col := range EventClaimVersionColumns() {
+		objs = append(objs, Object{
+			Kind:    event.KindColumn,
+			Name:    Qualified(schema, TableEventClaim) + "." + col.Name,
+			Table:   TableEventClaim,
+			Columns: []Column{col},
+		})
+	}
+	return objs
 }

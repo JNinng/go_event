@@ -562,9 +562,12 @@ func (r *Runner) processClaim(ctx context.Context, s *subscription, lease Lease)
 			EventID:      lease.Envelope.ID,
 			ConsumerType: lease.ConsumerType,
 			LeaseToken:   lease.LeaseToken,
-			RetryLimit:   s.retryLimit,
-			Backoff:      s.backoff,
-			Now:          time.Now(),
+			// handler 错误文本下推为终态摘要：后端清洗后仅在 failed 终态
+			// 落库（不落堆栈——堆栈由 handler 侧观测承担）。
+			Error:      err.Error(),
+			RetryLimit: s.retryLimit,
+			Backoff:    s.backoff,
+			Now:        time.Now(),
 		}); ferr != nil {
 			r.metrics.fail.Add(tctx, 1, resultAttrs(resultError))
 			r.logger.Error("event: fail recording failed",

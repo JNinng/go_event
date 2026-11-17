@@ -200,6 +200,11 @@ type Driver interface {
     // 认领；claim_count 达 f.RetryLimit 时置 failed 终态——递增计数、
     // 退避调度与终态判定在单次 Fail 内原子完成（ADR 0006）；仅当属主
     // 凭证匹配时生效（CAS），迟到的 Fail 不递增、不污染新属主状态。
+    // 本次 Fail 使行进入 failed 终态时，后端把清洗后的 f.Error 摘要
+    // （SanitizeErrorSummary）与时刻写入 last_error / failed_at；重试中
+    // （未到终态）与迟到的 Fail 均不写摘要与时间。认领侧的接管终态
+    // （达 RetryLimit 直接置 failed）只写 failed_at，不写摘要（无本次
+    // 处理错误）。
     Fail(ctx context.Context, f FailRequest) error
 }
 ```
@@ -252,6 +257,11 @@ type FailRequest struct {
     EventID      string
     ConsumerType string
     LeaseToken   string
+    // Error 是本次失败的错误文本，按不可信输入处理：后端以
+    // SanitizeErrorSummary 清洗（截断至 MaxErrorSummaryBytes、去控制
+    // 字符、不落堆栈）后仅在终态写入 last_error；空串视为未提供摘要
+    // （last_error 置 NULL）。core 的 Runner 下推 handler 的 err.Error()。
+    Error        string
     RetryLimit   int     // claim_count 达此值置 failed（订阅级配置下推）
     Backoff      Backoff // 递增退避（订阅级配置下推）
     Now          time.Time
@@ -266,6 +276,15 @@ type Backoff interface {
 // 内建实现（可自定义 Backoff 注入）：
 func LinearBackoff(base, max time.Duration) Backoff      // base * attempt，封顶 max
 func ExponentialBackoff(base, max time.Duration) Backoff // base * 2^(attempt-1)，封顶 max
+
+// 错误摘要清洗（ADR 0009）：各后端写 last_error 前的统一口径。
+const MaxErrorSummaryBytes = 4 << 10 // 摘要字节上限（4 KiB）
+
+// SanitizeErrorSummary 清洗不可信错误文本：移除全部 Unicode 控制字符
+// （Unicode Cc 类：C0/C1/DEL，含换行与制表符——非控制字符如 U+2028/
+// U+2029 分隔符原样保留），非法字节以 UTF-8 替换符（U+FFFD）保留，按
+// 字节上限截断且不撕裂 UTF-8 码点；空串输入返回空串。
+func SanitizeErrorSummary(text string) string
 ```
 
 语义备注：
@@ -274,6 +293,9 @@ func ExponentialBackoff(base, max time.Duration) Backoff // base * 2^(attempt-1)
   判据不依赖宿主时钟。
 - Complete/Fail/Heartbeat 的 CAS 不命中（租约过期、已被接管）**返回 nil
   而非错误**——「不生效」是接管场景的正常结果，是否记日志由 core 决定。
+- Fail 错误摘要仅终态写入：`last_error` 为最近一次终态失败的摘要（清洗
+  后文本；空串视为未提供），`failed_at` 非空 ⟺ 行当前处于 `failed` 终态；
+  接管终态只写 `failed_at`。口径见 design.md §5.3 与 ADR 0009。
 - 除迁移相关错误（`ErrMigrationLockTimeout`、`ErrMigrationPermissionDenied`、
   `ErrMigrationUnsupported`、`ErrMigrateModeUnsupported`、`ErrInvalidSchema`
   等，见 §2.8）外，Driver 不返回哨兵错误；其余错误一律视为该次操作失败，
@@ -729,8 +751,26 @@ pgxc 可原生实现 P1 的 LISTEN/NOTIFY 推送唤醒，postgrec 退化回轮�
 package eventtest // github.com/jninng/go_event/eventtest
 
 // RunSuite 运行全套契约测试（design.md §9.1 列举的全部语义）。
-// 新后端必须全过；语义即测试。
+// 新后端必须全过；语义即测试。d 须实现 ClaimStateReader
+// （错误摘要落库事实是 Driver 契约的一部分）。
 func RunSuite(t *testing.T, d event.Driver)
+
+// ClaimState 认领行的落库事实快照（事件 × 消费者身份）：空串/零值
+// 表示对应列为 NULL（未提供/未写入）。
+type ClaimState struct {
+    Status    string    // 行状态：active / retrying / done / failed
+    LastError string    // 错误摘要（清洗后文本）
+    FailedAt  time.Time // 行进入 failed 终态的时刻
+}
+
+// ClaimStateReader 是认领行落库事实的观察接口：RunSuite 据此断言 Fail
+// 错误摘要与 failed_at 的写入时机与口径（design.md §5.3、ADR 0009）。
+// inmem 原生实现；Postgres 后端在测试装配处以 SQL 适配 event_claim 行。
+type ClaimStateReader interface {
+    // ReadClaimState 返回认领行的当前落库事实；行不存在时 ok 为 false。
+    // 行缺失以外的查询失败属测试装配故障，经 t 报错终止。
+    ReadClaimState(t *testing.T, eventID, consumerType string) (ClaimState, bool)
+}
 
 // RunRetentionSuite 运行保留窗口惰性清理契约（design.md §5.2）。
 // newDriver 须为每个用例返回配置了保留窗口（≤ 2s，推荐 2s）的
@@ -854,6 +894,11 @@ func Migrate(context.Context) error
 
 // Verify 是 no-op：恒报告 OK 且无错误。
 func Verify(context.Context) (event.VerifyReport, error)
+
+// ReadClaimState 返回认领行的落库事实（事件 × 消费者身份），实现
+// eventtest.ClaimStateReader：状态、错误摘要与终态时刻；行不存在时
+// ok 为 false。
+func (d *Driver) ReadClaimState(t *testing.T, eventID, consumerType string) (eventtest.ClaimState, bool)
 ```
 
 ## 5. 使用示例

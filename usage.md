@@ -370,12 +370,13 @@ err := vectorize.SubscribeClaim(run,
 
 - handler 返回 `nil`：调用 `Complete` 置 `done`，幂等且不可逆。
 - handler 返回错误或 panic：调用 `Fail`，递增重试计数并按退避置为可再次认领；计数达 `RetryLimit` 时置 `failed` 终态，不再认领。
-- 租约过期被接管也计一次失败（前任未 Fail 而失去租约）；否则每轮挂死的事件会被无限接管。
+- 进入 `failed` 终态时，错误文本以清洗后的摘要落库（`last_error`，去除 Unicode 控制字符、截断 4 KiB、不含堆栈）并记录终态时刻（`failed_at`）；重试中不写。可直接查库排障（`SELECT ... FROM event_claim WHERE status = 'failed'`），见 [§8.3](#83-持久结构)。
+- 租约过期被接管也计一次失败（前任未 Fail 而失去租约）；否则每轮挂死的事件会被无限接管。接管达上限直接置 `failed`，只写 `failed_at`（该路径没有本次处理错误，无摘要）。
 - 退避由 `Backoff.Next(attempt)` 计算，`attempt` 从 1 开始。内建实现：
   - `event.LinearBackoff(base, max)`：`base × attempt`，封顶 `max`。
   - `event.ExponentialBackoff(base, max)`：`base × 2^(attempt-1)`，封顶 `max`。
   - 缺省 `ExponentialBackoff(1s, 1h)`；可实现 `event.Backoff` 自定义。
-- 迟到的 `Complete`/`Fail`（租约已过期或被接管）不生效：不会覆盖新属主状态，也不会递增计数。这是正常结果，Driver 返回 `nil`。
+- 迟到的 `Complete`/`Fail`（租约已过期或被接管）不生效：不会覆盖新属主状态，也不会递增计数或写入摘要。这是正常结果，Driver 返回 `nil`。
 
 ### 6.5 至少一次与幂等
 
@@ -508,7 +509,7 @@ drv := postgrec.NewDriver(db,
 两个 Postgres 后端的表结构一致：
 
 - `event`：`id` 主键、`type`、`payload bytea`、`metadata jsonb`、`occurred_at`、`position bigserial`，并有 `(type, id)` 唯一约束与 `(type, position)` 索引。
-- `event_claim`：主键 `(event_id, consumer_type)`，含 `lease_token`、`lease_until`、`claim_count`、`status`、`next_eligible_at`；`event_id` 外键级联删除。
+- `event_claim`：主键 `(event_id, consumer_type)`，含 `lease_token`、`lease_until`、`claim_count`、`status`、`next_eligible_at`，以及版本计划 v2 加列 `last_error`（错误摘要，可空 text）与 `failed_at`（进入 `failed` 终态的时刻，可空 timestamptz）；`event_id` 外键级联删除。摘要与终态时刻仅终态写入：`failed_at` 非空 ⟺ 行当前处于 `failed` 终态；`last_error` 是最近一次终态失败的清洗后摘要（截断 4 KiB、去控制字符、不含堆栈，空错误文本落 NULL）。
 
 DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语句、期望对象与共享执行器，无驱动依赖），两个后端使用同一份计划。首次操作是否建表、建到什么程度由迁移模式决定，见 [§8.4](#84-迁移模式与权限)。缺省模式 `Create` 会在首次操作时以构造 Driver 的连接（通常是运行账号）幂等应用版本计划全量语句。
 
@@ -530,7 +531,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
 - **无 DDL 权限的运行连接不能自动迁移**：`Create` 与显式 `Migrate` 同义，都以构造 Driver 的连接（通常是运行账号）执行 DDL。权限不足时返回 `event.ErrMigrationPermissionDenied` 并 fail-fast；正确做法是在部署期用高权限连接建表（调用 `Migrate` 或执行 `SQL` 导出的脚本），运行期改用 `Verify` 或 `None`。若后端锁能力为无（`LockNone`），`Create` 返回 `event.ErrMigrationUnsupported`；DDL 原子性为无是另一维度，同样只能 `Verify`/`None`。
 - **失败缓存与重试有界**：`ensure` 的失败按 Driver 实例负缓存。瞬时错误（数据库不可用、`ErrMigrationLockTimeout`）按指数退避重试（100ms 起、封顶 30s），窗口内所有操作返回同一错误，不会在每次 Append/Claim 时重跑全部 DDL；永久配置错误（权限不足、对象定义冲突、非法 schema、后端不支持自动迁移）直接 fail-fast，不再重试。调用方取消不算迁移结论，不写入负缓存。
 - **部署补建后需重启或重建 Driver**：永久配置错误在 Driver 生命周期内保持；`Verify` 首次通过后同样缓存「已检查」。表结构在运行期被改动时，只有重建 Driver 才会重新判定。
-- **`Verify` 报告结构**：`event.VerifyReport` 含 `Issues []event.VerifyIssue`，每项含对象标识、对象类型、问题类别与处置说明（`Action`）；`Issues` 为空表示与计划期望一致。问题类别为 `missing`（对象缺失：待升级，处置为执行迁移；缺失基线列例外——迁移不修改既有表，须人工加列）与 `outdated`（定义与计划期望不一致，不自动修复）；`too_new` / `failed` 为预留枚举，当前模型不产生。
+- **`Verify` 报告结构**：`event.VerifyReport` 含 `Issues []event.VerifyIssue`，每项含对象标识、对象类型、问题类别与处置说明（`Action`）；`Issues` 为空表示与计划期望一致。问题类别为 `missing`（对象缺失：待升级，处置为执行迁移；版本加列如 `last_error` / `failed_at` 缺失即属此类，可由迁移自动补齐）与 `outdated`（定义与计划期望不一致，不自动修复；缺失基线列属此类——迁移不修改既有表，须人工加列）；`too_new` / `failed` 为预留枚举，当前模型不产生。
 - **`Statements` / `SQL` 导出物**：两者由同一版本计划派生。`Statements` 返回计划内全部语句清单（不含迁移锁）；`SQL` 返回可手工执行的整段脚本：以 `BEGIN` 开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于全部 DDL 之前），随后依次输出计划内全部语句（基线 + 各版本，全部幂等），末尾 `COMMIT`。脚本整段可重放（中断重跑收敛）；手工执行 `SQL` 无需额外取锁；若按 `Statements` 逐条手工执行，必须先自行取锁并整段执行，否则并发首启会出现 DDL 竞态。
 - **保留窗口不受影响**：迁移模式只决定持久结构的初始化方式，不改变 [§8.5](#85-保留窗口与惰性清理) 的保留期与惰性清理语义。
 
@@ -606,12 +607,15 @@ func TestVectorizeFlow(t *testing.T) {
 
 ### 9.2 为新后端跑契约测试
 
-实现 `event.Driver` 后，必须通过全套契约测试：
+实现 `event.Driver` 后，必须通过全套契约测试。Driver 须实现
+`eventtest.ClaimStateReader`（套件据它断言 Fail 错误摘要与 `failed_at`
+的落库事实，[§6.4](#64-成功与失败)）：`eventtest/inmem` 原生实现，
+Postgres 后端在测试装配处以 SQL 查询 `event_claim` 行适配：
 
 ```go
 func TestMyBackendContract(t *testing.T) {
     drv := newMyDriver(t)
-    eventtest.RunSuite(t, drv)
+    eventtest.RunSuite(t, drv) // drv 须满足 eventtest.ClaimStateReader
 }
 
 func TestMyBackendRetention(t *testing.T) {
@@ -705,7 +709,7 @@ func TestMyBackendRetention(t *testing.T) {
 - **停机**：`Stop` 等待在途 handler；handler 本身过长会拖住停机，给 `Stop` 传超时 ctx 作为兜底。
 - **轮询开销**：默认 5s 轮询一次；低频场景可调大，需要低延迟时注入 `LocalWake`（仅同进程）或后续使用 LISTEN/NOTIFY（P1）。
 - **消费者身份变更**：新增身份会重放窗口内全部历史事件；改名等同于新身份，不是断点续跑。
-- **failed 事件**：当前版本没有管理面接口；P1 将提供 failed 查询与手工重放（仅 `failed` 可重放，`done` 不可逆）。
+- **failed 事件**：当前版本没有管理面接口；P1 将提供 failed 查询与手工重放（仅 `failed` 可重放，`done` 不可逆）。失败原因已落库：查 `event_claim` 的 `last_error` / `failed_at`（`failed_at IS NOT NULL` 即当前 failed 行，见 [§6.4](#64-成功与失败)）。
 
 ## 12. 错误与排查
 
@@ -737,7 +741,7 @@ func TestMyBackendRetention(t *testing.T) {
 **认领订阅不处理事件**
 
 1. 身份是否设置（`WithIdentity` 或 `WithConsumerType`）？
-2. 事件是否已处于该身份的 `done`/`failed` 终态？终态不会再次认领。
+2. 事件是否已处于该身份的 `done`/`failed` 终态？终态不会再次认领。`failed` 行可查 `last_error` / `failed_at` 定位原因（[§6.4](#64-成功与失败)）。
 3. 是否处于退避窗口？失败后要等 `next_eligible_at` 到期。
 4. 数据库连接与 schema 是否正确？
 

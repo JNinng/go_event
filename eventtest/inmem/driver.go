@@ -11,9 +11,11 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/jninng/go_event"
+	"github.com/jninng/go_event/eventtest"
 )
 
 // Option inmem Driver 构造选项。
@@ -57,6 +59,8 @@ type storedClaim struct {
 	claimCount   int // 已失败次数：显式 Fail 与接管各计一次（ADR 0006）
 	status       claimStatus
 	nextEligible time.Time // 退避期满时刻；零值表示立即可认领
+	lastError    string    // 错误摘要（清洗后文本；空串 = NULL/未提供）
+	failedAt     time.Time // 进入 failed 终态的时刻；零值 = 无
 }
 
 type claimKey struct {
@@ -65,7 +69,9 @@ type claimKey struct {
 }
 
 // Driver 进程内 Driver 实现。所有判定时钟一律取自方法入参 Now，
-// 不依赖宿主时钟（docs/api.md §2.4）。
+// 不依赖宿主时钟（docs/api.md §2.4）。实现 eventtest.ClaimStateReader
+// （ReadClaimState）：契约套件据它断言 Fail 错误摘要与终态时刻的落库
+// 事实，口径与 Postgres 后端一致（ADR 0009）。
 type Driver struct {
 	mu          sync.Mutex
 	events      map[string]*storedEvent
@@ -184,6 +190,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 
 	// 1) 接管达重试上限的行直接置 failed 终态：不发放、不占用 Limit
 	//    槽位（与 SQL 实现的「先置 failed 再 LIMIT 拾取」一致，ADR 0006）。
+	//    终态时刻随置入写入；接管路径没有本次处理错误，不写摘要。
 	for _, cd := range candidates {
 		if cd.claim == nil || cd.claim.status != statusActive {
 			continue
@@ -192,6 +199,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 			cd.claim.claimCount++
 			cd.claim.status = statusFailed
 			cd.claim.leaseUntil = q.Now
+			cd.claim.failedAt = q.Now
 		}
 	}
 
@@ -266,24 +274,45 @@ func (d *Driver) Complete(_ context.Context, c event.CompleteRequest) error {
 }
 
 // Fail 记失败：递增计数、退避与终态判定原子完成（ADR 0006）；迟到的 Fail 静默不生效。
+// 仅当本次 Fail 使行进入 failed 终态时写入错误摘要与终态时刻（摘要经
+// event.SanitizeErrorSummary 清洗；空串视为未提供）。
 func (d *Driver) Fail(_ context.Context, f event.FailRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	sc, ok := d.claims[claimKey{f.EventID, f.ConsumerType}]
 	if !ok || sc.leaseToken != f.LeaseToken || sc.status != statusActive {
-		return nil // 迟到的 Fail 不递增、不污染新属主状态
+		return nil // 迟到的 Fail 不递增、不写摘要、不污染新属主状态
 	}
 	// 递增计数、退避调度与终态判定单次原子完成（ADR 0006）。
 	sc.claimCount++
 	if sc.claimCount >= f.RetryLimit {
 		sc.status = statusFailed
 		sc.leaseUntil = f.Now
+		sc.lastError = event.SanitizeErrorSummary(f.Error)
+		sc.failedAt = f.Now
 		return nil
 	}
 	sc.status = statusRetrying
 	sc.leaseUntil = f.Now                                      // 立即过期，重认领由退避判据约束
 	sc.nextEligible = f.Now.Add(f.Backoff.Next(sc.claimCount)) // 首次失败 = 1
 	return nil
+}
+
+// ReadClaimState 返回认领行的落库事实（eventtest.ClaimStateReader）：
+// 状态、错误摘要与终态时刻。行不存在时 ok 为 false；t 用于报告装配层
+// 查询故障（内存实现只做行查找，不会失败）。
+func (d *Driver) ReadClaimState(_ *testing.T, eventID, consumerType string) (eventtest.ClaimState, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	sc, ok := d.claims[claimKey{eventID, consumerType}]
+	if !ok {
+		return eventtest.ClaimState{}, false
+	}
+	return eventtest.ClaimState{
+		Status:    string(sc.status),
+		LastError: sc.lastError,
+		FailedAt:  sc.failedAt,
+	}, true
 }
 
 // cleanupLocked 惰性清理：超保留窗口且无活跃租约的行（无论终态与否）

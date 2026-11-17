@@ -161,6 +161,16 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 - Complete/Fail 以**持有租约为前提**（对租约属主做条件更新）：租约过期或
   已被接管后，旧实例迟到的 Complete/Fail 不生效，不得递增 claim\_count 或
   覆盖新属主的认领状态（写进契约测试）。
+- **失败摘要落库**（[ADR 0009](adr/0009-error-summary-persistence.md)）：
+  `event_claim` 留存 `last_error`（错误摘要）与 `failed_at`（终态时刻）。
+  错误文本按不可信输入处理，口径为：移除全部 Unicode 控制字符（Cc 类，
+  含换行与制表符）、截断 4 KiB 字节（不撕裂 UTF-8 码点）、不落堆栈；清洗函数在 core
+  （`event.SanitizeErrorSummary`）供各后端共享。仅终态写入：本次 Fail 使行
+  进入 `failed` 终态时写摘要与时刻，重试中不写；接管终态只写 `failed_at`
+  （无本次处理错误）；迟到的 Fail 不写。不变式：`failed_at` 非空 ⟺ 行当前
+  处于 `failed` 终态；`last_error` 是最近一次终态失败的摘要（重放清
+  `failed_at`、保留 `last_error`，直到下一次终态失败覆盖）。Inspector 与
+  重放以该两列为数据源。
 - 终态是（事件 × consumer\_type）粒度：`done`/`failed` 仅对该身份自身生效，
   终态事件不参与该身份的常规认领（done 幂等不可逆；failed 的手工重放归
   管理面，见 §9.2）；新增 consumer\_type 重放全部窗口内历史——含其他身份
@@ -361,6 +371,8 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   接管计入重试/心跳/超时停续/退避重试/重试耗尽终态/迟到 Complete 与
   Fail 不生效/新身份重放全部窗口内历史/超限行不占限额槽位；公共的
   ID 唯一与幂等 Append 首写为准、元数据透传、HeadPosition 基线锚点；
+  错误摘要与终态时刻仅终态写入（含接管终态仅写 failed\_at）、重试中与
+  迟到 Fail 不写、摘要截断与去控制字符；
   持久结构初始化的幂等可重复执行；迁移契约 `RunMigrationSuite`（空库/
   完整/部分/冲突、三模式 Driver 首启、导出物、并发首启、锁释放、
   Lock=none、语句边界故障注入与回滚/收敛）；保留窗口清理资格
@@ -376,8 +388,10 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   观测面（otel 指标 + slog + 类型化 Observer）已在 P0 落地，见 §9.1 与
   ADR 0008。
 - **管理面**：滞留/failed 事件查询、手工重放（仅针对 `failed` 终态重新置为
-  可认领；`done` 不可逆、不重放）、dead-letter 处置钩子、失败信息留存
-  （最后错误摘要）、存量消费者身份的重命名迁移（§5.1）。迁移侧无台账，
+  可认领；`done` 不可逆、不重放）、dead-letter 处置钩子、存量消费者身份的
+  重命名迁移（§5.1）。失败信息留存（最后错误摘要与终态时刻）已落地
+  （§5.3、[ADR 0009](adr/0009-error-summary-persistence.md)），是 Inspector
+  查询与重放的数据源。迁移侧无台账，
   不需要 reset/stamp 入口；schema 异常经迁移重跑或人工修复。
 - **延迟事件**：deliver\_at 定时投递（Postgres 原生；其余后端为可选能力，见
   能力边界）；未到投递时间的行不满足 Fetch/Claim 的下推条件，与广播消费

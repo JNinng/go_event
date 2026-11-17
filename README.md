@@ -13,7 +13,7 @@
 
 - **2×2 正交**：`Declare[T]` 声明强类型事件，`NoPayload` 表示无参事件；广播/认领共享同一 `Handler[T]` 签名。
 - **广播发完即忘**：`Runner.Start` 内同步锚定基线，只处理启动后发布的事件；失败仅记日志跳过，不重试、不阻塞、不保序。
-- **认领至少一次**：租约互斥、自动心跳续租、接管计入重试、递增退避、`done`/`failed` 终态；迟到的 `Complete`/`Fail` 不生效。
+- **认领至少一次**：租约互斥、自动心跳续租、接管计入重试、递增退避、`done`/`failed` 终态；失败终态留存错误摘要与时刻（`last_error`/`failed_at`，去除控制字符、截断 4 KiB、不含堆栈），可直接查库排障；迟到的 `Complete`/`Fail` 不生效。
 - **多身份**：一个进程可承载多个消费者身份，各身份独立认领；同一 `Runner` 可混合承载广播与认领订阅。
 - **就近唤醒**：同进程发布触发本实例 poller 立即拉取；仅信号，不跳过存储，跨实例与信号丢失由轮询兜底。
 - **幂等发布**：发布侧生成或通过 `WithEventID` 显式指定唯一事件 ID，重复 `Append` 同 ID 幂等（首写为准）；元数据块原样透传（如 `trace_id`）。
@@ -165,8 +165,8 @@ TEST_POSTGRES_DSN='postgres://user:pass@localhost:5432/postgres' go test ./...
 
 ## 状态与路线
 
-- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`；otel 指标 + slog + 类型化 Observer 观测面（ADR 0008）。
-- **P1（规划）**：错误摘要落库与 `Fail` 扩展、`Inspector` 查询面与 `Admin` 管理面（failed 查询/重放）、outbox、接管计数、延迟事件、LISTEN/NOTIFY 推送唤醒。
+- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`；失败错误摘要落库（`Fail` 扩展，ADR 0009）；otel 指标 + slog + 类型化 Observer 观测面（ADR 0008）。
+- **P1（规划）**：`Inspector` 查询面与 `Admin` 管理面（failed 查询/重放）、outbox、接管计数、延迟事件、LISTEN/NOTIFY 推送唤醒。
 - **P2（规划）**：NATS JetStream / RocketMQ / Redis Stream / RabbitMQ 后端、事件链、批量认领、限流背压。
 
 详见 [docs/design.md §9](docs/design.md)。

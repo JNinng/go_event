@@ -257,9 +257,11 @@ func (d *Driver) Claim(ctx context.Context, q event.ClaimQuery) ([]event.Lease, 
 	defer func() { _ = tx.Rollback() }()
 
 	// 1) 接管达重试上限的行：置 failed 终态、不再认领（ADR 0006）。
+	//    failed_at 记录进入终态的时刻；接管路径没有本次处理错误，不写摘要。
 	if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
 UPDATE %s.event_claim c
-SET status = 'failed', lease_until = $3, next_eligible_at = '-infinity'::timestamptz
+SET status = 'failed', lease_until = $3, next_eligible_at = '-infinity'::timestamptz,
+	failed_at = $3
 FROM %s.event e
 WHERE c.event_id = e.id AND e.type = $1 AND c.consumer_type = $2
   AND c.status = 'active'
@@ -430,7 +432,10 @@ WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3
 }
 
 // Fail 记失败：递增计数、退避调度与终态判定在单事务内原子完成
-// （ADR 0006）；行锁 + CAS 谓词保证仅属主凭证匹配时生效。
+// （ADR 0006）；行锁 + CAS 谓词保证仅属主凭证匹配时生效。仅当本次 Fail
+// 使行进入 failed 终态时写入错误摘要与终态时刻：摘要经
+// event.SanitizeErrorSummary 清洗（截断 4 KiB、去控制字符、不落堆栈），
+// 空串视为未提供（NULL）；重试中（retrying）与迟到的 Fail 均不写。
 func (d *Driver) Fail(ctx context.Context, f event.FailRequest) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
@@ -449,7 +454,7 @@ WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3
   AND status = 'active'
 FOR UPDATE`, d.schema), f.EventID, f.ConsumerType, f.LeaseToken).Scan(&count)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil // 迟到的 Fail 不递增、不污染新属主状态（静默）
+		return nil // 迟到的 Fail 不递增、不写摘要、不污染新属主状态（静默）
 	}
 	if err != nil {
 		return fmt.Errorf("postgrec: fail scan: %w", err)
@@ -457,11 +462,16 @@ FOR UPDATE`, d.schema), f.EventID, f.ConsumerType, f.LeaseToken).Scan(&count)
 
 	count++
 	if count >= f.RetryLimit {
+		var lastErr any
+		if summary := event.SanitizeErrorSummary(f.Error); summary != "" {
+			lastErr = summary
+		}
 		_, err = tx.ExecContext(ctx, fmt.Sprintf(`
 UPDATE %s.event_claim SET claim_count = $4, status = 'failed',
-	lease_until = $5, next_eligible_at = '-infinity'::timestamptz
+	lease_until = $5, next_eligible_at = '-infinity'::timestamptz,
+	last_error = $6, failed_at = $7
 WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3`, d.schema),
-			f.EventID, f.ConsumerType, f.LeaseToken, count, f.Now)
+			f.EventID, f.ConsumerType, f.LeaseToken, count, f.Now, lastErr, f.Now)
 	} else {
 		_, err = tx.ExecContext(ctx, fmt.Sprintf(`
 UPDATE %s.event_claim SET claim_count = $4, status = 'retrying',

@@ -47,7 +47,11 @@ type Driver interface {
 	// Fail 记失败：递增重试计数，按 f.Backoff 递增退避置为再次可认领；
 	// 计数达 f.RetryLimit 时置 failed 终态——递增计数、退避调度与终态
 	// 判定在单次 Fail 内原子完成（ADR 0006）；仅当属主凭证匹配时生效
-	// （CAS），迟到的 Fail 不递增、不污染新属主状态。
+	// （CAS），迟到的 Fail 不递增、不污染新属主状态。本次 Fail 使行进入
+	// failed 终态时，后端把清洗后的 f.Error 摘要（SanitizeErrorSummary）
+	// 与时刻写入 last_error / failed_at；重试中（未到终态）与迟到的 Fail
+	// 均不写摘要与时间。认领侧的接管终态（达 RetryLimit 直接置 failed）
+	// 只写 failed_at，不写摘要（无本次处理错误）。
 	Fail(ctx context.Context, f FailRequest) error
 }
 
@@ -105,9 +109,14 @@ type FailRequest struct {
 	EventID      string
 	ConsumerType string
 	LeaseToken   string
-	RetryLimit   int     // 重试计数达此值置 failed（订阅级配置下推）
-	Backoff      Backoff // 递增退避（订阅级配置下推）
-	Now          time.Time
+	// Error 是本次失败的错误文本，按不可信输入处理：后端以
+	// SanitizeErrorSummary 清洗（截断至 MaxErrorSummaryBytes、去控制
+	// 字符、不落堆栈）后仅在终态写入 last_error；空串视为未提供摘要
+	// （last_error 置 NULL）。core 的 Runner 下推 handler 的 err.Error()。
+	Error      string
+	RetryLimit int     // 重试计数达此值置 failed（订阅级配置下推）
+	Backoff    Backoff // 递增退避（订阅级配置下推）
+	Now        time.Time
 }
 
 // Backoff 递增退避：依据已失败次数计算下次可认领前延时（ADR 0006，
