@@ -8,15 +8,11 @@ import (
 )
 
 // 保留窗口惰性清理契约（design.md §5.2：清理资格为「超窗且无活跃租约，
-// 无论终态与否」）。清理资格以后端墙钟对 occurred_at 判定，故用例以
-// 追加时刻的墙钟构造行：超窗行早 2 小时、窗口内行取当下。清理在
-// Append 内节流触发，序列固定为：追加新鲜行（触发首轮清理）→ 追加
-// 超窗行（被节流跳过，得以存活）→ 按用例认领/完成 → 等过节流窗 →
-// 追加触发行（第二轮清理评估超窗行）。
-//
-// newDriver 契约：每用例返回配置了保留窗口的全新 Driver（清理簿记按
-// Driver 实例记忆），窗口须 ≤ 2s（用例以 600ms 等待越过
-// max(窗口/4, 50ms) 的清理节流窗）。推荐 2s。
+// 无论终态与否」，以后端墙钟对 occurred_at 判定，超窗行早 2 小时构造）。
+// 序列固定：追加新鲜行（触发首轮清理）→ 追加超窗行（被节流跳过）→
+// 按用例认领/完成 → retentionSettle 等过节流窗 → 追加触发行评估超窗行。
+// newDriver 契约：返回配置了保留窗口的全新 Driver（清理簿记按实例记忆），
+// 窗口 ≤ 2s（600ms 等待越过 max(窗口/4, 50ms) 节流窗；推荐 2s）。
 func retentionFixture(t *testing.T, newDriver func(*testing.T) event.Driver,
 	typ string) (event.Driver, string) {
 	t.Helper()

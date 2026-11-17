@@ -56,7 +56,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := postgrec.Migrate(ctx, db, postgrec.WithSchema(schema)); err != nil {
 		t.Fatalf("migrate 2 (must be idempotent): %v", err)
 	}
-	// NewDriver 自动初始化亦幂等。
+	// 第三次显式 Migrate 亦幂等。
 	if err := postgrec.Migrate(ctx, db, postgrec.WithSchema(schema)); err != nil {
 		t.Fatalf("migrate 3: %v", err)
 	}

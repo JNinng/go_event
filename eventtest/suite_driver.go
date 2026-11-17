@@ -17,7 +17,7 @@ import (
 func testAppendIdempotent(t *testing.T, d event.Driver) {
 	typ := t.Name()
 	appendEvent(t, d, "aid-1", typ, "first", nil)
-	appendEvent(t, d, "aid-1", typ, "second", nil) // 同 ID 重复 Append
+	appendEvent(t, d, "aid-1", typ, "second", nil)
 
 	batch, err := d.Fetch(t.Context(), event.FetchQuery{Type: typ, Limit: 10})
 	if err != nil {
@@ -734,7 +734,8 @@ func testLateComplete(t *testing.T, d event.Driver) {
 		t.Fatalf("late complete must return nil, got %v", err)
 	}
 	// 新属主仍持有租约，事件未被旧 Complete 置 done：新属主 Fail 成功
-	// （若 done 则 CAS 不命中，行会停留在活跃租约状态）。
+	// （Fail 的 CAS 要求行仍为 active：若已被置 done，Fail 静默不命中，
+	// 末尾重新认领断言即失败）。
 	if err := d.Fail(t.Context(), event.FailRequest{
 		EventID: "lc1", ConsumerType: "lc", LeaseToken: ls2[0].LeaseToken,
 		RetryLimit: 5, Backoff: linearBackoffMs(),

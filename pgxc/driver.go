@@ -19,8 +19,8 @@ import (
 )
 
 // Driver event.Driver 的 Postgres 实现（pgx v5 连接池载体）。
-// 持久结构按迁移模式在首次使用时处理（design.md §8）：缺省 Create 执行
-// 基线，Verify 只读校验，None 直接放行。
+// 持久结构按迁移模式在首次使用时处理（design.md §8）：缺省 Create 幂等
+// 应用版本计划全量语句，Verify 只读校验，None 直接放行。
 type Driver struct {
 	pool      *pgxpool.Pool
 	schema    string
@@ -157,8 +157,8 @@ func (d *Driver) runEnsure(ctx context.Context) error {
 	}
 }
 
-// HeadPosition 广播基线锚点：该类型已提交事件的最大 Position，无行返回
-// 空串。单条语句快照（ADR 0006）；(type, position) 索引支撑即时求值。
+// HeadPosition 广播基线锚点：该类型已提交事件的最大 Position，无该类型
+// 事件时返回空串。单条语句快照（ADR 0006）；(type, position) 索引支撑即时求值。
 func (d *Driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 	if err := d.ensure(ctx); err != nil {
 		return "", err
@@ -175,6 +175,7 @@ func (d *Driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 	return strconv.FormatInt(pos, 10), nil
 }
 
+// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）。
 func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
@@ -196,6 +197,7 @@ ON CONFLICT (id) DO NOTHING`, d.schema),
 	return nil
 }
 
+// Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；Limit<=0 返回 nil。
 func (d *Driver) Fetch(ctx context.Context, q event.FetchQuery) ([]event.RawEnvelope, error) {
 	if err := d.ensure(ctx); err != nil {
 		return nil, err
@@ -232,6 +234,7 @@ type claimedRow struct {
 	count   int // 认领后的 claim_count（已失败次数）
 }
 
+// Claim 原子认领至多 Limit 个租约：终态接管、CAS 抢租约与取回拼装在同一事务内完成。
 func (d *Driver) Claim(ctx context.Context, q event.ClaimQuery) ([]event.Lease, error) {
 	if err := d.ensure(ctx); err != nil {
 		return nil, err
@@ -368,6 +371,7 @@ FROM %s.event WHERE id = ANY($1) ORDER BY position ASC`, d.schema), ids)
 	return leases, nil
 }
 
+// Heartbeat CAS 续租：仅属主凭证匹配且租约未过期时生效，不命中静默返回 nil。
 func (d *Driver) Heartbeat(ctx context.Context, h event.HeartbeatRequest) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
@@ -384,6 +388,7 @@ WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3
 	return nil
 }
 
+// Complete CAS 置 done：幂等、不可逆，迟到的 Complete 静默不生效。
 func (d *Driver) Complete(ctx context.Context, c event.CompleteRequest) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
@@ -426,7 +431,7 @@ FOR UPDATE`, d.schema), f.EventID, f.ConsumerType, f.LeaseToken).Scan(&count)
 		return fmt.Errorf("pgxc: fail scan: %w", err)
 	}
 
-	count++ // 本次失败计入
+	count++
 	if count >= f.RetryLimit {
 		_, err = tx.Exec(ctx, fmt.Sprintf(`
 UPDATE %s.event_claim SET claim_count = $4, status = 'failed',

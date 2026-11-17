@@ -75,6 +75,7 @@ type Driver struct {
 	lastCleanup time.Time
 }
 
+// Append 写入事件：同 ID 首写为准、不覆盖不重投；运行时注入字段不落库（保持零值）。
 func (d *Driver) Append(_ context.Context, e event.RawEnvelope) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -93,6 +94,7 @@ func (d *Driver) Append(_ context.Context, e event.RawEnvelope) error {
 	return nil
 }
 
+// Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；Limit<=0 返回 nil。
 func (d *Driver) Fetch(_ context.Context, q event.FetchQuery) ([]event.RawEnvelope, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -122,7 +124,7 @@ func (d *Driver) Fetch(_ context.Context, q event.FetchQuery) ([]event.RawEnvelo
 	return out, nil
 }
 
-// HeadPosition 广播基线锚点：该类型事件的最大 Position，无行返回空串。
+// HeadPosition 广播基线锚点：该类型事件的最大 Position，无该类型事件时返回空串。
 func (d *Driver) HeadPosition(_ context.Context, typ string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -138,6 +140,7 @@ func (d *Driver) HeadPosition(_ context.Context, typ string) (string, error) {
 	return strconv.FormatUint(head, 10), nil
 }
 
+// Claim 原子认领至多 Limit 个租约；语义同 event.Driver.Claim。
 func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -236,6 +239,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 	return leases, nil
 }
 
+// Heartbeat CAS 续租：仅属主凭证匹配且租约未过期时生效，不命中静默返回 nil。
 func (d *Driver) Heartbeat(_ context.Context, h event.HeartbeatRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -248,6 +252,7 @@ func (d *Driver) Heartbeat(_ context.Context, h event.HeartbeatRequest) error {
 	return nil
 }
 
+// Complete CAS 置 done：迟到的 Complete 静默不生效。
 func (d *Driver) Complete(_ context.Context, c event.CompleteRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -260,6 +265,7 @@ func (d *Driver) Complete(_ context.Context, c event.CompleteRequest) error {
 	return nil
 }
 
+// Fail 记失败：递增计数、退避与终态判定原子完成（ADR 0006）；迟到的 Fail 静默不生效。
 func (d *Driver) Fail(_ context.Context, f event.FailRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
