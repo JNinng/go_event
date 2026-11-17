@@ -2,6 +2,7 @@ package postgresschema
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -128,25 +129,30 @@ func (c *migrationConfig) classifyError(ps PlannedStatement, err error) error {
 	return c.classify(ps, err)
 }
 
-// acquireMigrationLock 有界等待取事务级迁移锁：try-lock + 退避，总上限
-// lockWait；超时映射为瞬时错误 ErrMigrationLockTimeout。
-func acquireMigrationLock(ctx context.Context, tx MigrationTx, schema string, cfg migrationConfig) error {
-	deadline := time.Now().Add(cfg.lockWait)
+// AcquireExclusiveLock 在事务 tx 内有界等待取得命名空间互斥锁：迁移执行
+// 器与管理面写操作共用同一把 advisory 锁（键含 schema，不同命名空间互不
+// 阻塞），写路径与迁移串行化。try-lock + 退避，总上限 wait。
+//
+// 返回：成功为 nil；锁语句执行错误原样上抛（调用方按各自口径分类/包装）；
+// 等待超时返回 event.ErrMigrationLockTimeout（锁即迁移锁；管理面写路径
+// 映射为 event.ErrAdminLockTimeout 上抛）；调用方取消返回 ctx.Err()。
+func AcquireExclusiveLock(ctx context.Context, tx MigrationTx, schema string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
 	backoff := 10 * time.Millisecond
 	for {
 		var ok bool
 		if err := tx.QueryRowContext(ctx, TryLockStatement, LockKey(schema)).Scan(&ok); err != nil {
-			return cfg.classifyError(PlannedStatement{}, err)
+			return err
 		}
 		if ok {
 			return nil
 		}
 		if !time.Now().Before(deadline) {
-			return fmt.Errorf("postgresschema: migrate: %w", event.ErrMigrationLockTimeout)
+			return event.ErrMigrationLockTimeout
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("postgresschema: migrate: %w", ctx.Err())
+			return ctx.Err()
 		case <-time.After(backoff):
 		}
 		if backoff < 100*time.Millisecond {
@@ -155,5 +161,21 @@ func acquireMigrationLock(ctx context.Context, tx MigrationTx, schema string, cf
 				backoff = 100 * time.Millisecond
 			}
 		}
+	}
+}
+
+// acquireMigrationLock 有界等待取事务级迁移锁：共用命名空间互斥锁实现，
+// 超时映射为瞬时错误 ErrMigrationLockTimeout；调用方取消/超时统一带
+// migrate 前缀上抛；锁语句执行错误按零值 PlannedStatement 交后端分类器。
+func acquireMigrationLock(ctx context.Context, tx MigrationTx, schema string, cfg migrationConfig) error {
+	err := AcquireExclusiveLock(ctx, tx, schema, cfg.lockWait)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, event.ErrMigrationLockTimeout),
+		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("postgresschema: migrate: %w", err)
+	default:
+		return cfg.classifyError(PlannedStatement{}, err)
 	}
 }

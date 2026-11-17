@@ -61,6 +61,47 @@
   「行不存在」同判别——保留期是重放语义的硬边界，不另设重放台账或延长
   窗口。
 
+### 5. 加固：与迁移执行共用命名空间互斥锁
+
+- TODO 契约要求「所有写操作必须持相应锁、并发调用与迁移互斥」。重放在
+  事务内先取得**与迁移执行同一把** advisory 锁
+  （`postgresschema.LockKey(schema)`，键含 schema——不同命名空间互不
+  阻塞），再执行 CAS 更新：管理写与迁移串行化（迁移的 `ADD COLUMN` 与
+  行更新不再竞争表锁），双方等待均有界（try-lock + 退避，与迁移执行器
+  共用 `postgresschema.AcquireExclusiveLock` 同一实现），管理侧超时映射
+  为新哨兵 `event.ErrAdminLockTimeout`（瞬时错误）。锁随重放事务提交/
+  回滚释放。
+- inmem 无迁移执行，以进程内容量 1 信号量为契约等价形态（对齐
+  simmigrate 执行器与 advisory 键的进程内形态），供契约套件注入验证。
+- 互斥是串行化而非拒绝：锁释放后重放照常生效。
+
+### 6. 加固：操作来源记录（观测旁路）
+
+- TODO 契约要求「记录操作来源」。沿 [ADR 0008](0008-observability.md)
+  口径补管理面观测：otel 指标 `<scope>.admin.replay`（Counter，`result`=
+  ok/no_effect/canceled/lock_timeout/error 与 `schema` 属性，发射点单一
+  在 Admin 写方法）、slog 审计日志（操作、事件 × 身份、结果；不含事件
+  payload 与 last_error 摘要——标识符 `event_id` / `consumer_type` 允许
+  入日志，失败结果附 `error.type` / `error` 分类属性）与类型化 Observer
+  事件 `AdminReplayEvent`（新增 `ObserverV3` 扩展接口——嵌入
+  `ObserverV2` 非破坏性演进，分发点类型断言；后端选项新增 `WithObserver`）。
+- 结果枚举 `no_effect` 单列：无效果与生效对运维是不同的处置信号（无效果
+  通常意味着该键已不是 failed，需先经 Inspector 查询）；观测是纯旁路，
+  失败不影响业务结果。
+- 指标属性不含事件 ID（业务标识禁入属性值），日志可含（排查需要）。
+
+### 7. 加固：错误可判别
+
+- 执行故障一律经 error 返回，不得折叠为 `ok=false`（既有决策 §3 的边界
+  强化）。错误分类与排查入口：
+  - `event.ErrAdminLockTimeout`：命名空间互斥锁等待超时，瞬时（退避后
+    重试）；检查是否有迁移执行或其他管理写操作持锁。
+  - 迁移面哨兵（`ErrInvalidSchema` / `ErrMigrationPermissionDenied` /
+    `*event.VerifyError` 等）：经首次操作的迁移模式处理产生，原样上抛，
+    处置口径与迁移一致（ADR 0007）。
+  - 连接 / 驱动故障：原样包装（`error.type` / SQLSTATE 判别），不吞掉。
+- 无效果（`ok=false` 且无错误）保持判别统一，不扩错误面（§3 决策不变）。
+
 ## 理由
 
 - **写面独立于 Driver 类型**：运行面是高频自动路径，管理面是低频人工
@@ -91,6 +132,10 @@
 - **重放前强校验事件存在**：「事件不存在但认领行存在」不是合法状态
   （认领行经 FK 随事件清理）；多一次查询不增加防护，仅增加竞态窗口，
   否决。
+- **依赖 DDL 表锁天然串行化、不显式取锁**：`ALTER TABLE` 的
+  `ACCESS EXCLUSIVE` 与行更新在存储层确实互斥，但等待无界（迁移侧
+  `lock_timeout` 会先超时回滚）、管理侧也无瞬时错误口径；显式同键
+  advisory 锁让双方等待有界、错误可判别（§5），否决。
 
 ## 后果
 
@@ -100,8 +145,19 @@
 - eventtest 新增 `RunAdminReplaySuite`：端到端重放（重放 → 认领 →
   完成）、计数归零与循环重放、done / active / retrying / 未知键的无效果
   与判别统一、`last_error` 保留与 `failed_at` 清空、并发重放恰好一次
-  生效、被接管后迟到重放不污染新属主。
-- 文档同步：design.md §5.3 重放语义与 §6 能力面表 Admin 行；重放窗口 =
-  保留窗口写入 usage.md 运维注意事项。
-- 观测埋点（操作来源记录）、与迁移的并发互斥（advisory lock）、错误可
-  诊断性强化属 Admin 加固的后续项，不在本决策范围内。
+  生效、被接管后迟到重放不污染新属主；加固后追加互斥用例（锁占用期间
+  锁超时且行不变、释放后重放生效，经 `AdminExclusionLock` 注入）与观测
+  用例（ok/no_effect/lock_timeout 结果与事件 × 身份一致，经
+  `AdminObserverSetter` 注入）——互斥与操作来源记录是契约约束，注入
+  接口缺失即 Fatal。
+- Postgres 后端重放为「事务内取锁 → CAS 更新 → 提交」三步，同一事务
+  保证锁与写原子；管理写锁等待上限独立于迁移锁等待上限
+  （`SetAdminLockWaitForTest` 供测试缩短）。管理写路径的 ensure 先于取锁
+  ——未预热实例在迁移持锁期间的首次调用可能先收到迁移面锁超时
+  （`ErrMigrationLockTimeout`），预热后落在管理面
+  `ErrAdminLockTimeout`；两者均为同键瞬时错误。
+- 加固（§5–§7）随本决策一并落地：互斥经 `postgresschema.
+  AcquireExclusiveLock` 与迁移执行器共用实现（单一锁键来源）；观测沿
+  ADR 0008 口径扩展（`ObserverV3`、`<scope>.admin.replay`）；哨兵
+  `ErrAdminLockTimeout` 进 core errors.go。鉴权仍由使用方负责；无自动
+  down；迁移侧无台账、无需 reset/stamp 入口（口径不变）。

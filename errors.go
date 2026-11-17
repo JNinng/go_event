@@ -28,6 +28,11 @@ var (
 	// 不得缓存为永久错误）。
 	ErrMigrationLockTimeout = errors.New("event: migration lock timeout")
 
+	// ErrAdminLockTimeout：管理面写操作等待命名空间互斥锁超时，属瞬时
+	// 错误（退避后重试）。锁与迁移执行共用同一把（键含 schema）——等待
+	// 对象是迁移执行或其他管理写操作；不同命名空间互不阻塞。
+	ErrAdminLockTimeout = errors.New("event: admin lock timeout")
+
 	// ErrMigrationPermissionDenied：DDL 权限不足，属永久配置错误（可能由
 	// 底层驱动的权限错误包装）。
 	ErrMigrationPermissionDenied = errors.New("event: migration permission denied")

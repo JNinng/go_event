@@ -46,10 +46,12 @@
 - **core 负责全部 driver 操作与消费编排的指标**：`publish`、`fetch`、
   `claim`、`heartbeat`、`complete`、`fail` 的计数与耗时在 core 调用边界
   计量——后端不再重复埋同口径操作指标，两套数据无增量信息。
-- **后端只负责迁移生命周期**：发射点单一，在包级 `Migrate` / `Verify`
-  （driver ensure 经 `pgSchemaManager` 调用同一函数，ensure 路径与部署期
-  显式调用全路径无重复）。迁移成功对 core 不可见（ensure 在后端内部），
-  这是后端唯一的增量观测点。
+- **后端负责迁移生命周期与管理面写操作**：迁移发射点单一，在包级
+  `Migrate` / `Verify`（driver ensure 经 `pgSchemaManager` 调用同一函数，
+  ensure 路径与部署期显式调用全路径无重复）。迁移成功对 core 不可见
+  （ensure 在后端内部），这是后端唯一的增量观测点之一；管理面写操作
+  （Admin）不经 core 编排（调用方直连后端对象），发射点同样在后端
+  （`<scope>.admin.replay`，随 Admin 加固落地，见 ADR 0010）。
 - 指标命名 `<scope>.<动作>`（计数）与 `<scope>.<动作>.duration`（耗时，
   单位 `s`）；计数单位 `1`；属性只允许枚举与标识符（`event`、`mode`、
   `result`、`identity`、`schema`），业务 payload（事件 ID、错误原文）
@@ -58,8 +60,11 @@
 ### 4. 类型化 Observer
 
 - `Observer{OnPublish, OnConsume, OnWake}` + `ObserverV2`（嵌入扩展
-  `OnLeaseAbandoned` / `OnRunnerStopped`），分发点类型断言，非破坏性演
-  进；事件按值传递，字段仅值类型/string/error。
+  `OnLeaseAbandoned` / `OnRunnerStopped`）+ `ObserverV3`（嵌入扩展
+  `OnAdminReplay`，管理面写操作），分发点类型断言，非破坏性演进；
+  事件按值传递，字段仅值类型/string/error。core 事件经 Publisher /
+  Runner 选项注入；后端管理面事件经后端 `WithObserver` 注入（未实现
+  V3 的观察者不感知管理面事件）。
 - 回调在调用方 goroutine 同步执行，库内 recover panic——观测是纯旁路，
   不改变业务执行语义。
 
@@ -78,7 +83,10 @@
 - 已知口径限制：`Claim` 无法区分「接管」与「Fail 重试」（`Attempts` 混
   合两者，见 TODO），故无接管专属指标；停机放弃租约以
   `go_event.lease.abandoned` 计数（接管前兆）。
-- `inmem` / `eventtest` 契约套件不感知可观测面；选项缺省语义不变，既有
+- `inmem` / `eventtest` 契约套件不感知 otel / slog 观测面（inmem 不引入
+  可观测依赖）；管理面 `Admin` 的类型化 Observer 事件为例外——inmem
+  Admin 分发 `AdminReplayEvent`（Observer 为 core 类型，非第三方依赖），
+  供契约套件断言操作来源记录（ADR 0010）。选项缺省语义不变，既有
   调用方零改动。
 - 测试规范：指标断言用 `sdk/metric` ManualReader 收集 `metricdata`；日
   志断言用自定义 `slog.Handler`；`go test -race ./...` 必须通过。

@@ -84,6 +84,29 @@ type StopEvent struct {
 	TimedOut bool
 }
 
+// Admin 重放结果枚举（AdminReplayEvent.Result 与后端管理面指标 result
+// 属性的取值）。ok / no_effect 之外均为失败返回：canceled 是调用方取消
+// （不记错误日志），lock_timeout 是命名空间互斥锁等待超时（瞬时，可
+// 重试），error 是其余执行故障（连接、迁移面等）。
+const (
+	AdminReplayOK          = "ok"           // 重放生效（行原为 failed 且已重放）
+	AdminReplayNoEffect    = "no_effect"    // 无效果（ok=false 且无错误）
+	AdminReplayCanceled    = "canceled"     // 调用方取消
+	AdminReplayLockTimeout = "lock_timeout" // 互斥锁等待超时（瞬时）
+	AdminReplayError       = "error"        // 执行故障
+)
+
+// AdminReplayEvent 是一次管理面重放的观测事件（ADR 0010：管理写操作记录
+// 操作来源）。EventID × ConsumerType 是重放对象（事件 × 消费者身份，仅
+// 标识不入指标属性）；Result 取 Admin 重放结果枚举值；Err 仅在失败结果
+// （canceled / lock_timeout / error）时非 nil。
+type AdminReplayEvent struct {
+	EventID      string
+	ConsumerType string
+	Result       string
+	Err          error
+}
+
 // Observer 观测旁路接口：回调在调用方 goroutine 同步执行，须微秒级返回；
 // 库内 recover panic，不改变业务语义。
 type Observer interface {
@@ -97,6 +120,13 @@ type ObserverV2 interface {
 	Observer
 	OnLeaseAbandoned(LeaseEvent)
 	OnRunnerStopped(StopEvent)
+}
+
+// ObserverV3 可选扩展接口：管理面写操作观测（嵌入 ObserverV2 同款非破坏
+// 性演进，分发点类型断言——未实现 V3 的观察者不感知管理面事件）。
+type ObserverV3 interface {
+	ObserverV2
+	OnAdminReplay(AdminReplayEvent)
 }
 
 type meterOption struct{ mp metric.MeterProvider }

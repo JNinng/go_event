@@ -15,6 +15,7 @@ import (
 	"github.com/jninng/go_event"
 	"github.com/jninng/go_event/eventtest"
 	"github.com/jninng/go_event/postgrec"
+	"github.com/jninng/go_event/postgresschema"
 )
 
 // 集成测试需真实 Postgres：设置 TEST_POSTGRES_DSN（如
@@ -124,14 +125,62 @@ func TestPostgrecInspectorSuite(t *testing.T) {
 
 // Admin 管理面重放契约（写路径由独立 Admin 承载：postgrec.NewAdmin 构造，
 // 与 Driver 共享连接与命名空间选项，不挂 Driver 类型）。重放事实经
-// ClaimStateReader 装配（SQL 适配 event_claim 行）断言。
+// ClaimStateReader 装配（SQL 适配 event_claim 行）断言；互斥与操作来源
+// 记录由 suiteAdmin 装配（套件注入点），互斥锁等待缩短为 300ms。
 func TestPostgrecAdminReplaySuite(t *testing.T) {
 	db, drv, schema := testDB(t)
-	admin := postgrec.NewAdmin(db, postgrec.WithSchema(schema))
+	defer postgrec.SetAdminLockWaitForTest(300 * time.Millisecond)()
+	admin := suiteAdmin{
+		Admin:  postgrec.NewAdmin(db, postgrec.WithSchema(schema)),
+		db:     db,
+		schema: schema,
+	}
 	eventtest.RunAdminReplaySuite(t, suiteDriver{
 		Driver: drv,
 		states: claimStateReader{db: db, schema: schema},
 	}, admin)
+}
+
+// suiteAdmin 挂接套件注入点：互斥锁占用（与迁移执行同一把 advisory 键）
+// 与观测旁路挂接（等价 Admin 实例）。
+type suiteAdmin struct {
+	event.Admin
+	db     *sql.DB
+	schema string
+}
+
+// HoldExclusionLock 以会话级 advisory 锁占用命名空间互斥锁（postgrec.Admin
+// 写路径在事务内 try-lock 同一键）：锁占用期间 Admin 写与迁移都必须
+// 有界等待。锁必须钉在专用连接上（database/sql 连接池会把连接复用回池，
+// 会话锁随连接滞留会污染后续操作），释放幂等、解锁后归还连接。
+func (s suiteAdmin) HoldExclusionLock(t *testing.T) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	holder, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire holder connection: %v", err)
+	}
+	if _, err := holder.ExecContext(ctx,
+		"SELECT pg_advisory_lock(hashtext($1))", postgresschema.LockKey(s.schema)); err != nil {
+		_ = holder.Close()
+		t.Fatalf("hold exclusion lock: %v", err)
+	}
+	var once bool
+	return func() {
+		if once {
+			return
+		}
+		once = true
+		// 解锁与归还在同一清理：先解锁再 Close，避免会话锁滞留连接池。
+		_, _ = holder.ExecContext(context.Background(),
+			"SELECT pg_advisory_unlock(hashtext($1))", postgresschema.LockKey(s.schema))
+		_ = holder.Close()
+	}
+}
+
+// WithReplayObserver 返回挂接观测旁路的等价 Admin（原实例不变更）。
+func (s suiteAdmin) WithReplayObserver(o event.Observer) event.Admin {
+	return postgrec.NewAdmin(s.db, postgrec.WithSchema(s.schema), postgrec.WithObserver(o))
 }
 
 // 保留窗口惰性清理契约：每用例独立 schema + 短保留窗口的全新 Driver

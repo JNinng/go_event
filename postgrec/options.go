@@ -30,9 +30,10 @@ type config struct {
 	mode      event.MigrateMode
 	modeSet   bool
 
-	logger *slog.Logger         // 迁移生命周期日志（缺省构造期快照 slog.Default()）
+	logger *slog.Logger         // 迁移/管理面生命周期日志（缺省构造期快照 slog.Default()）
 	mp     metric.MeterProvider // nil = 未注入（newConfig 快照全局，未装配时即 noop）
 	scope  string
+	obs    event.Observer // 管理面观测旁路（缺省无观察者）
 }
 
 // WithSchema 表所在 schema（缺省 public）。
@@ -90,4 +91,12 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 // 模块名 postgrec。部署期决策——改名会使仪表盘口径漂移。
 func WithScopeName(scope string) Option {
 	return func(c *config) { c.scope = scope }
+}
+
+// WithObserver 注入类型化观测旁路（缺省无观察者）：当前仅管理面 Admin
+// 发射观测事件（AdminReplayEvent，经 ObserverV3 分发；未实现 V3 的观察者
+// 不感知）。回调在调用方 goroutine 同步执行、须微秒级返回，库内 recover
+// panic；观测是纯旁路，不改变业务语义。
+func WithObserver(o event.Observer) Option {
+	return func(c *config) { c.obs = o }
 }

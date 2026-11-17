@@ -73,10 +73,12 @@ func TestInmemInspectorSuite(t *testing.T) {
 }
 
 // Admin 管理面重放契约：写路径由独立 Admin 承载（NewAdmin 构造，与 Driver
-// 共享同一份内存状态，不挂 Driver 类型）。
+// 共享同一份内存状态，不挂 Driver 类型）。互斥锁等待缩短为 300ms（套件
+// 的锁超时用例不需要真实等待上限）。
 func TestInmemAdminReplaySuite(t *testing.T) {
 	d := inmem.New()
-	eventtest.RunAdminReplaySuite(t, d, inmem.NewAdmin(d))
+	eventtest.RunAdminReplaySuite(t, d,
+		inmem.NewAdmin(d, inmem.WithAdminLockWait(300*time.Millisecond)))
 }
 
 // NewAdmin 传入非本包构造的 Driver 视为装配错误（panic）。

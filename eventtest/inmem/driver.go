@@ -4,7 +4,9 @@
 // NewInspector 构造或对 Driver 类型断言探测）：查询口径与 Postgres
 // 后端一致，返回落库事实、不做租约过期推断。管理写路径由独立 Admin
 // 承载（NewAdmin，与 Driver 共享同一份内存状态，不挂 Driver 类型）：
-// failed 事件手工重放，语义与 Postgres 后端一致。
+// failed 事件手工重放，语义与 Postgres 后端一致——写路径持与迁移执行
+// 等价的进程内互斥锁（本进程无迁移执行，契约等价形态）并发射类型化
+// Observer 事件（进程内不接 otel / slog）。
 package inmem
 
 import (
@@ -42,6 +44,7 @@ func newDriver(opts ...Option) *Driver {
 	d := &Driver{
 		events: make(map[string]*storedEvent),
 		claims: make(map[claimKey]*storedClaim),
+		excl:   make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -89,6 +92,11 @@ type Driver struct {
 	position    uint64
 	retention   time.Duration
 	lastCleanup time.Time
+
+	// excl 是管理面写路径与迁移执行的进程内互斥锁（容量 1 信号量，对齐
+	// simmigrate 迁移执行器与 Postgres advisory 键的进程内等价形态）：
+	// 本进程无迁移执行，契约等价锁供 Admin 写路径持锁与套件注入验证。
+	excl chan struct{}
 }
 
 // Append 写入事件：同 ID 首写为准、不覆盖不重投；运行时注入字段不落库（保持零值）。

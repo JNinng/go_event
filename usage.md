@@ -515,7 +515,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
 
 只读查询面 `event.Inspector`（可选接口，pgxc / postgrec 均已提供）直接查询这两张表：状态与分档计数按 `event_claim` 行的 `status` 列与「无认领行」分档，failed 列表取 `status='failed'` 行并随行返回 `last_error` / `failed_at`——查询与落库事实严格对齐，见 [§11](#11-运维注意事项) 的「failed 事件查询」。`NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL，只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
 
-管理写路径由独立 `event.Admin`（可选接口，pgxc / postgrec / inmem 均已提供）承载：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领，写法与 `event_claim` 落库事实对齐（置 `retrying`、`claim_count=0`、清租约、`failed_at=NULL`、`last_error` 保留），见 [§11](#11-运维注意事项) 的「failed 手工重放（Admin）」。`NewAdmin` 与 `NewDriver` 共享连接与命名空间选项，写路径不经 Driver 类型暴露、只经该构造获得，鉴权由使用方负责。
+管理写路径由独立 `event.Admin`（可选接口，pgxc / postgrec / inmem 均已提供）承载：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领，写法与 `event_claim` 落库事实对齐（置 `retrying`、`claim_count=0`、清租约、`failed_at=NULL`、`last_error` 保留），见 [§11](#11-运维注意事项) 的「failed 手工重放（Admin）」。`NewAdmin` 与 `NewDriver` 共享连接与命名空间选项，写路径不经 Driver 类型暴露、只经该构造获得，鉴权由使用方负责。写路径在事务内持与迁移执行共用的命名空间互斥锁（与迁移串行化，等待有界），并发射操作来源观测（指标 / 日志 / Observer 事件，见 [§13](#13-可观测otel--slog)）。
 
 ### 8.4 迁移模式与权限
 
@@ -634,7 +634,9 @@ func TestMyBackendRetention(t *testing.T) {
 
 提供只读查询面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunInspectorSuite`：套件对传入的 Driver 做 `event.Inspector` 类型断言探测，失败即 Fatal——查询结果与 Claim/Fail/Complete 落库事实的比对是查询面契约的一部分。
 
-提供管理面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunAdminReplaySuite(t, d, admin)`：管理写路径不经 Driver 类型暴露，`admin` 由后端 `NewAdmin` 构造传入（与 `d` 共享状态/连接），缺失即 Fatal——重放语义（仅 failed 可重放、计数归零、判别统一、`last_error` 保留 / `failed_at` 清空、并发 CAS 防护）是管理面契约的一部分。
+提供管理面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunAdminReplaySuite(t, d, admin)`：管理写路径不经 Driver 类型暴露，`admin` 由后端 `NewAdmin` 构造传入（与 `d` 共享状态/连接），缺失即 Fatal——重放语义（仅 failed 可重放、计数归零、判别统一、`last_error` 保留 / `failed_at` 清空、并发 CAS 防护）是管理面契约的一部分。互斥与操作来源记录同样是契约约束，套件经两个注入接口断言、缺失即 Fatal：
+- `eventtest.AdminExclusionLock`（`HoldExclusionLock`）：后端测试装配从外部占用与 Admin 写互斥的命名空间锁（与迁移执行同一把——Postgres 后端为迁移 advisory 键，inmem 为进程内等价信号量），套件断言锁占用期间重放返回 `ErrAdminLockTimeout` 且行不变、释放后重放生效；
+- `eventtest.AdminObserverSetter`（`WithReplayObserver`）：返回挂接观测旁路的等价 Admin 实例，套件断言 `event.AdminReplayEvent` 的结果枚举与事件 × 身份。
 
 迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
@@ -699,9 +701,10 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithSchema(s)` | 表所在 schema | `public` |
 | `WithRetention(d)` | 保留窗口 | 7 天 |
 | `WithMigrateMode(m)` | 运行面迁移模式：`Create` / `Verify` / `None`（只对 `NewDriver` 有意义） | `Create` |
-| `WithLogger(l)` | 迁移生命周期日志 | `slog.Default()` |
-| `WithMeterProvider(mp)` | 迁移指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
-| `WithScopeName(s)` | 迁移指标 scope 与名前缀 | 模块名（`pgxc` / `postgrec`） |
+| `WithLogger(l)` | 迁移与管理面生命周期日志 | `slog.Default()` |
+| `WithMeterProvider(mp)` | 迁移与管理面指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
+| `WithScopeName(s)` | 迁移与管理面指标 scope 与名前缀 | 模块名（`pgxc` / `postgrec`） |
+| `WithObserver(o)` | 类型化观测旁路（当前仅 Admin 发射 `AdminReplayEvent`） | 无 |
 
 ## 11. 运维注意事项
 
@@ -727,9 +730,12 @@ func TestMyBackendRetention(t *testing.T) {
 - **failed 手工重放（Admin）**：管理写路径由独立 `event.Admin` 承载（pgxc / postgrec / inmem 均提供 `NewAdmin`，与 Driver 共享连接与命名空间选项；不进 Driver、不挂后端 Driver 类型——「非管理面路径无法调用」由类型形态保证），当前唯一操作 `ReplayFailed(ctx, eventID, consumerType, now)` 把（事件 × 消费者身份）的 failed 终态行重新置为可认领：
   - 仅 `status='failed'` 的行可重放：`done` 幂等不可逆、不重放；`active`（租约活跃）与 `retrying`（自动重试退避中）拒绝且不改动；行不存在（事件未知、超保留窗口被清理、该身份尚无认领行）与非 failed 行判别统一——返回 `ok=false` 且无错误，需要区分原因先经 `Inspector.ClaimState` 查询；执行故障经 `error` 返回。
   - 重放写入：置 `retrying`、`claim_count=0`（此后 Fail 的重试计数从合法范围重新开始）、清 `lease_token`、`lease_until` 置为重放时刻（原租约凭证失效）、`next_eligible_at=now`（立即可认领、不做退避）、`failed_at=NULL`、`last_error` 保留（排障历史，直到下一次终态失败覆盖）。
-  - 并发防护是单条条件更新（CAS，仅命中 `status='failed'`）：并发重放恰好一次生效；已被重新认领（接管）或已完成的行不受迟到重放影响。
+  - 并发防护是单条条件更新（CAS，仅命中 `status='failed'`）：并发重放恰好一次生效；已被重新认领（接管）或已完成的行不受迟到重放影响。**行归属校验即 CAS 本身**：以（事件 × 消费者身份）主键定位唯一认领行、以 `status='failed'` 限定可改写集合，命名空间由构造期固定并校验的 schema 限定——不满足即不归属（不命中、`ok=false`），不产生跨行 / 跨命名空间改写。
+  - **与迁移互斥**：重放在事务内持与迁移执行相同的命名空间互斥锁（键含 schema，不同 schema 互不阻塞）——迁移执行期间发起的重放有界等待，超时返回 `event.ErrAdminLockTimeout`（瞬时错误，退避后重试）；互斥是串行化而非拒绝，锁释放后重放照常生效。
+  - **操作来源记录**：每次重放发射 otel 指标 `<scope>.admin.replay`（`result` 属性，见 [§13.2](#132-指标口径)）、一行 slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附 error.type / error 分类属性）与 `event.AdminReplayEvent` 观测事件（`WithObserver` 注入、`ObserverV3` 分发）。观测均为旁路，失败不影响业务结果。
+  - **错误分类与排查入口**：`event.ErrAdminLockTimeout`（锁等待超时，瞬时——检查是否有迁移执行或长事务持锁）；迁移面哨兵（`ErrInvalidSchema` / `ErrMigrationPermissionDenied` / `*event.VerifyError` 等，经首次操作的迁移模式处理产生，处置见 [§8.4](#84-迁移模式与权限)）；连接 / 驱动故障（原样包装，以 `error.type` / SQLSTATE 判别后按驱动语义处置）。执行故障一律 `error` 返回，不会折叠为 `ok=false`。
   - **重放窗口 = 保留窗口**：超窗行已被惰性清理删除，重放该键即 `ok=false`——发现 failed 后应在保留窗口内处置；窗口配置见 [§8.5](#85-保留窗口与惰性清理)。
-  - 鉴权与操作审计由使用方负责：管理面对象只应授予运维角色。
+  - 鉴权与操作审计由使用方负责：管理面对象只应授予运维角色。管理面只提供上行写操作，**不提供自动 down**；迁移侧无台账，无需 reset/stamp 入口，schema 异常经迁移重跑或人工修复（[§8.4](#84-迁移模式与权限)、[ADR 0007](docs/adr/0007-migration-mode-and-protocol.md)）。
 
 ## 12. 错误与排查
 
@@ -746,6 +752,7 @@ func TestMyBackendRetention(t *testing.T) {
 | `event.ErrMigrationUnsupported` | 锁能力为无（`LockNone`），`Create` 不支持自动迁移 | 改用 `Verify`/`None`，由部署流程建表 |
 | `event.ErrMigrateModeUnsupported` | `WithMigrateMode` 传给 `Migrate`，或模式取值非法 | 该选项只传给 `NewDriver`；检查模式取值 |
 | `event.ErrInvalidSchema` | schema 名非法（只允许 `^[A-Za-z_][A-Za-z0-9_]*$`） | 修正 schema 名；非法名不会进入任何 DML/DDL |
+| `event.ErrAdminLockTimeout` | Admin 写操作等待命名空间互斥锁超时（瞬时错误；锁与迁移执行共用） | 退避后重试；检查是否有迁移执行或其他管理写操作持锁（不同 schema 互不阻塞） |
 
 `Verify` 发现问题时返回类型化错误 `*event.VerifyError`，可用 `errors.As` 取回后读取 `Report`；它不是哨兵错误。
 
@@ -832,20 +839,29 @@ runner := event.NewRunner(drv,
   `heartbeat` / `complete` / `fail` 计数与耗时、`claim.granted`、
   `lease.abandoned`、`consume` / `handle.duration`、`wake`——全部在 core
   调用边界计量，后端不重复埋同口径操作指标。
-- **后端**（scope 缺省模块名）：仅迁移生命周期 `migrate` /
+- **后端**（scope 缺省模块名）：迁移生命周期 `migrate` /
   `migrate.duration`，发射点在包级 `Migrate` / `Verify`（driver ensure 同
   路径，无重复计量）；`result` 区分
   `ok` / `canceled` / `lock_timeout` / `permission_denied` / `verify_conflict` /
-  `permanent` / `transient`。
+  `permanent` / `transient`。管理面写操作 `admin.replay`（Counter），发射点
+  在 Admin 写方法；`result` 区分
+  `ok` / `no_effect` / `canceled` / `lock_timeout` / `error`（与
+  `event.AdminReplayEvent.Result` 同枚举），另带 `schema` 属性。
 - 属性只含枚举与标识符（`event` / `mode` / `result` / `identity` /
-  `schema`），事件 ID 与错误原文不入属性；Prometheus 导出侧自动做
+  `schema`），事件 ID 与错误原文不入属性（管理面 slog 审计日志可含
+  `event_id` / `consumer_type` 标识——标识符允许入日志；不含事件 payload
+  与 last_error 摘要，失败结果附 error.type / error 分类属性）；Prometheus
+  导出侧自动做
   `.`→`_` 并按单位追加 `_total` / `_seconds`。
 
 ### 13.3 Observer 旁路
 
 需要进程内联动（非指标场景）时注入 `Observer`：回调在调用方 goroutine 同
 步执行、须微秒级返回，库内 recover panic；`ObserverV2` 增加停机放弃租约
-与停机完成事件（非破坏性扩展）。
+与停机完成事件，`ObserverV3` 增加管理面重放事件（均为非破坏性扩展，
+分发点类型断言——未实现新版本接口的观察者不感知对应事件）。后端管理面
+的观测经后端构造选项注入（`pgxc.WithObserver` / `postgrec.WithObserver`，
+当前仅 `Admin` 发射事件）。
 
 ```go
 // 实现 Observer（三个方法）即满足 V2；只需实现关心的额外事件，
@@ -863,6 +879,10 @@ func (slaObserver) OnLeaseAbandoned(e event.LeaseEvent) {
     slog.Warn("lease abandoned on shutdown", "event", e.Event)
 }
 func (slaObserver) OnRunnerStopped(event.StopEvent) {}
+func (slaObserver) OnAdminReplay(e event.AdminReplayEvent) {
+    slog.Info("admin replay", "event_id", e.EventID,
+        "consumer_type", e.ConsumerType, "result", e.Result)
+}
 ```
 
 ### 13.4 测试断言

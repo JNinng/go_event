@@ -408,6 +408,9 @@ var (
     ErrMigrationLockTimeout      // 等待迁移锁超时，属瞬时错误（退避后重试）
     ErrMigrationPermissionDenied // DDL 权限不足，属永久配置错误
     ErrInvalidSchema             // schema 名非法（只允许 ^[A-Za-z_][A-Za-z0-9_]*$）
+
+    // ---- 管理面（ADR 0010） ----
+    ErrAdminLockTimeout // Admin 写操作等待命名空间互斥锁超时（锁与迁移共用），属瞬时错误
 )
 
 // IsPermanentMigrationError 报告迁移失败是否属永久配置错误：*VerifyError、
@@ -592,16 +595,81 @@ type ObserverV2 interface { // 可选扩展，分发点类型断言
     OnRunnerStopped(StopEvent)   // TimedOut=true 表示等待在途超过调用方 ctx
 }
 
+type ObserverV3 interface { // 可选扩展（管理面写操作），分发点类型断言
+    ObserverV2
+    OnAdminReplay(AdminReplayEvent) // 管理面重放（操作来源记录，ADR 0010）
+}
+
 type PublishEvent struct{ Event, Result string; Err error }
 type ConsumeEvent struct{ Mode, Event, Result string; Attempts int; Err error }
 type WakeEvent struct{ Event string; Notified, Dropped int }
 type LeaseEvent struct{ Event string }
 type StopEvent struct{ TimedOut bool }
+
+// AdminReplayEvent 是一次管理面重放的观测事件（后端 Admin 经 WithObserver
+// 注入发射；EventID × ConsumerType 为重放对象标识）。
+type AdminReplayEvent struct {
+    EventID      string
+    ConsumerType string
+    Result       string // Admin 重放结果枚举（见下）
+    Err          error  // 仅失败结果（canceled / lock_timeout / error）非 nil
+}
+
+// Admin 重放结果枚举（AdminReplayEvent.Result 与后端管理面指标 result
+// 属性取值）：
+const (
+    AdminReplayOK          = "ok"           // 重放生效（行原为 failed 且已重放）
+    AdminReplayNoEffect    = "no_effect"    // 无效果（ok=false 且无错误）
+    AdminReplayCanceled    = "canceled"     // 调用方取消
+    AdminReplayLockTimeout = "lock_timeout" // 互斥锁等待超时（瞬时）
+    AdminReplayError       = "error"        // 执行故障
+)
 ```
 
 `Result` 枚举：`ok` / `invalid_id` / `encode_error` / `append_error`（发布）；
 `ok` / `handler_error` / `handler_panic`（消费）；`error` / `canceled`（轮询）。
 `Mode`：`broadcast` / `claim`。
+
+**指标清单**（`<scope>.<动作>`；计数单位 `1`，耗时直方图单位 `s`；Prometheus
+导出侧自动转 `.`→`_` 并按单位追加 `_total`/`_seconds`）：
+
+| 指标 | 类型 | 属性 |
+| --- | --- | --- |
+| `go_event.publish` | Counter | `event`, `result` |
+| `go_event.publish.duration` | Histogram | `result`（仅 Append 已尝试时记录） |
+| `go_event.fetch` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
+| `go_event.claim` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
+| `go_event.claim.granted` | Counter | `event`, `identity` |
+| `go_event.lease.abandoned` | Counter | `event` |
+| `go_event.consume` | Counter | `mode`, `event`, `result` |
+| `go_event.handle.duration` | Histogram | `mode`, `event`, `result` |
+| `go_event.heartbeat` / `complete` / `fail` | Counter | `result`=ok/error |
+| `go_event.wake` | Counter | `result`=sent/dropped |
+
+属性值仅枚举与标识符（`identity` 为消费者身份，多实例区分维度）；业务
+payload（事件 ID、错误原文）不入属性。日志仅低频生命周期事件
+（`runner started/stopped`、`stopping, lease released for takeover` 等），
+错误经 `error.type` + `error` 字符串化上报。
+
+后端（pgxc / postgrec）埋迁移生命周期与管理面写操作，发射点单一
+（包级 `Migrate` / `Verify`，driver ensure 与 Admin 写方法同路径无重复计量）：
+
+```go
+func WithLogger(l *slog.Logger) Option          // 缺省 slog.Default()
+func WithMeterProvider(mp metric.MeterProvider) Option // 缺省 otel.GetMeterProvider()
+func WithScopeName(scope string) Option         // 缺省模块名
+func WithObserver(o Observer) Option            // 缺省无观察者（当前仅 Admin 发射）
+
+// 迁移指标：<scope>.migrate（Counter）+ <scope>.migrate.duration（Histogram），
+// 属性 result=ok/canceled/lock_timeout/permission_denied/verify_conflict/
+// permanent/transient 与 schema；Migrate 成功打 Info 日志「migration applied」
+//（schema、mode、duration_seconds）。
+//
+// 管理面指标：<scope>.admin.replay（Counter），属性 result=ok/no_effect/
+// canceled/lock_timeout/error 与 schema；每次重放打一行 slog 审计日志
+// 「admin replay」（op、schema、event_id、consumer_type、result；失败加
+// error.type + error）并发 AdminReplayEvent（ObserverV3 分发）。
+```
 
 ### 2.10 Inspector（只读查询面，可选）
 
@@ -699,41 +767,6 @@ type FailedEvent struct {
 }
 ```
 
-**指标清单**（`<scope>.<动作>`；计数单位 `1`，耗时直方图单位 `s`；Prometheus
-导出侧自动转 `.`→`_` 并按单位追加 `_total`/`_seconds`）：
-
-| 指标 | 类型 | 属性 |
-| --- | --- | --- |
-| `go_event.publish` | Counter | `event`, `result` |
-| `go_event.publish.duration` | Histogram | `result`（仅 Append 已尝试时记录） |
-| `go_event.fetch` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
-| `go_event.claim` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
-| `go_event.claim.granted` | Counter | `event`, `identity` |
-| `go_event.lease.abandoned` | Counter | `event` |
-| `go_event.consume` | Counter | `mode`, `event`, `result` |
-| `go_event.handle.duration` | Histogram | `mode`, `event`, `result` |
-| `go_event.heartbeat` / `complete` / `fail` | Counter | `result`=ok/error |
-| `go_event.wake` | Counter | `result`=sent/dropped |
-
-属性值仅枚举与标识符（`identity` 为消费者身份，多实例区分维度）；业务
-payload（事件 ID、错误原文）不入属性。日志仅低频生命周期事件
-（`runner started/stopped`、`stopping, lease released for takeover` 等），
-错误经 `error.type` + `error` 字符串化上报。
-
-后端（pgxc / postgrec）只埋迁移生命周期，发射点单一（包级 `Migrate` /
-`Verify`，driver ensure 同路径无重复计量）：
-
-```go
-func WithLogger(l *slog.Logger) Option          // 缺省 slog.Default()
-func WithMeterProvider(mp metric.MeterProvider) Option // 缺省 otel.GetMeterProvider()
-func WithScopeName(scope string) Option         // 缺省模块名
-
-// 指标：<scope>.migrate（Counter）+ <scope>.migrate.duration（Histogram），
-// 属性 result=ok/canceled/lock_timeout/permission_denied/verify_conflict/
-// permanent/transient 与 schema；Migrate 成功打 Info 日志「migration applied」
-//（schema、mode、duration_seconds）。
-```
-
 ### 2.11 Admin（管理面写接口，可选）
 
 管理面写操作与运行面分离（design.md §6）：`Admin` 不进入 `Driver` 契约，
@@ -741,6 +774,30 @@ func WithScopeName(scope string) Option         // 缺省模块名
 路径只能经后端 `NewAdmin` 显式构造（与 `Driver` 共享连接与命名空间选项），
 「非管理面路径无法调用」由类型形态保证。鉴权与操作审计由使用方负责。
 形态与重放语义见 [ADR 0010](adr/0010-admin-write-plane-and-replay.md)。
+
+写路径约束（契约硬约束）：
+
+- **持锁**：写操作在事务内持有与迁移执行相同的命名空间互斥锁
+  （`postgresschema.LockKey(schema)` 的 advisory 键，键含 schema——不同
+  命名空间互不阻塞），与迁移执行串行化；等待有界（try-lock + 退避，与
+  迁移执行器同一实现），超时返回 `ErrAdminLockTimeout`（瞬时错误）。
+- **校验对象/行归属**：归属校验即单条条件更新（CAS）本身——以（事件 ×
+  消费者身份）主键定位唯一认领行、以 `status='failed'` 限定可改写集合，
+  命名空间由构造期固定并校验的 schema 限定；不满足即不归属（不命中、
+  `ok=false`），不产生跨行 / 跨命名空间改写。
+- **记录操作来源**：每次调用发射 otel 指标 `<scope>.admin.replay`
+  （§2.9）、slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与
+  last_error 摘要，失败结果附 error.type / error 分类属性）与类型化
+  Observer 事件 `AdminReplayEvent`（经 `WithObserver` 注入、`ObserverV3`
+  分发）。观测均为旁路，失败不影响业务结果。
+- **错误可判别**：`ErrAdminLockTimeout`（锁等待超时，瞬时）；
+  迁移面哨兵（`ErrInvalidSchema`、`ErrMigrationPermissionDenied`、
+  `*VerifyError` 等，经首次操作的迁移模式处理产生，原样上抛）；
+  连接 / 驱动故障（原样包装，以 `error.type` / SQLSTATE 判别）。
+  执行故障一律经 error 返回，不得折叠为 `ok=false`。
+- **无自动 down、迁移侧无台账**：管理面只提供上行写操作，不提供任何
+  down / 回滚入口；迁移侧无执行台账，无需 reset / stamp 入口，schema
+  异常经迁移重跑或人工修复（ADR 0007）。
 
 ```go
 // Admin 管理面写操作（可选接口）：仅处置认领消费的 failed 终态行——
@@ -793,7 +850,8 @@ func NewInspector(db *sql.DB, opts ...Option) event.Inspector
 
 // NewAdmin 构造管理面 event.Admin（§2.11）：与 NewDriver 共享连接与命名
 // 空间选项（同一 schema、同一迁移模式语义）。管理写路径不经 Driver 类型
-// 暴露——Admin 只经本构造获得；鉴权由使用方负责。
+// 暴露——Admin 只经本构造获得；鉴权由使用方负责。写路径持与迁移执行
+// 共用的命名空间互斥锁并发射管理面观测（§2.9/§2.11 约束）。
 func NewAdmin(db *sql.DB, opts ...Option) event.Admin
 
 // Migrate 幂等应用版本计划（Create 语义）：单事务内取迁移锁、做接管校验
@@ -837,7 +895,8 @@ func NewInspector(pool *pgxpool.Pool, opts ...Option) event.Inspector
 
 // NewAdmin 构造管理面 event.Admin（§2.11）：与 NewDriver 共享连接与命名
 // 空间选项。管理写路径不经 Driver 类型暴露——Admin 只经本构造获得；
-// 鉴权由使用方负责。
+// 鉴权由使用方负责。写路径持与迁移执行共用的命名空间互斥锁并发射
+// 管理面观测（§2.9/§2.11 约束）。
 func NewAdmin(pool *pgxpool.Pool, opts ...Option) event.Admin
 
 // Migrate 幂等应用版本计划（Create 语义），与 postgrec.Migrate 相同的
@@ -872,6 +931,10 @@ func WithRetention(d time.Duration) Option
 // 不校验。该选项只对 NewDriver 有意义，显式传给 Migrate 返回
 // ErrMigrateModeUnsupported。
 func WithMigrateMode(m event.MigrateMode) Option
+
+// WithObserver 注入类型化观测旁路（缺省无观察者）：当前仅管理面 Admin
+// 发射观测事件（AdminReplayEvent，经 ObserverV3 分发）。
+func WithObserver(o event.Observer) Option
 ```
 
 迁移相关语义：
@@ -943,9 +1006,14 @@ func RunInspectorSuite(t *testing.T, d event.Driver)
 // §9.2、ADR 0010）：重放后可再认领并完成、重试计数归零与循环重放、
 // done/active/retrying/未知键无效果且判别统一、last_error 保留与
 // failed_at 清空（经 ClaimStateReader 断言）、并发重放恰好一次生效、
-// 被接管后迟到重放不污染新属主行。admin 须非空（管理写路径不经 Driver
-// 类型暴露，只能由后端 NewAdmin 构造获得；缺失即 Fatal——提供管理面的
-// 后端必须全过本套件）；d 须实现 ClaimStateReader。
+// 被接管后迟到重放不污染新属主行、互斥锁占用期间锁超时且行不变/
+// 释放后重放生效、canceled 结果判别、观测事件结果与事件 × 身份一致。
+// admin 须非空（管理写路径不经 Driver 类型暴露，只能由后端 NewAdmin
+// 构造获得），且 admin 须实现 AdminExclusionLock（HoldExclusionLock：
+// 从外部占用与 Admin 写互斥的命名空间锁）与 AdminObserverSetter
+// （WithReplayObserver：返回挂接观测旁路的等价 Admin）两个注入接口
+// ——互斥与操作来源记录是管理面契约约束，任一缺失即 Fatal；d 须实现
+// ClaimStateReader。
 func RunAdminReplaySuite(t *testing.T, d event.Driver, admin event.Admin)
 
 // RunMigrationSuite 运行迁移契约测试。suite 本身不读环境变量；门控

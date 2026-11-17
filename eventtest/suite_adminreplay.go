@@ -1,6 +1,8 @@
 package eventtest
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -20,14 +22,37 @@ import (
 //     经 ClaimStateReader 断言。
 //   - 并发防护：单条条件更新（CAS，仅命中 status='failed'）——并发重放
 //     恰好一次生效。
+//   - 互斥（契约约束「所有写操作必须持相应锁」）：写路径持与迁移执行相同
+//     的命名空间互斥锁——锁占用期间有界等待并返回 ErrAdminLockTimeout
+//     （瞬时）、行不被改写，锁释放后重放生效。
+//   - 操作来源记录（观测旁路）：每次重放发射 AdminReplayEvent（ok /
+//     no_effect / lock_timeout 结果），事件 × 身份字段与调用一致。
 //
 // 重放窗口 = 保留窗口：超窗行被清理后与「行不存在」同判别（清理资格已由
 // RunRetentionSuite 契约约束，此处不重复）。
 
+// AdminExclusionLock 是互斥验证的注入接口（沿迁移套件 LockObserver 等可选
+// 接口先例）：后端测试装配从外部占用与 Admin 写互斥的命名空间锁（与迁移
+// 执行同一把锁——Postgres 后端为迁移 advisory 键，inmem 为进程内等价
+// 信号量）。互斥是管理面契约约束，缺失即 Fatal。
+type AdminExclusionLock interface {
+	// HoldExclusionLock 占用互斥锁并返回释放函数（释放须幂等）。
+	HoldExclusionLock(t *testing.T) (release func())
+}
+
+// AdminObserverSetter 是操作来源记录验证的注入接口：返回挂接观测旁路的
+// 等价 Admin 实例（原实例不变更）。观测事件是管理面契约约束（记录操作
+// 来源），缺失即 Fatal。
+type AdminObserverSetter interface {
+	WithReplayObserver(o event.Observer) event.Admin
+}
+
 // RunAdminReplaySuite 运行管理面 Admin 重放契约测试。admin 须非空——
 // 管理写路径不经 Driver 类型暴露，只能由后端 NewAdmin 构造获得（缺失即
 // Fatal，沿 ClaimStateReader/RunInspectorSuite 先例：提供该能力的后端
-// 必须全过本套件）。d 须实现 ClaimStateReader（重放事实断言的数据源）。
+// 必须全过本套件）。d 须实现 ClaimStateReader（重放事实断言的数据源）；
+// admin 须实现 AdminExclusionLock 与 AdminObserverSetter（互斥与操作来源
+// 记录是管理面契约约束）。
 func RunAdminReplaySuite(t *testing.T, d event.Driver, admin event.Admin) {
 	if admin == nil {
 		t.Fatalf("admin is nil: the management write surface is a separate optional " +
@@ -37,6 +62,18 @@ func RunAdminReplaySuite(t *testing.T, d event.Driver, admin event.Admin) {
 	if !ok {
 		t.Fatalf("driver %T must implement ClaimStateReader: the replay facts "+
 			"(last_error preserved, failed_at cleared) are asserted against claim-row facts", d)
+	}
+	excl, ok := admin.(AdminExclusionLock)
+	if !ok {
+		t.Fatalf("admin %T must implement eventtest.AdminExclusionLock: mutual "+
+			"exclusion with migration execution is a hard constraint of the "+
+			"management write surface (all writes hold the corresponding lock)", admin)
+	}
+	obsSetter, ok := admin.(AdminObserverSetter)
+	if !ok {
+		t.Fatalf("admin %T must implement eventtest.AdminObserverSetter: recording "+
+			"the operation source (typed Observer events) is a hard constraint of "+
+			"the management write surface", admin)
 	}
 
 	// ---- 重放后回到正常消费路径 ----
@@ -56,6 +93,17 @@ func RunAdminReplaySuite(t *testing.T, d event.Driver, admin event.Admin) {
 
 	// ---- 并发防护（CAS：仅命中 status='failed'）----
 	t.Run("ConcurrentReplays_FailedRow_ExactlyOneTakesEffect", func(t *testing.T) { testAdminReplayConcurrentExactlyOne(t, d, admin) })
+
+	// ---- 互斥（与迁移执行共用命名空间锁）----
+	t.Run("ExclusionLockHeld_AdminReplay_LockTimeoutRowUnchanged", func(t *testing.T) { testAdminReplayExclusionLockHeld(t, d, admin, rd, excl) })
+	t.Run("ExclusionLockReleased_AdminReplay_ReplayTakesEffect", func(t *testing.T) { testAdminReplayExclusionLockReleased(t, d, admin, rd, excl) })
+
+	// ---- 操作来源记录（类型化观测旁路）----
+	t.Run("TerminalFailedRow_AdminReplay_EmitsReplayedThenNoEffect", func(t *testing.T) { testAdminReplayObservation(t, d, admin, obsSetter) })
+	t.Run("ExclusionLockHeld_AdminReplay_ObservesLockTimeout", func(t *testing.T) { testAdminReplayObservesLockTimeout(t, d, admin, rd, excl, obsSetter) })
+
+	// ---- 取消路径（canceled 结果枚举）----
+	t.Run("CanceledContext_AdminReplay_CanceledResultRowUntouched", func(t *testing.T) { testAdminReplayCanceledContext(t, d, admin, rd, obsSetter) })
 }
 
 // replay 重放并断言无执行故障：执行故障不得折叠为「无效果」，立即失败于
@@ -377,5 +425,215 @@ func testAdminReplayConcurrentExactlyOne(t *testing.T, d event.Driver, admin eve
 	ls := claim(t, d, typ, "arp", time.Minute, replayAt)
 	if len(ls) != 1 || ls[0].Attempts != 1 {
 		t.Fatalf("claim after concurrent replays = %+v, want single lease with Attempts 1", ls)
+	}
+}
+
+// ---- 互斥（与迁移执行共用命名空间锁）----
+
+// warmAdmin 预热 Admin 实例的 ensure（首次操作按迁移模式处理持久结构）：
+// 互斥断言针对管理写路径的锁等待，而非 ensure 内迁移的锁等待。对尚未
+// 落行的键重放（无效果、无错误）即完成预热。
+func warmAdmin(t *testing.T, admin event.Admin, eventID, consumerType string) {
+	t.Helper()
+	ok, err := admin.ReplayFailed(t.Context(), eventID, consumerType, baseNow)
+	if ok || err != nil {
+		t.Fatalf("warm-up replay (%s, %s) = (%v, %v), want (false, nil)",
+			eventID, consumerType, ok, err)
+	}
+}
+
+// 锁占用期间：重放有界等待后以 ErrAdminLockTimeout（瞬时）失败，行不被
+// 改写——写操作持锁的互斥语义（Postgres 后端锁占用方为迁移执行，inmem
+// 为进程内等价信号量，套件经 AdminExclusionLock 注入占用）。
+func testAdminReplayExclusionLockHeld(t *testing.T, d event.Driver, admin event.Admin, rd ClaimStateReader, excl AdminExclusionLock) {
+	typ := t.Name()
+	warmAdmin(t, admin, "ar-x1", "arx")
+	adminFailedFixture(t, d, "ar-x1", typ, "arx")
+
+	release := excl.HoldExclusionLock(t)
+	t.Cleanup(release)
+
+	ok, err := admin.ReplayFailed(t.Context(), "ar-x1", "arx", baseNow.Add(time.Minute))
+	if ok {
+		t.Fatal("replay while exclusion lock held must not take effect, got ok=true")
+	}
+	if !errors.Is(err, event.ErrAdminLockTimeout) {
+		t.Fatalf("replay while lock held = %v, want transient ErrAdminLockTimeout", err)
+	}
+	st := readClaimState(t, rd, "ar-x1", "arx")
+	if st.Status != "failed" {
+		t.Fatalf("status = %q, want failed (timed-out replay must not touch the row)", st.Status)
+	}
+}
+
+// 锁释放后：同一 failed 行重放生效、回到可认领路径——互斥是串行化而非
+// 拒绝，锁超时为瞬时错误。
+func testAdminReplayExclusionLockReleased(t *testing.T, d event.Driver, admin event.Admin, rd ClaimStateReader, excl AdminExclusionLock) {
+	typ := t.Name()
+	warmAdmin(t, admin, "ar-y1", "ary")
+	adminFailedFixture(t, d, "ar-y1", typ, "ary")
+
+	release := excl.HoldExclusionLock(t)
+	// 失败于断言时也必须释放锁（release 幂等）：inmem 信号量被占用会
+	// 连锁阻塞后续子测试，Postgres 会话锁随连接滞留池中。
+	t.Cleanup(release)
+	if _, err := admin.ReplayFailed(t.Context(), "ar-y1", "ary", baseNow.Add(time.Minute)); !errors.Is(err, event.ErrAdminLockTimeout) {
+		t.Fatalf("replay while lock held = %v, want ErrAdminLockTimeout", err)
+	}
+	release()
+
+	replayAt := baseNow.Add(2 * time.Minute)
+	if !replay(t, admin, "ar-y1", "ary", replayAt) {
+		t.Fatal("failed row must be replayable after lock release, got ok=false")
+	}
+	st := readClaimState(t, rd, "ar-y1", "ary")
+	if st.Status != "retrying" {
+		t.Fatalf("status = %q, want retrying (replay takes effect after release)", st.Status)
+	}
+}
+
+// ---- 操作来源记录（类型化观测旁路）----
+
+// replayObserver 收集管理面重放观测事件（套件断言操作来源记录）。
+type replayObserver struct {
+	mu     sync.Mutex
+	events []event.AdminReplayEvent
+}
+
+func (o *replayObserver) OnPublish(event.PublishEvent)      {}
+func (o *replayObserver) OnConsume(event.ConsumeEvent)      {}
+func (o *replayObserver) OnWake(event.WakeEvent)            {}
+func (o *replayObserver) OnLeaseAbandoned(event.LeaseEvent) {}
+func (o *replayObserver) OnRunnerStopped(event.StopEvent)   {}
+
+func (o *replayObserver) OnAdminReplay(e event.AdminReplayEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, e)
+}
+
+func (o *replayObserver) collected() []event.AdminReplayEvent {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]event.AdminReplayEvent(nil), o.events...)
+}
+
+// 成功路径的观测事件：重放生效发射 ok（事件 × 身份与调用一致），对同一
+// 行的重复重放（已非 failed）发射 no_effect——结果枚举与返回值一致。
+func testAdminReplayObservation(t *testing.T, d event.Driver, admin event.Admin, obsSetter AdminObserverSetter) {
+	typ := t.Name()
+	adminFailedFixture(t, d, "ar-o1", typ, "aro")
+
+	obs := &replayObserver{}
+	observed := obsSetter.WithReplayObserver(obs)
+
+	replayAt := baseNow.Add(time.Minute)
+	if !replay(t, observed, "ar-o1", "aro", replayAt) {
+		t.Fatal("failed row must be replayable, got ok=false")
+	}
+	if replay(t, observed, "ar-o1", "aro", replayAt) {
+		t.Fatal("already replayed row must have no effect, got ok=true")
+	}
+
+	events := obs.collected()
+	if len(events) != 2 {
+		t.Fatalf("observation events = %d, want 2 (replayed + no effect)", len(events))
+	}
+	first, second := events[0], events[1]
+	if first.Result != event.AdminReplayOK || second.Result != event.AdminReplayNoEffect {
+		t.Fatalf("results = [%s, %s], want [%s, %s]",
+			first.Result, second.Result, event.AdminReplayOK, event.AdminReplayNoEffect)
+	}
+	if first.EventID != "ar-o1" || first.ConsumerType != "aro" ||
+		second.EventID != "ar-o1" || second.ConsumerType != "aro" {
+		t.Fatalf("event identities = (%s, %s) / (%s, %s), want (ar-o1, aro) twice",
+			first.EventID, first.ConsumerType, second.EventID, second.ConsumerType)
+	}
+	if first.Err != nil || second.Err != nil {
+		t.Fatalf("errs = %v / %v, want nil on ok and no_effect results", first.Err, second.Err)
+	}
+}
+
+// 锁占用期间的观测事件：结果枚举为 lock_timeout、Err 为瞬时锁超时错误
+// （失败结果携带错误，可诊断）。
+func testAdminReplayObservesLockTimeout(t *testing.T, d event.Driver, admin event.Admin, rd ClaimStateReader, excl AdminExclusionLock, obsSetter AdminObserverSetter) {
+	typ := t.Name()
+	obs := &replayObserver{}
+	observed := obsSetter.WithReplayObserver(obs)
+	// 预热观测实例的 ensure（等价 Admin 为新实例）：锁占用期间 ensure 的
+	// 迁移会先撞锁，预热后互斥断言落在管理写路径上。预热须先于 failed
+	// 行装配——预热用同一键、行落库前尚不存在（无效果）。
+	warmAdmin(t, observed, "ar-t1", "art")
+	adminFailedFixture(t, d, "ar-t1", typ, "art")
+
+	release := excl.HoldExclusionLock(t)
+	t.Cleanup(release)
+
+	_, err := observed.ReplayFailed(t.Context(), "ar-t1", "art", baseNow.Add(time.Minute))
+	if !errors.Is(err, event.ErrAdminLockTimeout) {
+		t.Fatalf("replay while lock held = %v, want ErrAdminLockTimeout", err)
+	}
+
+	events := obs.collected()
+	// 预热重放（无效果）与锁超时重放各发一次事件：取结果为 lock_timeout
+	// 的事件断言（恰一次）。
+	var timedOut []event.AdminReplayEvent
+	for _, e := range events {
+		if e.Result == event.AdminReplayLockTimeout {
+			timedOut = append(timedOut, e)
+		}
+	}
+	if len(timedOut) != 1 {
+		t.Fatalf("lock_timeout observation events = %d (all: %+v), want 1", len(timedOut), events)
+	}
+	ev := timedOut[0]
+	if ev.EventID != "ar-t1" || ev.ConsumerType != "art" {
+		t.Fatalf("identity = (%s, %s), want (ar-t1, art)", ev.EventID, ev.ConsumerType)
+	}
+	if !errors.Is(ev.Err, event.ErrAdminLockTimeout) {
+		t.Fatalf("event err = %v, want ErrAdminLockTimeout", ev.Err)
+	}
+}
+
+// ---- 取消路径（canceled 结果枚举）----
+
+// 调用方取消：不发起写、判别为 canceled（异常路径显式断言）。canceled
+// 不记错误日志的口径由后端 slog 集成用例覆盖（套件无 slog 面），此处
+// 断言返回值与观测枚举。
+func testAdminReplayCanceledContext(t *testing.T, d event.Driver, admin event.Admin, rd ClaimStateReader, obsSetter AdminObserverSetter) {
+	typ := t.Name()
+	obs := &replayObserver{}
+	observed := obsSetter.WithReplayObserver(obs)
+	warmAdmin(t, observed, "ar-nx", "arnx")
+	adminFailedFixture(t, d, "ar-nx", typ, "arnx")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	ok, err := observed.ReplayFailed(ctx, "ar-nx", "arnx", baseNow.Add(time.Minute))
+	if ok {
+		t.Fatal("canceled replay must not take effect, got ok=true")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled replay err = %v, want context.Canceled", err)
+	}
+	st := readClaimState(t, rd, "ar-nx", "arnx")
+	if st.Status != "failed" {
+		t.Fatalf("status = %q, want failed (canceled replay must not touch the row)", st.Status)
+	}
+
+	var canceled []event.AdminReplayEvent
+	for _, e := range obs.collected() {
+		if e.Result == event.AdminReplayCanceled {
+			canceled = append(canceled, e)
+		}
+	}
+	if len(canceled) != 1 {
+		t.Fatalf("canceled observation events = %d (all: %+v), want 1", len(canceled), obs.collected())
+	}
+	if canceled[0].EventID != "ar-nx" || canceled[0].ConsumerType != "arnx" {
+		t.Fatalf("identity = (%s, %s), want (ar-nx, arnx)", canceled[0].EventID, canceled[0].ConsumerType)
+	}
+	if !errors.Is(canceled[0].Err, context.Canceled) {
+		t.Fatalf("event err = %v, want context.Canceled", canceled[0].Err)
 	}
 }
