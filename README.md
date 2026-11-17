@@ -13,7 +13,7 @@
 
 - **2×2 正交**：`Declare[T]` 声明强类型事件，`NoPayload` 表示无参事件；广播/认领共享同一 `Handler[T]` 签名。
 - **广播发完即忘**：`Runner.Start` 内同步锚定基线，只处理启动后发布的事件；失败仅记日志跳过，不重试、不阻塞、不保序。
-- **认领至少一次**：租约互斥、自动心跳续租、接管计入重试、递增退避、`done`/`failed` 终态；失败终态留存错误摘要与时刻（`last_error`/`failed_at`，去除控制字符、截断 4 KiB、不含堆栈），可直接查库排障；迟到的 `Complete`/`Fail` 不生效。
+- **认领至少一次**：租约互斥、自动心跳续租、接管计入重试、递增退避、`done`/`failed` 终态；失败终态留存错误摘要与时刻（`last_error`/`failed_at`，去除控制字符、截断 4 KiB、不含堆栈），可直接查库排障；迟到的 `Complete`/`Fail` 不生效。接管与终态计数随 `Claim` 的 `ClaimResult` 返回、与落库事实一致，`<scope>.claim.takeover` / `.terminal_failed` 指标与 Observer 事件可直接观测接管。
 - **查询面（可选）**：`Inspector` 只读查询——事件 × 消费者身份的状态与重试计数、按身份的分档计数（「待处理」= 该身份无认领行）、failed 事件偏移分页列表（错误摘要与终态时刻随行返回）；按能力探测接入（对 `Driver` 做 `event.Inspector` 类型断言或后端 `NewInspector` 构造），结果仅在保留窗口内可见。
 - **管理面（可选）**：`Admin` 写操作与运行面分离、不进 `Driver`——`ReplayFailed` 把（事件 × 消费者身份）的 `failed` 终态行重置为可认领（仅 failed 可重放，`done` 不可逆；重试计数归零、清租约、立即可认领；`last_error` 保留、`failed_at` 清空）；经后端 `NewAdmin` 构造，重放窗口 = 保留窗口。写路径加固：持与迁移执行共用的命名空间互斥锁（等待有界）、行归属校验即 CAS、操作来源观测（指标 / 日志 / Observer 事件）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接故障）。
 - **多身份**：一个进程可承载多个消费者身份，各身份独立认领；同一 `Runner` 可混合承载广播与认领订阅。

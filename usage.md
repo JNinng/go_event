@@ -414,6 +414,24 @@ _ = job.SubscribeClaim(run, func(ctx context.Context, e event.Envelope[Job]) err
 - `LastAttempt` 由 core 按订阅级 `RetryLimit` 计算：`Attempts >= RetryLimit` 时为 true（即本次是最后一次尝试）；用 `>=` 判定以防御多实例间的订阅配置差异。
 - 边界：最后一次尝试的租约可能未被真正执行（进程崩溃/停机、或 handler 超 `MaxProcessing` 被接管）；此后接管会在认领时直接置 `failed`、不再补发租约，因此 handler 不得假设 `LastAttempt` 必然出现。它只用于观测与幂等辅助，不能替代业务终态处理（当前版本不提供终态回调）。
 - 广播订阅恒为 `0` / `false`。
+- **`Attempts > 1` 不能当作接管计数**：它混合了显式 Fail 重试与过期租约接管两种来源；接管专属的事实由 `Driver.Claim` 随轮返回的 `ClaimResult` 承载（`Takeovers` 只计接管过期租约的发放、含终态接管；`TerminalFailed` 单独统计认领直接置 failed 的数量），经 `<scope>.claim.takeover` / `.terminal_failed` 指标与 `ObserverV4.OnClaim` 事件可见（ADR 0011）。
+
+### 6.8 接管与终态计数（ClaimResult）
+
+认领消费的多实例接管（前任失去租约）与「达重试上限直接置 failed」是排障
+与 SLA 观测的关键事实，`Claim` 把每轮的落库事实随 `ClaimResult` 返回，
+core 的 Runner 据此计量（与 `Inspector` 查询、落库状态可对账）：
+
+- `Leases`：本轮发放的租约；
+- `Takeovers`：本轮接管过期租约而发放的数量，含接管后直接置 failed 的
+  终态接管；无主首次认领与 Fail 退避期满的重认领（Fail 时已计入）不计入；
+- `TerminalFailed`：本轮认领动作直接置 failed 的数量。当前认领语义下置
+  终态的下推条件要求租约已过期，认领侧终态必经接管路径（恒有
+  `TerminalFailed ≤ Takeovers`），一次终态接管同时计入两者。
+
+`Lease` 不承载接管标记；直接调用 Driver 的应用可直接读 `ClaimResult`，
+经 Runner 编排的应用看 §13.2 的指标。决策与口径见
+[ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)。
 
 ## 7. 多身份与混合订阅
 
@@ -837,8 +855,11 @@ runner := event.NewRunner(drv,
 
 - **core**（scope 缺省 `go_event`）：`publish` / `fetch` / `claim` /
   `heartbeat` / `complete` / `fail` 计数与耗时、`claim.granted`、
+  `claim.takeover`（接管发放数，含终态接管——与 `ClaimResult.Takeovers`
+  同源、与落库事实一致）、`claim.terminal_failed`（认领侧直接置 failed 数）、
   `lease.abandoned`、`consume` / `handle.duration`、`wake`——全部在 core
-  调用边界计量，后端不重复埋同口径操作指标。
+  调用边界计量，后端不重复埋同口径操作指标。接管与终态计数只在发生时
+  打点（无零值数据点）。
 - **后端**（scope 缺省模块名）：迁移生命周期 `migrate` /
   `migrate.duration`，发射点在包级 `Migrate` / `Verify`（driver ensure 同
   路径，无重复计量）；`result` 区分
@@ -858,10 +879,12 @@ runner := event.NewRunner(drv,
 
 需要进程内联动（非指标场景）时注入 `Observer`：回调在调用方 goroutine 同
 步执行、须微秒级返回，库内 recover panic；`ObserverV2` 增加停机放弃租约
-与停机完成事件，`ObserverV3` 增加管理面重放事件（均为非破坏性扩展，
-分发点类型断言——未实现新版本接口的观察者不感知对应事件）。后端管理面
-的观测经后端构造选项注入（`pgxc.WithObserver` / `postgrec.WithObserver`，
-当前仅 `Admin` 发射事件）。
+与停机完成事件，`ObserverV3` 增加管理面重放事件，`ObserverV4` 增加认领轮
+的发放与接管/终态计数事件（`ClaimEvent`，与 `ClaimResult` 同口径；均为
+非破坏性扩展，分发点类型断言——未实现新版本接口的观察者不感知对应事件）。
+后端管理面的观测经后端构造选项注入（`pgxc.WithObserver` /
+`postgrec.WithObserver`，当前仅 `Admin` 发射事件）；认领轮事件由 core 的
+Runner 发射。
 
 ```go
 // 实现 Observer（三个方法）即满足 V2；只需实现关心的额外事件，
@@ -882,6 +905,12 @@ func (slaObserver) OnRunnerStopped(event.StopEvent) {}
 func (slaObserver) OnAdminReplay(e event.AdminReplayEvent) {
     slog.Info("admin replay", "event_id", e.EventID,
         "consumer_type", e.ConsumerType, "result", e.Result)
+}
+func (slaObserver) OnClaim(e event.ClaimEvent) {
+    if e.Takeovers > 0 {
+        slog.Warn("lease takeover", "event", e.Event, "identity", e.Identity,
+            "takeovers", e.Takeovers, "terminal_failed", e.TerminalFailed)
+    }
 }
 ```
 

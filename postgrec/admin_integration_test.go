@@ -30,10 +30,11 @@ func provisionFailedRow(t *testing.T, drv event.Driver, id, typ, consumerType st
 	}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	ls, err := drv.Claim(ctx, event.ClaimQuery{
+	res, err := drv.Claim(ctx, event.ClaimQuery{
 		Type: typ, ConsumerType: consumerType, Lease: time.Minute, Limit: 10,
 		RetryLimit: 1, Now: time.Now(),
 	})
+	ls := res.Leases
 	if err != nil || len(ls) != 1 {
 		t.Fatalf("claim: %v, leases %d", err, len(ls))
 	}

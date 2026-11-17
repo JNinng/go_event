@@ -49,6 +49,9 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("ExpiredLease_Claim_TakeoverIncrementsAttempts", func(t *testing.T) { testClaimTakeover(t, d) })
 	t.Run("OverLimitTakeover_Claim_TerminalNoLease", func(t *testing.T) { testClaimOverLimitTerminal(t, d) })
 	t.Run("OverLimitRow_Claim_DoesNotConsumeLimitSlot", func(t *testing.T) { testClaimOverLimitSlot(t, d) })
+	t.Run("FailRetryReclaim_ClaimResult_NotTakeover", func(t *testing.T) { testFailRetryReclaimNotTakeover(t, d) })
+	t.Run("RetryingOverLimitRow_ClaimResult_NoTerminalOnClaim", func(t *testing.T) { testRetryingOverLimitRowNoTerminalOnClaim(t, d) })
+	t.Run("MixedBatch_ClaimResult_CountsSumAndReconcile", func(t *testing.T) { testMixedBatchClaimCounts(t, d) })
 	t.Run("SmallLimit_Claim_CapsBatch", func(t *testing.T) { testClaimLimit(t, d) })
 	t.Run("TerminalRows_Claim_Skipped", func(t *testing.T) { testClaimSkipTerminal(t, d) })
 	t.Run("NewConsumerType_Claim_ReplaysHistory", func(t *testing.T) { testNewConsumerReplays(t, d) })
@@ -184,14 +187,22 @@ func appendOccurredAt(t *testing.T, d event.Driver, id, typ string,
 func claim(t *testing.T, d event.Driver, typ, consumerType string,
 	lease time.Duration, now time.Time) []event.Lease {
 	t.Helper()
-	ls, err := d.Claim(t.Context(), event.ClaimQuery{
+	return claimResult(t, d, typ, consumerType, lease, now).Leases
+}
+
+// claimResult 认领并返回完整落库事实汇总（接管/终态计数用例与对账用例
+// 需要 ClaimResult；仅取租约的用例用 claim）。
+func claimResult(t *testing.T, d event.Driver, typ, consumerType string,
+	lease time.Duration, now time.Time) event.ClaimResult {
+	t.Helper()
+	res, err := d.Claim(t.Context(), event.ClaimQuery{
 		Type: typ, ConsumerType: consumerType, Lease: lease, Limit: 10,
 		RetryLimit: 5, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	return ls
+	return res
 }
 
 // comparePosition 按数值比较 Position 字符串（后端 Position 为数值全序）。

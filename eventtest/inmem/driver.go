@@ -2,7 +2,9 @@
 // 本地测试/示例使用。条件过滤在内存模拟，能力边界注明「模拟」档
 // （ADR 0005）。同一实现同时提供只读查询面 event.Inspector（经
 // NewInspector 构造或对 Driver 类型断言探测）：查询口径与 Postgres
-// 后端一致，返回落库事实、不做租约过期推断。管理写路径由独立 Admin
+// 后端一致，返回落库事实、不做租约过期推断。认领随 ClaimResult 返回
+// 接管与终态计数（内存计数，口径与 Postgres 后端一致、与落库状态可
+// 对账，ADR 0011）。管理写路径由独立 Admin
 // 承载（NewAdmin，与 Driver 共享同一份内存状态，不挂 Driver 类型）：
 // failed 事件手工重放，语义与 Postgres 后端一致——写路径持与迁移执行
 // 等价的进程内互斥锁（本进程无迁移执行，契约等价形态）并发射类型化
@@ -164,12 +166,13 @@ func (d *Driver) HeadPosition(_ context.Context, typ string) (string, error) {
 	return strconv.FormatUint(head, 10), nil
 }
 
-// Claim 原子认领至多 Limit 个租约；语义同 event.Driver.Claim。
-func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, error) {
+// Claim 原子认领至多 Limit 个租约；语义同 event.Driver.Claim。接管与
+// 终态计数随 ClaimResult 返回，与落库事实一致（design.md §9.2）。
+func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) (event.ClaimResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if q.Limit <= 0 {
-		return nil, nil
+		return event.ClaimResult{}, nil
 	}
 
 	// 候选：无主、租约过期、或退避期满（过滤在认领时原子完成，ADR 0004）。
@@ -209,6 +212,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 	// 1) 接管达重试上限的行直接置 failed 终态：不发放、不占用 Limit
 	//    槽位（与 SQL 实现的「先置 failed 再 LIMIT 拾取」一致，ADR 0006）。
 	//    终态时刻随置入写入；接管路径没有本次处理错误，不写摘要。
+	terminalFailed := 0
 	for _, cd := range candidates {
 		if cd.claim == nil || cd.claim.status != statusActive {
 			continue
@@ -218,6 +222,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 			cd.claim.status = statusFailed
 			cd.claim.leaseUntil = q.Now
 			cd.claim.failedAt = q.Now
+			terminalFailed++ // 置终态必经「过期租约接管」路径（下推条件含租约过期）
 		}
 	}
 
@@ -225,6 +230,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 	token := newToken()
 	var leases []event.Lease
 	granted := 0
+	grantedTakeovers := 0
 	for _, cd := range candidates {
 		if granted >= q.Limit {
 			break
@@ -245,6 +251,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 			cd.claim.leaseToken = token
 			cd.claim.leaseUntil = q.Now.Add(q.Lease)
 			cd.claim.nextEligible = time.Time{}
+			grantedTakeovers++
 		} else if cd.claim.status == statusRetrying { // 失败已在 Fail 时计入，此处仅重认领
 			cd.claim.leaseToken = token
 			cd.claim.leaseUntil = q.Now.Add(q.Lease)
@@ -262,7 +269,11 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, er
 			Attempts:     d.claims[key].claimCount + 1, // 含本次认领
 		})
 	}
-	return leases, nil
+	return event.ClaimResult{
+		Leases:         leases,
+		Takeovers:      terminalFailed + grantedTakeovers, // 接管计数覆盖发放与终态两条路径
+		TerminalFailed: terminalFailed,
+	}, nil
 }
 
 // Heartbeat CAS 续租：仅属主凭证匹配且租约未过期时生效，不命中静默返回 nil。

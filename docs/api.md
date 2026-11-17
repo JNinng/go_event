@@ -186,8 +186,9 @@ type Driver interface {
     // failed 的行不可认领；接管（租约过期）认领递增 claim_count
     // （ADR 0006）；达 q.RetryLimit 的接管认领置 failed 终态、不再认领
     // （终态判定需认领侧获知上限，故由 core 随条件下推）。批次内顺序
-    // 不承诺（契约仅约束 Fetch 升序）。
-    Claim(ctx context.Context, q ClaimQuery) ([]Lease, error)
+    // 不承诺（契约仅约束 Fetch 升序）。返回 ClaimResult 汇总本轮落库
+    // 事实（发放租约与接管/终态计数，计数与落库状态一致，ADR 0011）。
+    Claim(ctx context.Context, q ClaimQuery) (ClaimResult, error)
 
     // Heartbeat 续租：仅当属主凭证匹配时生效；租约过期或已被接管后
     // 迟到的心跳不生效（CAS 不命中静默返回 nil）。
@@ -230,7 +231,20 @@ type ClaimQuery struct {
     Now          time.Time     // 租约过期与退避判据的时钟，由 core 下推
 }
 
-// Lease 认领结果：一次租约的属主凭证。
+// ClaimResult 一次认领轮的结果与落库事实汇总（design.md §9.2、ADR 0011）。
+// 计数与落库状态严格一致，供观测面计量与 Inspector 对账。
+type ClaimResult struct {
+    Leases         []Lease // 本次发放的租约（至多 q.Limit 条；批次内顺序不承诺）
+    Takeovers      int     // 接管发放数量（含接管后直接置 failed 的终态接管；
+                            // 无主首认与 Fail 退避期满的重认领不计入）
+    TerminalFailed int     // 认领动作因 claim_count 达 RetryLimit 直接置
+                            // failed 的数量；一次终态接管同时计入两者
+}
+
+// Lease 认领结果：一次租约的属主凭证。租约不承载接管标记——接管与
+// 终态计数随 ClaimResult 按轮汇总返回（ADR 0011）；Attempts 表达
+// 「一次处理尝试未完成」的累计（显式 Fail 与接管各计一次），不能当作
+// 接管计数（usage.md §6.7）。
 type Lease struct {
     Envelope     RawEnvelope
     ConsumerType string
@@ -297,6 +311,13 @@ func SanitizeErrorSummary(text string) string
 - Fail 错误摘要仅终态写入：`last_error` 为最近一次终态失败的摘要（清洗
   后文本；空串视为未提供），`failed_at` 非空 ⟺ 行当前处于 `failed` 终态；
   接管终态只写 `failed_at`。口径见 design.md §5.3 与 ADR 0009。
+- Claim 计数口径（ADR 0011）：`Takeovers` 只计「接管过期租约」的发放
+  （含终态接管）；Fail 退避期满的重认领（retrying，Fail 时已计入）与
+  无主首认不计入。`TerminalFailed` 独立统计认领动作直接置 failed 的数量；
+  当前认领语义下置终态的下推条件要求租约已过期，故认领侧终态必经接管
+  路径，恒有 `TerminalFailed ≤ Takeovers`。计数与落库状态严格一致，可经
+  `Inspector.ClaimState` / claim\_count 对账；`Attempts > 1` 混合 Fail
+  重试与过期接管，不能代替接管计数。
 - 除迁移相关错误（`ErrMigrationLockTimeout`、`ErrMigrationPermissionDenied`、
   `ErrMigrationUnsupported`、`ErrMigrateModeUnsupported`、`ErrInvalidSchema`
   等，见 §2.8）外，Driver 不返回哨兵错误；其余错误一律视为该次操作失败，
@@ -600,11 +621,23 @@ type ObserverV3 interface { // 可选扩展（管理面写操作），分发点�
     OnAdminReplay(AdminReplayEvent) // 管理面重放（操作来源记录，ADR 0010）
 }
 
+type ObserverV4 interface { // 可选扩展（认领轮计数），分发点类型断言
+    ObserverV3
+    OnClaim(ClaimEvent) // 认领轮的发放与接管/终态计数（ADR 0011）
+}
+
 type PublishEvent struct{ Event, Result string; Err error }
 type ConsumeEvent struct{ Mode, Event, Result string; Attempts int; Err error }
 type WakeEvent struct{ Event string; Notified, Dropped int }
 type LeaseEvent struct{ Event string }
 type StopEvent struct{ TimedOut bool }
+
+// ClaimEvent 是一次认领轮的观测事件（随 Driver.Claim 的 ClaimResult 返回，
+// 与落库事实一致；仅成功轮次分发，失败轮次经 <scope>.claim 指标与日志可见）。
+type ClaimEvent struct {
+    Event, Identity string
+    Leases, Takeovers, TerminalFailed int
+}
 
 // AdminReplayEvent 是一次管理面重放的观测事件（后端 Admin 经 WithObserver
 // 注入发射；EventID × ConsumerType 为重放对象标识）。
@@ -640,6 +673,8 @@ const (
 | `go_event.fetch` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
 | `go_event.claim` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
 | `go_event.claim.granted` | Counter | `event`, `identity` |
+| `go_event.claim.takeover` | Counter | `event`, `identity`（接管发放数，含终态接管；ADR 0011） |
+| `go_event.claim.terminal_failed` | Counter | `event`, `identity`（认领侧直接置 failed 数，ADR 0011） |
 | `go_event.lease.abandoned` | Counter | `event` |
 | `go_event.consume` | Counter | `mode`, `event`, `result` |
 | `go_event.handle.duration` | Histogram | `mode`, `event`, `result` |
@@ -1317,6 +1352,7 @@ func TestVectorizeFlow(t *testing.T) {
 | 广播水位内存维护、只进不退（§5.2、ADR 0004/0006）  | `RawEnvelope.Position` + `FetchQuery.After`，core 内存持有                        |
 | 按类型轮询限额（§5.4）                      | 每 Type 单次 Fetch/Claim + `WithFetchLimit`                                     |
 | 认领互斥、接管计入重试（§5.3、ADR 0006）         | `Claim` 语义注释 + `Lease.Attempts` + `ClaimQuery.RetryLimit`（达上限的接管置 failed）    |
+| 接管计数与终态计数可见（§9.2、ADR 0011）           | `Claim` 返回 `ClaimResult{Leases, Takeovers, TerminalFailed}`（与落库事实一致）+ `<scope>.claim.takeover` / `.terminal_failed` 指标 + `ObserverV4.OnClaim`   |
 | 心跳、最大处理时长、超时停续（§5.3、ADR 0006）      | `HeartbeatRequest` + `WithLease/WithHeartbeat/WithMaxProcessing`             |
 | 迟到 Complete/Fail 不生效（CAS，ADR 0006） | `LeaseToken` + Complete/Fail CAS 不命中静默 nil                                   |
 | 重试上限 + 递增退避（§5.3、ADR 0006）         | `FailRequest.RetryLimit/Backoff`（Driver 内原子完成）+ `WithRetryLimit/WithBackoff` |

@@ -209,13 +209,14 @@ func TestPostgrecLegacyFailedRow_FailedEvents_MapsNullFailedAtToZeroValue(t *tes
 	}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	ls, err := drv.Claim(ctx, event.ClaimQuery{
+	res, err := drv.Claim(ctx, event.ClaimQuery{
 		Type: typ, ConsumerType: "legacy", Lease: time.Minute, Limit: 1,
 		RetryLimit: 5, Now: time.Now().UTC(),
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
+	ls := res.Leases
 	if len(ls) != 1 {
 		t.Fatalf("claim: %+v", ls)
 	}

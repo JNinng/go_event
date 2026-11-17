@@ -40,7 +40,7 @@ type claimProbeDriver struct {
 	probeMu   sync.Mutex
 	claimQs   []event.ClaimQuery
 	claimErrs int // 剩余注入 Claim 错误的次数
-	batches   [][]event.Lease
+	results   []event.ClaimResult
 	beats     []event.HeartbeatRequest
 	completes []event.CompleteRequest
 	fails     []event.FailRequest
@@ -55,11 +55,18 @@ func newClaimProbeDriver() *claimProbeDriver {
 	}
 }
 
-// enqueueBatch 追加一批 Claim 返回值：按调用顺序消耗，耗尽后返回空批次。
+// enqueueBatch 追加一批 Claim 返回的租约（计数为零的 ClaimResult）：
+// 按调用顺序消耗，耗尽后返回空批次。
 func (d *claimProbeDriver) enqueueBatch(leases ...event.Lease) {
+	d.enqueueResult(event.ClaimResult{Leases: leases})
+}
+
+// enqueueResult 追加一次 Claim 返回的完整 ClaimResult（可编程接管/终态
+// 计数，供观测指标断言）：按调用顺序消耗，耗尽后返回零值结果。
+func (d *claimProbeDriver) enqueueResult(res event.ClaimResult) {
 	d.probeMu.Lock()
 	defer d.probeMu.Unlock()
-	d.batches = append(d.batches, leases)
+	d.results = append(d.results, res)
 }
 
 // failClaims 让接下来 n 次 Claim 返回 errStub。
@@ -69,17 +76,17 @@ func (d *claimProbeDriver) failClaims(n int) {
 	d.claimErrs = n
 }
 
-func (d *claimProbeDriver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, error) {
+func (d *claimProbeDriver) Claim(_ context.Context, q event.ClaimQuery) (event.ClaimResult, error) {
 	d.probeMu.Lock()
 	d.claimQs = append(d.claimQs, q)
-	var out []event.Lease
+	var out event.ClaimResult
 	var err error
 	if d.claimErrs > 0 {
 		d.claimErrs--
 		err = errStub
-	} else if len(d.batches) > 0 {
-		out = d.batches[0]
-		d.batches = d.batches[1:]
+	} else if len(d.results) > 0 {
+		out = d.results[0]
+		d.results = d.results[1:]
 	}
 	d.probeMu.Unlock()
 

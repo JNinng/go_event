@@ -151,6 +151,9 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   未完成」为单位：显式 Fail 计入；租约过期被接管（前任未 Fail 而失去租约）
   在认领时同样计入，否则每轮挂死的事件会被无限接管、永不进入终态
   （细节见 [ADR 0006](adr/0006-broadcast-fire-and-forget-and-claim-retry.md)）。
+  接管与 Fail 重试在重试计数中不可区分（`Attempts` 混合两者），接管专属
+  的事实由 `Claim` 随轮返回：`ClaimResult.Takeovers` / `.TerminalFailed`
+  与落库事实一致（§9.2、[ADR 0011](adr/0011-claim-result-and-takeover-counting.md)）。
 - 一个事件可被 N 种 consumer\_type 各消费一次；同类型**同一时刻至多一个活跃
   租约**。租约过期被接管后，若旧实例仍存活（如慢 handler 被误接管），可能
   出现并发重复处理——整体投递语义仍是 at-least-once，不承诺恰好一次。
@@ -378,8 +381,11 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
 - **就近消费**：同进程发布唤醒本实例立即拉取/认领（仅信号，不跳过存储）。
 - **可观测**：日志走 stdlib `slog`，指标走 `go.opentelemetry.io/otel/metric`
   并跟随全局装配（未配置时 otel 全局 provider 即 noop，热路径零开销）；
-  core 计量 driver 操作与消费编排，后端计量迁移生命周期（单一发射点）；
-  类型化 `Observer` 为纯旁路（同步回调、库内 recover）。见 ADR 0008 与
+  core 计量 driver 操作与消费编排（含认领侧接管与终态计数，
+  `<scope>.claim.takeover` / `<scope>.claim.terminal_failed`），后端计量
+  迁移生命周期（单一发射点）；类型化 `Observer` 为纯旁路（同步回调、
+  库内 recover）。见 ADR 0008、
+  [ADR 0011](adr/0011-claim-result-and-takeover-counting.md) 与
   [api.md §2.9](api.md)。
 - **Postgres 后端**：event / event\_claim 两表、幂等版本计划 DDL、SKIP LOCKED
   认领、惰性清理（资格：超窗且无活跃租约，无论状态；保留窗口可配，历史
@@ -396,7 +402,11 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   基线锚定与起点语义/失败跳过且不阻塞/广播各自全收/水位单调；无参事件
   的广播与认领；类型间不互相饿死；认领消费互斥（含并发认领）/接管/
   接管计入重试/心跳/超时停续/退避重试/重试耗尽终态/迟到 Complete 与
-  Fail 不生效/新身份重放全部窗口内历史/超限行不占限额槽位；公共的
+  Fail 不生效/新身份重放全部窗口内历史/超限行不占限额槽位；接管与终态
+  计数随 ClaimResult 与落库事实一致——普通发放零计数、接管发放
+  Takeovers=1、终态接管双计、Fail 重试重认领与 retrying 行重认领不计
+  接管且不认领侧置终态、混合批次只计接管行并可与 Attempts/落库状态
+  对账；公共的
   ID 唯一与幂等 Append 首写为准、元数据透传、HeadPosition 基线锚点；
   错误摘要与终态时刻仅终态写入（含接管终态仅写 failed\_at）、重试中与
   迟到 Fail 不写、摘要截断与去控制字符；
@@ -415,12 +425,17 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
 ### 9.2 生产化能力（P1）
 
 - **outbox**：调用方事务内追加事件并随事务原子提交（后端可选拓展接口）。
-- **观测（接管计数）**：`Claim` 接口计划变更为
-  `ClaimResult{Leases, Takeovers, TerminalFailed}`，`Takeovers` 统计本次
-  认领中的租约接管（含终态接管），`TerminalFailed` 单独统计认领时直接置
-  failed 的数量；`Lease` 不再承担接管标记（v0.x 允许破坏性变更）。基础
-  观测面（otel 指标 + slog + 类型化 Observer）已在 P0 落地，见 §9.1 与
-  ADR 0008。
+- **观测（接管计数）**：已落地——`Claim` 返回
+  `ClaimResult{Leases, Takeovers, TerminalFailed}`：`Takeovers` 统计本次
+  认领中「接管过期租约」而发放的数量（含终态接管；无主首认与 Fail 退避
+  期满的重认领不计入），`TerminalFailed` 独立统计认领动作直接置 failed
+  的数量（当前认领语义下置终态的下推条件要求租约已过期，故认领侧终态
+  必经接管路径，恒有 TerminalFailed ≤ Takeovers）；一次终态接管同时计入
+  两者。计数取自后端落库事实（SQL 后端为终态 UPDATE 影响行数与认领标记，
+  inmem 为内存计数），与 Inspector.ClaimState / claim\_count 可对账；
+  `Lease` 不承载接管标记（v0.x 允许破坏性变更）。观测面：<scope>.claim.takeover
+  与 <scope>.claim.terminal_failed 指标 + `ObserverV4.OnClaim` 事件（ADR 0008
+  与 [ADR 0011](adr/0011-claim-result-and-takeover-counting.md)）。
 - **管理面**：查询面 `Inspector` 已落地（§6 表格「查询面（可选）」行）：
   只读可选接口、按能力探测接入，提供（事件 × 消费者身份）状态与重试
   计数、按身份的状态分档计数（「待处理」= 该身份无认领行）、failed 事件

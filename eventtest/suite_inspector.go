@@ -222,14 +222,14 @@ func testInspectorStateUnknownEvent(t *testing.T, d event.Driver, insp event.Ins
 // claimLimit 以指定限额认领（position 升序取前 limit 条）。
 func claimLimit(t *testing.T, d event.Driver, typ, consumerType string, limit int, now time.Time) []event.Lease {
 	t.Helper()
-	ls, err := d.Claim(t.Context(), event.ClaimQuery{
+	res, err := d.Claim(t.Context(), event.ClaimQuery{
 		Type: typ, ConsumerType: consumerType, Lease: time.Minute, Limit: limit,
 		RetryLimit: 5, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	return ls
+	return res.Leases
 }
 
 // leaseByID 从认领批次中取出指定事件的租约（缺失即装配缺陷，立即失败）。
@@ -436,26 +436,26 @@ func testInspectorFailedTakeoverFacts(t *testing.T, d event.Driver, insp event.I
 	appendEvent(t, d, "if-v1", typ, "1", nil)
 	// 接管计数达 RetryLimit=2 的认领直接置 failed：第 1 次认领（count=0）、
 	// 第 2 次接管认领（count=1，发放）、第 3 次接管认领（count=2 达上限）。
-	doClaim := func(now time.Time) []event.Lease {
+	doClaim := func(now time.Time) event.ClaimResult {
 		t.Helper()
-		ls, err := d.Claim(t.Context(), event.ClaimQuery{
+		res, err := d.Claim(t.Context(), event.ClaimQuery{
 			Type: typ, ConsumerType: "iv", Lease: time.Minute, Limit: 10,
 			RetryLimit: 2, Now: now,
 		})
 		if err != nil {
 			t.Fatalf("claim: %v", err)
 		}
-		return ls
+		return res
 	}
-	if ls := doClaim(baseNow); len(ls) != 1 {
-		t.Fatalf("first claim: %+v", ls)
+	if res := doClaim(baseNow); len(res.Leases) != 1 {
+		t.Fatalf("first claim: %+v", res)
 	}
-	if ls := doClaim(baseNow.Add(2 * time.Minute)); len(ls) != 1 {
-		t.Fatalf("second claim (within limit): %+v", ls)
+	if res := doClaim(baseNow.Add(2 * time.Minute)); len(res.Leases) != 1 {
+		t.Fatalf("second claim (within limit): %+v", res)
 	}
 	terminalAt := baseNow.Add(4 * time.Minute)
-	if ls := doClaim(terminalAt); len(ls) != 0 {
-		t.Fatalf("over-limit takeover must not hand out lease, got %+v", ls)
+	if res := doClaim(terminalAt); len(res.Leases) != 0 {
+		t.Fatalf("over-limit takeover must not hand out lease, got %+v", res)
 	}
 
 	out := failedList(t, insp, event.FailedQuery{Type: typ, ConsumerType: "iv", Limit: 10})

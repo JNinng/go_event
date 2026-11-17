@@ -55,16 +55,19 @@
 - 指标命名 `<scope>.<动作>`（计数）与 `<scope>.<动作>.duration`（耗时，
   单位 `s`）；计数单位 `1`；属性只允许枚举与标识符（`event`、`mode`、
   `result`、`identity`、`schema`），业务 payload（事件 ID、错误原文）
-  禁入属性值。
+  禁入属性值。数量型事实（接管、终态计数）不进属性值，以独立计数器
+  表达（`<scope>.claim.takeover` / `<scope>.claim.terminal_failed`，
+  ADR 0011 补充）。
 
 ### 4. 类型化 Observer
 
 - `Observer{OnPublish, OnConsume, OnWake}` + `ObserverV2`（嵌入扩展
   `OnLeaseAbandoned` / `OnRunnerStopped`）+ `ObserverV3`（嵌入扩展
-  `OnAdminReplay`，管理面写操作），分发点类型断言，非破坏性演进；
-  事件按值传递，字段仅值类型/string/error。core 事件经 Publisher /
-  Runner 选项注入；后端管理面事件经后端 `WithObserver` 注入（未实现
-  V3 的观察者不感知管理面事件）。
+  `OnAdminReplay`，管理面写操作）+ `ObserverV4`（嵌入扩展 `OnClaim`，
+  认领轮的发放与接管/终态计数，ADR 0011 补充），分发点类型断言，
+  非破坏性演进；事件按值传递，字段仅值类型/string/error。core 事件经
+  Publisher / Runner 选项注入；后端管理面事件经后端 `WithObserver`
+  注入（未实现对应版本的观察者不感知对应事件）。
 - 回调在调用方 goroutine 同步执行，库内 recover panic——观测是纯旁路，
   不改变业务执行语义。
 
@@ -83,6 +86,11 @@
 - 已知口径限制：`Claim` 无法区分「接管」与「Fail 重试」（`Attempts` 混
   合两者，见 TODO），故无接管专属指标；停机放弃租约以
   `go_event.lease.abandoned` 计数（接管前兆）。
+  **补充（ADR 0011 落地后）**：该限制已解除——`Claim` 随轮返回
+  `ClaimResult`（后端落库事实），core 计量
+  `go_event.claim.takeover` / `go_event.claim.terminal_failed` 并经
+  `ObserverV4.OnClaim` 分发；`Attempts` 仍混合两种来源，不因本补充改变
+  语义。
 - `inmem` / `eventtest` 契约套件不感知 otel / slog 观测面（inmem 不引入
   可观测依赖）；管理面 `Admin` 的类型化 Observer 事件为例外——inmem
   Admin 分发 `AdminReplayEvent`（Observer 为 core 类型，非第三方依赖），

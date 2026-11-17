@@ -387,15 +387,15 @@ func testClaimEndToEnd(t *testing.T, d event.Driver) {
 		t.Fatalf("completed event must not be redelivered, got %d", count.Load())
 	}
 	// Driver 侧验证终态：done 后不可认领。
-	ls, err := d.Claim(ctx, event.ClaimQuery{
+	res, err := d.Claim(ctx, event.ClaimQuery{
 		Type: ev.Name, ConsumerType: "e2e", Lease: time.Minute, Limit: 10,
 		RetryLimit: 5, Now: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(ls) != 0 {
-		t.Fatalf("completed event must be done, got %+v", ls)
+	if len(res.Leases) != 0 {
+		t.Fatalf("completed event must be done, got %+v", res)
 	}
 }
 
@@ -469,15 +469,15 @@ func testClaimRetryExhausted(t *testing.T, d event.Driver) {
 		t.Fatalf("exhausted event must not be retried, got %d calls", calls.Load())
 	}
 	// Driver 侧验证终态：failed 不可再认领。
-	ls, err := d.Claim(ctx, event.ClaimQuery{
+	res, err := d.Claim(ctx, event.ClaimQuery{
 		Type: ev.Name, ConsumerType: "exhauster", Lease: time.Minute, Limit: 10,
 		RetryLimit: 5, Now: time.Now().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(ls) != 0 {
-		t.Fatalf("exhausted event must be failed terminal, got %+v", ls)
+	if len(res.Leases) != 0 {
+		t.Fatalf("exhausted event must be failed terminal, got %+v", res)
 	}
 }
 
@@ -539,15 +539,15 @@ func testTakeoverAfterMaxProcessing(t *testing.T, d event.Driver) {
 	_ = run2.Stop(context.WithoutCancel(ctx))
 
 	// Driver 侧验证：run2 成功后事件为 done，不可再认领。
-	ls, err := d.Claim(ctx, event.ClaimQuery{
+	res, err := d.Claim(ctx, event.ClaimQuery{
 		Type: ev.Name, ConsumerType: "taker", Lease: time.Minute, Limit: 10,
 		RetryLimit: 5, Now: time.Now().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(ls) != 0 {
-		t.Fatalf("completed by run2 must be done, got %+v", ls)
+	if len(res.Leases) != 0 {
+		t.Fatalf("completed by run2 must be done, got %+v", res)
 	}
 }
 
@@ -595,15 +595,15 @@ func testActiveLeaseNoTakeover(t *testing.T, d event.Driver) {
 	// 处理时长跨过至少一个租约周期：正常区间内依赖心跳续租，租约不应过期。
 	time.Sleep(lease + 100*time.Millisecond)
 
-	ls, err := d.Claim(ctx, event.ClaimQuery{
+	res, err := d.Claim(ctx, event.ClaimQuery{
 		Type: ev.Name, ConsumerType: identity, Lease: lease,
 		Limit: 10, RetryLimit: 5, Now: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("claim B: %v", err)
 	}
-	if len(ls) != 0 {
-		t.Fatalf("active lease within max processing must not be taken over, got %+v", ls)
+	if len(res.Leases) != 0 {
+		t.Fatalf("active lease within max processing must not be taken over, got %+v", res)
 	}
 
 	stopRelease()
@@ -615,15 +615,15 @@ func testActiveLeaseNoTakeover(t *testing.T, d event.Driver) {
 	}
 
 	// A 已 Complete：done 终态不可再认领。
-	ls, err = d.Claim(ctx, event.ClaimQuery{
+	res, err = d.Claim(ctx, event.ClaimQuery{
 		Type: ev.Name, ConsumerType: identity, Lease: time.Minute,
 		Limit: 10, RetryLimit: 5, Now: time.Now().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("claim after complete: %v", err)
 	}
-	if len(ls) != 0 {
-		t.Fatalf("completed event must be done, got %+v", ls)
+	if len(res.Leases) != 0 {
+		t.Fatalf("completed event must be done, got %+v", res)
 	}
 }
 
@@ -705,15 +705,15 @@ func testClaimNotResumedAfterStop(t *testing.T, d event.Driver) {
 
 	mustPublish(t, ctx, pub, ev, suitePayload{"after-stop"})
 	time.Sleep(300 * time.Millisecond) // 负向窗口：确认停机后不认领
-	ls, err := d.Claim(ctx, event.ClaimQuery{
+	res, err := d.Claim(ctx, event.ClaimQuery{
 		Type: ev.Name, ConsumerType: "as", Lease: time.Minute, Limit: 10,
 		RetryLimit: 5, Now: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(ls) != 1 {
-		t.Fatalf("event published after stop must remain unclaimed, got %+v", ls)
+	if len(res.Leases) != 1 {
+		t.Fatalf("event published after stop must remain unclaimed, got %+v", res)
 	}
 }
 
@@ -1048,7 +1048,7 @@ func testTakeoverAttemptsReachHandler(t *testing.T, d event.Driver) {
 	if err != nil {
 		t.Fatalf("direct claim: %v", err)
 	}
-	if len(first) != 1 || first[0].Attempts != 1 {
+	if len(first.Leases) != 1 || first.Leases[0].Attempts != 1 {
 		t.Fatalf("direct claim want 1 lease attempts=1, got %+v", first)
 	}
 

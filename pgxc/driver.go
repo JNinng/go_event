@@ -246,30 +246,33 @@ LIMIT $3`, d.schema), q.Type, after, q.Limit)
 }
 
 type claimedRow struct {
-	eventID string
-	count   int // 认领后的 claim_count（已失败次数）
+	eventID  string
+	count    int  // 认领后的 claim_count（已失败次数）
+	takeover bool // 本次认领接管了过期租约（active 过期分支；retrying 重认领与无主首认不标记）
 }
 
 // Claim 原子认领至多 Limit 个租约：终态接管、CAS 抢租约与取回拼装在同一事务内完成。
-func (d *Driver) Claim(ctx context.Context, q event.ClaimQuery) ([]event.Lease, error) {
+// 接管与终态计数取自语句影响行数与认领标记，与落库事实一致（design.md §9.2）。
+func (d *Driver) Claim(ctx context.Context, q event.ClaimQuery) (event.ClaimResult, error) {
 	if err := d.ensure(ctx); err != nil {
-		return nil, err
+		return event.ClaimResult{}, err
 	}
 	if q.Limit <= 0 {
-		return nil, nil
+		return event.ClaimResult{}, nil
 	}
 	leaseUntil := q.Now.Add(q.Lease)
 	token := newToken()
 
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("pgxc: claim tx: %w", err)
+		return event.ClaimResult{}, fmt.Errorf("pgxc: claim tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// 1) 接管达重试上限的行：置 failed 终态、不再认领（ADR 0006）。
 	//    failed_at 记录进入终态的时刻；接管路径没有本次处理错误，不写摘要。
-	if _, err = tx.Exec(ctx, fmt.Sprintf(`
+	//    置终态的下推条件含「租约过期」，故认领侧终态必经接管路径。
+	terminalTag, err := tx.Exec(ctx, fmt.Sprintf(`
 UPDATE %s.event_claim c
 SET status = 'failed', lease_until = $3, next_eligible_at = '-infinity'::timestamptz,
 	failed_at = $3
@@ -278,16 +281,26 @@ WHERE c.event_id = e.id AND e.type = $1 AND c.consumer_type = $2
   AND c.status = 'active'
   AND c.lease_until <= $3 AND c.next_eligible_at <= $3
   AND c.claim_count + 1 >= $4`, d.schema, d.schema),
-		q.Type, q.ConsumerType, q.Now, q.RetryLimit); err != nil {
-		return nil, fmt.Errorf("pgxc: claim terminal: %w", err)
+		q.Type, q.ConsumerType, q.Now, q.RetryLimit)
+	if err != nil {
+		return event.ClaimResult{}, fmt.Errorf("pgxc: claim terminal: %w", err)
 	}
+	terminalFailed := int(terminalTag.RowsAffected())
 
-	// 2) 原子认领：无主（INSERT）或租约过期/退避期满（ON CONFLICT UPDATE，
-	//    接管计入重试）。过滤在认领时单条操作内下推（ADR 0004），
-	//    FOR UPDATE SKIP LOCKED 降低并发争用（design.md §5.3）。
+	// 2) 原子认领（单语句两个数据修改 CTE 共享同一拾取窗口）：picked 按
+	//    position 升序拾取至多 Limit 条可认领行并锁定事件行（SKIP LOCKED
+	//    降低并发争用，design.md §5.3）；无主与 retrying 重认领走 INSERT
+	//    （接管不计入——Fail 时已计入，ADR 0006），active 过期租约走
+	//    UPDATE 接管（计入重试）。takeover 标记来自拾取快照的旧行状态，
+	//    RETURNING 随行带回，供接管计数汇总。过滤在认领时单条操作内下推
+	//    （ADR 0004）。已知边界：快照路由为 active（只走 takeover）的行
+	//    若在 UPDATE 执行时被旧属主迟到 Fail 翻成 retrying 且退避未期满，
+	//    guard 重查不命中则本轮不发放、下轮再认领——与旧单语句实现非逐点
+	//    等价（旧实现在零退避下当轮按 retrying 发放），语义更安全，
+	//    at-least-once 不破坏（ADR 0011）。
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 WITH picked AS (
-	SELECT e.id
+	SELECT e.id, c.status
 	FROM %s.event e
 	LEFT JOIN %s.event_claim c
 	       ON c.event_id = e.id AND c.consumer_type = $2
@@ -300,83 +313,95 @@ WITH picked AS (
 	ORDER BY e.position ASC
 	LIMIT $4
 	FOR UPDATE OF e SKIP LOCKED
-)
-INSERT INTO %s.event_claim
-	(event_id, consumer_type, lease_token, lease_until, claim_count, status, next_eligible_at)
-SELECT p.id, $2, $5, $6, 0, 'active', '-infinity'::timestamptz
-FROM picked p
-ON CONFLICT (event_id, consumer_type) DO UPDATE
-	SET lease_token      = EXCLUDED.lease_token,
-	    lease_until      = EXCLUDED.lease_until,
+),
+takeover AS (
+	UPDATE %s.event_claim c
+	SET lease_token      = $5,
+	    lease_until      = $6,
 	    status           = 'active',
 	    next_eligible_at = '-infinity'::timestamptz,
-	    claim_count      = CASE
-	        WHEN %s.event_claim.status = 'active'
-	        THEN %s.event_claim.claim_count + 1  -- 接管：前任失去租约计一次失败
-	        ELSE %s.event_claim.claim_count      -- retrying 重认领：Fail 时已计入
-	    END
-	WHERE ((%s.event_claim.status = 'active'
-	       AND %s.event_claim.lease_until <= $3
-	       AND %s.event_claim.next_eligible_at <= $3)
-	   OR (%s.event_claim.status = 'retrying'
-	       AND %s.event_claim.next_eligible_at <= $3))
-RETURNING event_id, claim_count
-`, d.schema, d.schema, d.schema, d.schema, d.schema, d.schema,
-		d.schema, d.schema, d.schema, d.schema, d.schema),
+	    claim_count      = c.claim_count + 1  -- 接管：前任失去租约计一次失败
+	FROM picked p
+	WHERE c.event_id = p.id AND c.consumer_type = $2 AND p.status = 'active'
+	  AND c.status = 'active' AND c.lease_until <= $3 AND c.next_eligible_at <= $3
+	RETURNING c.event_id, c.claim_count, TRUE AS takeover
+),
+reclaim AS (
+	INSERT INTO %s.event_claim
+		(event_id, consumer_type, lease_token, lease_until, claim_count, status, next_eligible_at)
+	SELECT p.id, $2, $5, $6, 0, 'active', '-infinity'::timestamptz
+	FROM picked p
+	WHERE p.status IS NULL OR p.status = 'retrying'
+	ON CONFLICT (event_id, consumer_type) DO UPDATE
+		SET lease_token      = $5,
+		    lease_until      = $6,
+		    status           = 'active',
+		    next_eligible_at = '-infinity'::timestamptz,
+		    claim_count      = %s.event_claim.claim_count  -- retrying 重认领：Fail 时已计入
+		WHERE %s.event_claim.status = 'retrying'
+		  AND %s.event_claim.next_eligible_at <= $3
+	RETURNING event_id, claim_count, FALSE AS takeover
+)
+SELECT event_id, claim_count, takeover FROM takeover
+UNION ALL
+SELECT event_id, claim_count, takeover FROM reclaim
+`, d.schema, d.schema, d.schema, d.schema, d.schema, d.schema, d.schema),
 		q.Type, q.ConsumerType, q.Now, q.Limit, token, leaseUntil)
 	if err != nil {
-		return nil, fmt.Errorf("pgxc: claim: %w", err)
+		return event.ClaimResult{}, fmt.Errorf("pgxc: claim: %w", err)
 	}
 	var claimed []claimedRow
 	for rows.Next() {
 		var c claimedRow
-		if err = rows.Scan(&c.eventID, &c.count); err != nil {
+		if err = rows.Scan(&c.eventID, &c.count, &c.takeover); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("pgxc: claim scan: %w", err)
+			return event.ClaimResult{}, fmt.Errorf("pgxc: claim scan: %w", err)
 		}
 		claimed = append(claimed, c)
 	}
 	rows.Close()
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("pgxc: claim rows: %w", err)
-	}
-	if len(claimed) == 0 {
-		if err = tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("pgxc: claim commit: %w", err)
-		}
-		return nil, nil
+		return event.ClaimResult{}, fmt.Errorf("pgxc: claim rows: %w", err)
 	}
 
 	// 3) 取回信封拼回；pgx 原生数组绑定。批次内顺序不承诺（契约仅约束
-	//    Fetch 升序）：claimed 来自 INSERT ... RETURNING，顺序无保证。
-	ids := make([]string, len(claimed))
-	for i, c := range claimed {
-		ids[i] = c.eventID
-	}
-	rows, err = tx.Query(ctx, fmt.Sprintf(`
+	//    Fetch 升序）：claimed 来自 RETURNING，顺序无保证。
+	byID := make(map[string]event.RawEnvelope, len(claimed))
+	if len(claimed) > 0 {
+		ids := make([]string, len(claimed))
+		for i, c := range claimed {
+			ids[i] = c.eventID
+		}
+		rows, err = tx.Query(ctx, fmt.Sprintf(`
 SELECT id, type, payload, metadata, occurred_at, position
 FROM %s.event WHERE id = ANY($1) ORDER BY position ASC`, d.schema), ids)
-	if err != nil {
-		return nil, fmt.Errorf("pgxc: claim fetch: %w", err)
-	}
-	envs, err := collectEnvelopes(rows)
-	rows.Close()
-	if err != nil {
-		return nil, err
-	}
-	byID := make(map[string]event.RawEnvelope, len(envs))
-	for _, e := range envs {
-		byID[e.ID] = e
+		if err != nil {
+			return event.ClaimResult{}, fmt.Errorf("pgxc: claim fetch: %w", err)
+		}
+		envs, err := collectEnvelopes(rows)
+		rows.Close()
+		if err != nil {
+			return event.ClaimResult{}, err
+		}
+		for _, e := range envs {
+			byID[e.ID] = e
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("pgxc: claim commit: %w", err)
+		return event.ClaimResult{}, fmt.Errorf("pgxc: claim commit: %w", err)
 	}
 
+	// 4) 汇总：接管计数覆盖发放（takeover 标记）与终态（步骤 1 影响行数）
+	//    两条路径；终态接管同时计入两者。
 	leases := make([]event.Lease, 0, len(claimed))
+	grantedTakeovers := 0
 	for _, c := range claimed {
 		env, ok := byID[c.eventID]
 		if !ok {
-			return nil, fmt.Errorf("pgxc: claimed event %s not found", c.eventID)
+			return event.ClaimResult{}, fmt.Errorf("pgxc: claimed event %s not found", c.eventID)
+		}
+		if c.takeover {
+			grantedTakeovers++
 		}
 		leases = append(leases, event.Lease{
 			Envelope:     env,
@@ -386,7 +411,11 @@ FROM %s.event WHERE id = ANY($1) ORDER BY position ASC`, d.schema), ids)
 			Attempts:     c.count + 1, // 含本次认领
 		})
 	}
-	return leases, nil
+	return event.ClaimResult{
+		Leases:         leases,
+		Takeovers:      terminalFailed + grantedTakeovers,
+		TerminalFailed: terminalFailed,
+	}, nil
 }
 
 // Heartbeat CAS 续租：仅属主凭证匹配且租约未过期时生效，不命中静默返回 nil。

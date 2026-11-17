@@ -6,6 +6,8 @@
 
 ### 新特性
 
+- **认领轮事实汇总（接管与终态计数）**：`Driver.Claim` 返回 `ClaimResult{Leases, Takeovers, TerminalFailed}`——本轮发放的租约、接管过期租约而发放的数量（含接管后直接置 failed 的终态接管）、认领动作直接置 failed 的数量。计数取自后端落库事实（SQL 后端为终态 UPDATE 影响行数与认领接管标记，inmem 为内存计数），与 `Inspector.ClaimState` / `claim_count` 可对账；接管计数覆盖发放与终态两条路径。当前认领语义下置终态的下推条件要求租约已过期，认领侧终态必经接管路径（恒有 `TerminalFailed ≤ Takeovers`），一次终态接管同时计入两者；无主首认与 Fail 退避期满的重认领不计接管。决策记录见 [ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)。
+  - **观测面**：新增指标 `<scope>.claim.takeover`（接管发放数）与 `<scope>.claim.terminal_failed`（认领侧直接置 failed 数，属性 `event` + `identity`，与 `<scope>.claim.granted` 同风格，仅计数非零时打点）；`Observer` 非破坏性演进至 `ObserverV4`（嵌入 V3），新增 `OnClaim(ClaimEvent)` 认领轮计数事件（仅成功轮次分发）。`Attempts > 1` 混合 Fail 重试与过期接管，不能代替接管计数（usage.md §6.7/§6.8）。
 - **失败错误摘要落库**：认领消费进入 `failed` 终态时，`event_claim` 行留存错误摘要（`last_error`）与终态时刻（`failed_at`），直接查库即可定位失败原因，无需回源应用日志。
   - Postgres 后端由版本计划 v2 自动加列，升级随部署隐式发生；不变式：`failed_at` 非空 ⟺ 行当前处于 `failed` 终态（接管终态只写 `failed_at`）。
 - **`FailRequest` 新增 `Error` 字段**：记录失败时可携带错误文本，core 的 `Runner` 自动下推 handler 错误；文本按不可信输入清洗为摘要（去除 Unicode 控制字符、截断 4 KiB、不含堆栈，口径见 `event.SanitizeErrorSummary`），仅终态写入。
@@ -21,6 +23,7 @@
 
 ### 破坏性变更与兼容期
 
+- **`Driver.Claim` 返回类型由 `[]Lease` 变更为 `ClaimResult`**（v0.x 允许破坏性变更）：调用方取 `ClaimResult.Leases` 承载原返回形态；全部后端（pgxc / postgrec）、`eventtest`、`eventtest/inmem` 与 `eventtest/simmigrate` 已同步。`Lease` 结构不变、不承载接管标记——接管与终态计数随 `ClaimResult` 按轮汇总（[ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)）。
 - `postgresschema.Diff` 对缺失基线列的报告类别由 `missing` 改为 `outdated`（迁移不修改既有表，须人工处置）；版本加列缺失仍为 `missing`，可由迁移自动补齐。计划升级至 v2（`event_claim` 加 `last_error` / `failed_at`）。
 - `eventtest.RunSuite` 要求 Driver 实现 `eventtest.ClaimStateReader`（套件据它断言错误摘要落库事实）；`eventtest/inmem` 已原生实现。
 
@@ -28,5 +31,6 @@
 
 - 新增 [ADR 0009](docs/adr/0009-error-summary-persistence.md)：错误摘要落库口径与 `Fail` 接口扩展的决策记录。
 - 新增 [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)：管理面写操作的承载形态（独立 `Admin`、不经 `Driver` 类型暴露）与 failed 手工重放语义的决策记录，含加固口径（与迁移的命名空间互斥、操作来源观测、错误分类）。
+- 新增 [ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)：`Claim` 返回认领轮事实（`ClaimResult`）与接管/终态计数口径的决策记录；[ADR 0008](docs/adr/0008-observability.md) 补充接管指标与 `ObserverV4`（解除「无接管专属指标」的已知口径限制）。
 
 [Unreleased]: https://github.com/JNinng/go_event/compare/v0.1.1...HEAD

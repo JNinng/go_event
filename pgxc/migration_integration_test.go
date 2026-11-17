@@ -111,17 +111,17 @@ func exerciseDML(t *testing.T, drv event.Driver, typ, prefix string) {
 		t.Fatal("fetch returned no events")
 	}
 
-	leases, err := drv.Claim(ctx, event.ClaimQuery{
+	claim, err := drv.Claim(ctx, event.ClaimQuery{
 		Type: typ, ConsumerType: prefix + "-c1",
 		Lease: time.Minute, Limit: 10, RetryLimit: 3, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(leases) != 1 {
-		t.Fatalf("claim leases = %d, want 1", len(leases))
+	if len(claim.Leases) != 1 {
+		t.Fatalf("claim leases = %d, want 1", len(claim.Leases))
 	}
-	lease := leases[0]
+	lease := claim.Leases[0]
 	if err := drv.Heartbeat(ctx, event.HeartbeatRequest{
 		EventID: lease.Envelope.ID, ConsumerType: lease.ConsumerType,
 		LeaseToken: lease.LeaseToken, Extend: time.Minute, Now: now,
@@ -136,19 +136,19 @@ func exerciseDML(t *testing.T, drv event.Driver, typ, prefix string) {
 	}
 
 	appendEvent(t, drv, typ, prefix+"-2")
-	leases, err = drv.Claim(ctx, event.ClaimQuery{
+	claim, err = drv.Claim(ctx, event.ClaimQuery{
 		Type: typ, ConsumerType: prefix + "-c2",
 		Lease: time.Minute, Limit: 10, RetryLimit: 1, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("claim second: %v", err)
 	}
-	if len(leases) == 0 {
+	if len(claim.Leases) == 0 {
 		t.Fatal("second claim returned no leases")
 	}
 	if err := drv.Fail(ctx, event.FailRequest{
-		EventID: leases[0].Envelope.ID, ConsumerType: leases[0].ConsumerType,
-		LeaseToken: leases[0].LeaseToken, RetryLimit: 1,
+		EventID: claim.Leases[0].Envelope.ID, ConsumerType: claim.Leases[0].ConsumerType,
+		LeaseToken: claim.Leases[0].LeaseToken, RetryLimit: 1,
 		Backoff: event.LinearBackoff(time.Second, time.Second), Now: now,
 	}); err != nil {
 		t.Fatalf("fail: %v", err)
