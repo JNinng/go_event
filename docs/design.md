@@ -81,13 +81,15 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   （同 ID 即同一事件，写进契约）。Envelope 携带元数据块（string 键值），后端原样存储透传、不解释
   语义；暂用于携带 trace\_id（使用方可注入 otel TraceID 等追踪上下文）做事件流
   与调用链的关联。
-- **依赖策略**：core 依赖 stdlib（slog），不携带任何数据库驱动，也不依赖
-  具体方言；方言 DDL（版本计划、期望对象、锁语句与共享执行器）放在独立
-  `postgresschema` 模块，只做构造、不 import 驱动；各后端 require 该模块并
-  做连接适配与错误分类。core 的初始化面只定义契约类型（迁移模式、校验报告、
-  能力声明），不内置任何后端 DDL。
-- **观测策略**：以可注入的 `Metrics` 接口接入（P1 计划），实现方适配 otel；
-  不把 otel 依赖强加进 core，未配置时静默、零开销。P0 只用 slog（见 §9.2）。
+- **依赖策略**：core 依赖 stdlib（slog）与 otel metric API，不携带任何数据库
+  驱动，也不依赖具体方言；方言 DDL（版本计划、期望对象、锁语句与共享执行器）
+  放在独立 `postgresschema` 模块，只做构造、不 import 驱动；各后端 require
+  该模块并做连接适配与错误分类。core 的初始化面只定义契约类型（迁移模式、
+  校验报告、能力声明），不内置任何后端 DDL。
+- **观测策略**：日志走 stdlib `slog`，指标走
+  `go.opentelemetry.io/otel/metric` 并跟随全局装配（未配置时 otel 全局
+  provider 即 noop，热路径零开销）；类型化 `Observer` 为纯旁路。库直接
+  持有 otel 依赖，不设 `Metrics` 适配接口（见 ADR 0008、§9.1）。
 - **强类型与无参事件并存**：泛型声明式事件（`Declare[T](name)`）提供强类型
   生产/消费，payload 编解码默认 JSON、可插拔 codec；无参事件是
   `Declare[NoPayload]` 的快捷形态。Type 名是认领与路由的稳定标识，改名即
@@ -337,6 +339,11 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   批大小为 `min(WithFetchLimit, 空闲并发槽位)`，无空闲槽位时不认领；派发前
   由 core 按租约尝试序号与订阅 RetryLimit 注入 Attempts/LastAttempt。
 - **就近消费**：同进程发布唤醒本实例立即拉取/认领（仅信号，不跳过存储）。
+- **可观测**：日志走 stdlib `slog`，指标走 `go.opentelemetry.io/otel/metric`
+  并跟随全局装配（未配置时 otel 全局 provider 即 noop，热路径零开销）；
+  core 计量 driver 操作与消费编排，后端计量迁移生命周期（单一发射点）；
+  类型化 `Observer` 为纯旁路（同步回调、库内 recover）。见 ADR 0008 与
+  [api.md §2.9](api.md)。
 - **Postgres 后端**：event / event\_claim 两表、幂等版本计划 DDL、SKIP LOCKED
   认领、惰性清理（资格：超窗且无活跃租约，无论状态；保留窗口可配，历史
   重放仅限窗口内，认领消费窗口须覆盖最坏重试路径）。
@@ -362,11 +369,12 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
 ### 9.2 生产化能力（P1）
 
 - **outbox**：调用方事务内追加事件并随事务原子提交（后端可选拓展接口）。
-- **观测**：slog 日志 + 可注入的 `Metrics` 接口（发布/认领/完成/失败/重试
-  计数、投递延迟、租约接管次数）。实现方适配 otel，不把 otel 依赖强加进
-  core；未配置时静默、零开销。`Claim` 接口计划变更为
-  `ClaimResult{Leases, Takeovers, TerminalFailed}`，`Lease` 不再承担接管
-  标记（v0.x 允许破坏性变更）。
+- **观测（接管计数）**：`Claim` 接口计划变更为
+  `ClaimResult{Leases, Takeovers, TerminalFailed}`，`Takeovers` 统计本次
+  认领中的租约接管（含终态接管），`TerminalFailed` 单独统计认领时直接置
+  failed 的数量；`Lease` 不再承担接管标记（v0.x 允许破坏性变更）。基础
+  观测面（otel 指标 + slog + 类型化 Observer）已在 P0 落地，见 §9.1 与
+  ADR 0008。
 - **管理面**：滞留/failed 事件查询、手工重放（仅针对 `failed` 终态重新置为
   可认领；`done` 不可逆、不重放）、dead-letter 处置钩子、失败信息留存
   （最后错误摘要）、存量消费者身份的重命名迁移（§5.1）。迁移侧无台账，

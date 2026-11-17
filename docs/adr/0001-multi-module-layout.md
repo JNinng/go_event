@@ -25,8 +25,9 @@ Redis 等），以及契约测试套件 eventtest。需要决定仓库与依赖�
   `github.com/jninng/go_event/postgrec`、`github.com/jninng/go_event/pgxc`、
   `github.com/jninng/go_event/eventtest`。
 
-> 注记：观测依赖决策已由 design.md §4/§9.2 的可注入 `Metrics` 接口取代；
-> ADR 0007 §10 覆盖 P1 观测接口变更。core 不引入 otel 依赖，由实现方适配。
+> 注记：观测依赖决策已由 [ADR 0008](0008-observability.md) 取代——core 直接
+> 依赖 otel metric API 并跟随全局装配，不再采用可注入 `Metrics` 接口。
+> 设计口径见 design.md §4/§9.1。
 
 ## 理由
 

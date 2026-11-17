@@ -165,8 +165,12 @@ TEST_POSTGRES_DSN='postgres://user:pass@localhost:5432/postgres' go test ./...
 
 ## 状态与路线
 
-- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`。
-- **P1（规划）**：错误摘要落库与 `Fail` 扩展、`Inspector` 查询面与 `Admin` 管理面（failed 查询/重放）、outbox、可注入 `Metrics` 观测、延迟事件、LISTEN/NOTIFY 推送唤醒。
+- **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`；otel 指标 + slog + 类型化 Observer 观测面（ADR 0008）。
+- **P1（规划）**：错误摘要落库与 `Fail` 扩展、`Inspector` 查询面与 `Admin` 管理面（failed 查询/重放）、outbox、接管计数、延迟事件、LISTEN/NOTIFY 推送唤醒。
 - **P2（规划）**：NATS JetStream / RocketMQ / Redis Stream / RabbitMQ 后端、事件链、批量认领、限流背压。
 
 详见 [docs/design.md §9](docs/design.md)。
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
