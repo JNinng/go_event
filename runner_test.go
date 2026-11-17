@@ -56,7 +56,7 @@ func TestHeadPositionFailure_Start_ReturnsErrorAndRetryable(t *testing.T) {
 	}
 }
 
-// Fetch 失败：poller 记日志继续轮询，恢复后照常投递（api.md §2.4：
+// Fetch 失败：poller 记日志继续轮询，恢复后照常投递（docs/api.md §2.4：
 // 错误视为该次操作失败，core 重试或跳过）。
 func TestFetchFailure_Poll_KeepsPollingUntilSuccess(t *testing.T) {
 	d := newStubDriver()

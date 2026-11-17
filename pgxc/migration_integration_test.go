@@ -700,7 +700,6 @@ func TestMigrationMidwayFailureRollback(t *testing.T) {
 		if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
 			t.Fatalf("create schema: %v", err)
 		}
-		// 同名 enum 类型会令 CREATE TABLE ... event_claim 以重复对象失败；
 		// 此时 event 表与其索引已在同一事务内创建，必须整体回滚。
 		if _, err := pool.Exec(ctx,
 			"CREATE TYPE "+schema+".event_claim AS ENUM ('x')"); err != nil {

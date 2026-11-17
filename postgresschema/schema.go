@@ -70,7 +70,8 @@ type ForeignKey struct {
 //   - schema：仅 Name；
 //   - table：Columns；
 //   - index：Table / KeyColumns / Unique；
-//   - constraint：Table / KeyColumns / Unique（唯一）/ ForeignKey（外键）/ 主键。
+//   - constraint：Table / KeyColumns；Unique 标记唯一约束，ForeignKey
+//     标记外键，两者皆空即主键。
 //
 // Name 是限定标识（如 "public.event_pk"），Table 是所属表的未限定名。
 type Object struct {

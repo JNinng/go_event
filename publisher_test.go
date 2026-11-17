@@ -99,7 +99,7 @@ func TestEmptyEventID_Publish_ReturnsErrEmptyEventIDNoAppend(t *testing.T) {
 	}
 }
 
-// 未设置 WithEventID 时仍走注入的生成器（缺省行为回归）。
+// 未设置 WithEventID 时仍走注入的生成器。
 func TestWithoutEventID_Publish_UsesGenerator(t *testing.T) {
 	d := newStubDriver()
 	pub := event.NewPublisher(d, event.WithIDGenerator(func() string { return "gen-id" }))

@@ -184,7 +184,7 @@ func (d *Driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 	return strconv.FormatInt(pos, 10), nil
 }
 
-// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）。
+// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等，design.md §4）。
 func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
@@ -193,7 +193,6 @@ func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 	if err != nil {
 		return err
 	}
-	// 幂等 Append：同 ID 首写为准，不覆盖、不重投（design.md §4）。
 	_, err = d.db.ExecContext(ctx, fmt.Sprintf(`
 INSERT INTO %s.event (id, type, payload, metadata, occurred_at)
 VALUES ($1, $2, $3, $4::jsonb, $5)
@@ -400,7 +399,6 @@ func (d *Driver) Heartbeat(ctx context.Context, h event.HeartbeatRequest) error 
 	if err := d.ensure(ctx); err != nil {
 		return err
 	}
-	// CAS：仅属主凭证匹配且租约未过期时生效；不命中静默返回 nil。
 	_, err := d.db.ExecContext(ctx, fmt.Sprintf(`
 UPDATE %s.event_claim SET lease_until = $4
 WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3
@@ -412,12 +410,11 @@ WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3
 	return nil
 }
 
-// Complete CAS 置 done：幂等、不可逆，迟到的 Complete 静默不生效。
+// Complete CAS 置 done：幂等、不可逆，迟到的 Complete 静默不生效（ADR 0006）。
 func (d *Driver) Complete(ctx context.Context, c event.CompleteRequest) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
 	}
-	// CAS：幂等、不可逆；迟到的 Complete 不生效（ADR 0006）。
 	_, err := d.db.ExecContext(ctx, fmt.Sprintf(`
 UPDATE %s.event_claim SET status = 'done', lease_until = $4
 WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3

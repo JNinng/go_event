@@ -242,7 +242,7 @@ func newRunnerMetrics(mp metric.MeterProvider, scope string) *runnerMetrics {
 }
 
 // pollResult 轮询类 driver 操作（fetch/claim）的结果枚举；canceled 口径
-// 与既有日志过滤一致（errors.Is(err, context.Canceled)）。
+// 与日志过滤一致（errors.Is(err, context.Canceled)）。
 func pollResult(err error) string {
 	switch {
 	case err == nil:

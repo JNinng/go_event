@@ -22,6 +22,8 @@ type Queryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (Rows, error)
 }
 
+// 基线对象的系统目录探测查询：均以 schema 名为唯一参数，各查询的返回
+// 列序与各读取函数的 Scan 顺序一一对应。
 const (
 	schemaExistsQuery = `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`
 

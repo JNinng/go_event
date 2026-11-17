@@ -42,8 +42,8 @@ func (w *LocalWake) unsubscribe(typ string, ch chan struct{}) {
 }
 
 // notify 向订阅某事件类型的本实例 poller 发唤醒信号（非阻塞；Publisher
-// 内部使用）。返回送达与因通道满被丢弃的订阅通道数（无订阅者返回 0, 0，
-// 丢弃由周期 poll 兜底，ADR 0003）。并发安全。
+// 内部使用）。返回送达与因通道满被丢弃的订阅通道数；无订阅者两者为 0，
+// 丢弃由周期 poll 兜底（ADR 0003）。并发安全。
 func (w *LocalWake) notify(typ string) (notified, dropped int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

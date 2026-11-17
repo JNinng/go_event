@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// handler 正常返回：callHandler 透传返回值与 error。
+// handler 正常返回：callHandler 透传其 error。
 func TestHandlerError_CallHandler_Propagates(t *testing.T) {
 	want := errors.New("handler failed")
 	err := callHandler(func(context.Context, RawEnvelope) error { return want },

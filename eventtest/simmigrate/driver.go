@@ -30,6 +30,8 @@ func newDriver(backend *Backend, mode event.MigrateMode) event.Driver {
 	}
 }
 
+// ensure 首次操作前按迁移模式确保持久结构就绪；失败即缓存，后续操作直接
+// 返回同一错误（Driver 负缓存，不在 Driver 内重试）。
 func (d *driver) ensure(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

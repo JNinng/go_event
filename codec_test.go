@@ -28,7 +28,7 @@ func TestRoundtripPayload_Codec_PreservesValue(t *testing.T) {
 	}
 }
 
-// 不支持编组的载荷返回错误（异常路径显式断言）。
+// 不支持编组的载荷返回错误。
 func TestUnsupportedPayload_Encode_ReturnsError(t *testing.T) {
 	c := event.NewJSONCodec()
 
@@ -37,7 +37,7 @@ func TestUnsupportedPayload_Encode_ReturnsError(t *testing.T) {
 	}
 }
 
-// 非法 JSON 解码返回错误（异常路径显式断言）。
+// 非法 JSON 解码返回错误。
 func TestMalformedJSON_Decode_ReturnsError(t *testing.T) {
 	c := event.NewJSONCodec()
 
@@ -47,7 +47,7 @@ func TestMalformedJSON_Decode_ReturnsError(t *testing.T) {
 	}
 }
 
-// 类型不匹配的解码返回错误（异常路径显式断言）。
+// 类型不匹配的解码返回错误。
 func TestShapeMismatch_Decode_ReturnsError(t *testing.T) {
 	c := event.NewJSONCodec()
 

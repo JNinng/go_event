@@ -227,7 +227,7 @@ func (r *Runner) subscribeClaim(typ string,
 	heartbeat := cfg.heartbeat
 	if heartbeat <= 0 || heartbeat >= lease {
 		// 缺省或非法（≥ 租约的首个心跳落在租约过期之后，handler 仍在跑
-		// 即会被接管）一律取缺省 lease/3；钳制行为写进 docs/api.md §2.5。
+		// 即会被接管）一律取缺省 lease/3；钳制契约见 docs/api.md §2.5。
 		heartbeat = lease / 3
 	}
 	maxProcessing := cfg.maxProcessing
@@ -494,7 +494,7 @@ func (r *Runner) dispatchClaim(ctx context.Context, s *subscription, lease Lease
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
-		// 停机中不处理：租约到期由其他实例接管（at-least-once 不破坏）。
+		// 停机路径：放弃租约待接管（细节见函数头注释）。
 		r.metrics.leaseAbandoned.Add(ctx, 1,
 			metric.WithAttributes(attribute.String(attrEvent, s.typ)))
 		r.hub.leaseAbandoned(LeaseEvent{Event: s.typ})
@@ -627,7 +627,7 @@ func (r *Runner) heartbeatLoop(ctx context.Context, s *subscription, lease Lease
 	}
 }
 
-// handlerPanicError 是 handler panic 的包装错误（消息保持既有文本），
+// handlerPanicError 是 handler panic 的包装错误（消息文本稳定），
 // 供观测分类以 errors.As 判别 handler_panic。
 type handlerPanicError struct{ value any }
 

@@ -14,7 +14,7 @@ import (
 )
 
 // 可观测规范测试：otel 同步仪表接口密封，断言用 sdk/metric ManualReader
-// 收集 metricdata（规范测试节）；日志断言用自定义 slog.Handler。
+// 收集 metricdata（usage.md §13.4）；日志断言用自定义 slog.Handler。
 
 // newManualProvider 构造 ManualReader 装配的 provider（快照断言用）。
 func newManualProvider(t *testing.T) (*sdkmetric.MeterProvider, *sdkmetric.ManualReader) {
@@ -68,7 +68,7 @@ func counterTotal(dps []metricdata.DataPoint[int64]) int64 {
 	return total
 }
 
-// counterValueByResult 累加 result 属性等于 want 的数据点值。
+// counterValueByResult 累加 result 属性等于指定值的数据点值。
 func counterValueByResult(t *testing.T, dps []metricdata.DataPoint[int64],
 	result string) int64 {
 	t.Helper()
@@ -179,7 +179,7 @@ type failCodec struct{}
 func (failCodec) Encode(any) ([]byte, error) { return nil, errors.New("codec down") }
 func (failCodec) Decode([]byte, any) error   { return errors.New("codec down") }
 
-// heartbeatFailDriver 包装 stubDriver：Heartbeat 注入错误。
+// heartbeatFailDriver 包装任意 Driver 实现：Heartbeat 注入错误。
 type heartbeatFailDriver struct {
 	event.Driver
 	err error

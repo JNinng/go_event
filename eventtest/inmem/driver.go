@@ -47,8 +47,8 @@ type claimStatus string
 const (
 	statusActive   claimStatus = "active"   // 持有租约
 	statusRetrying claimStatus = "retrying" // 已失败/退避中，待重认领
-	statusDone     claimStatus = "done"
-	statusFailed   claimStatus = "failed"
+	statusDone     claimStatus = "done"     // 处理完成终态
+	statusFailed   claimStatus = "failed"   // 重试耗尽终态
 )
 
 type storedClaim struct {
@@ -59,6 +59,7 @@ type storedClaim struct {
 	nextEligible time.Time // 退避期满时刻；零值表示立即可认领
 }
 
+// claimKey 认领互斥与终态的（事件 × 消费者身份）粒度键。
 type claimKey struct {
 	eventID      string
 	consumerType string
@@ -80,13 +81,11 @@ func (d *Driver) Append(_ context.Context, e event.RawEnvelope) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, ok := d.events[e.ID]; ok {
-		return nil // 幂等：首写为准，不覆盖、不重投
+		return nil
 	}
 	d.position++
 	ev := e
 	ev.Position = strconv.FormatUint(d.position, 10)
-	// 运行时注入字段不落库：Append 输入侧忽略（RawEnvelope 注释），
-	// 保证 Fetch 返回零值、不被后端依赖。
 	ev.Attempts = 0
 	ev.LastAttempt = false
 	d.events[e.ID] = &storedEvent{env: ev, position: d.position}
@@ -246,34 +245,34 @@ func (d *Driver) Heartbeat(_ context.Context, h event.HeartbeatRequest) error {
 	c, ok := d.claims[claimKey{h.EventID, h.ConsumerType}]
 	if !ok || c.leaseToken != h.LeaseToken || c.status != statusActive ||
 		!c.leaseUntil.After(h.Now) {
-		return nil // CAS 不命中静默返回：接管场景的正常结果
+		return nil // 接管场景的正常结果
 	}
 	c.leaseUntil = h.Now.Add(h.Extend)
 	return nil
 }
 
-// Complete CAS 置 done：迟到的 Complete 静默不生效。
+// Complete CAS 置 done：幂等不可逆，迟到的 Complete 静默不生效。
 func (d *Driver) Complete(_ context.Context, c event.CompleteRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	sc, ok := d.claims[claimKey{c.EventID, c.ConsumerType}]
 	if !ok || sc.leaseToken != c.LeaseToken || sc.status != statusActive {
-		return nil // 幂等、不可逆；迟到的 Complete 不生效
+		return nil
 	}
 	sc.status = statusDone
 	sc.leaseUntil = c.Now
 	return nil
 }
 
-// Fail 记失败：递增计数、退避与终态判定原子完成（ADR 0006）；迟到的 Fail 静默不生效。
+// Fail 记失败：递增计数、退避与终态判定原子完成（ADR 0006）；迟到的 Fail
+// 静默不生效，不递增、不污染新属主状态。
 func (d *Driver) Fail(_ context.Context, f event.FailRequest) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	sc, ok := d.claims[claimKey{f.EventID, f.ConsumerType}]
 	if !ok || sc.leaseToken != f.LeaseToken || sc.status != statusActive {
-		return nil // 迟到的 Fail 不递增、不污染新属主状态
+		return nil
 	}
-	// 递增计数、退避调度与终态判定单次原子完成（ADR 0006）。
 	sc.claimCount++
 	if sc.claimCount >= f.RetryLimit {
 		sc.status = statusFailed
