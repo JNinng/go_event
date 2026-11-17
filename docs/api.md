@@ -424,7 +424,7 @@ var (
     ErrEmptyEventID         // WithEventID 传入空串（不回退到 IDGenerator）
 
     // ---- 迁移（ADR 0007） ----
-    ErrMigrateModeUnsupported    // WithMigrateMode 显式传给 Migrate（该选项只对 NewDriver 有意义）
+    ErrMigrateModeUnsupported    // WithMigrateMode 显式传给 Migrate（该选项对 NewDriver / NewStore 的内部 Driver 构造期生效）
     ErrMigrationUnsupported      // 锁能力为无（LockNone）时 Create 不支持自动迁移（只能 Verify/None）
     ErrMigrationLockTimeout      // 等待迁移锁超时，属瞬时错误（退避后重试）
     ErrMigrationPermissionDenied // DDL 权限不足，属永久配置错误
@@ -448,7 +448,8 @@ func IsPermanentMigrationError(err error) bool
 （升级随部署隐式发生，见 ADR 0007）。
 
 ```go
-// MigrateMode 运行面（Driver 构造期）迁移模式；只对 NewDriver 有意义。
+// MigrateMode 运行面（Driver 构造期）迁移模式；对 NewDriver / NewStore
+// （内部 Driver 构造期）生效。
 type MigrateMode int
 
 const (
@@ -874,7 +875,9 @@ type Admin interface {
 package postgrec // github.com/jninng/go_event/postgrec（标准库 database/sql）
 
 // NewDriver 基于 *sql.DB 构造 event.Driver。缺省迁移模式 Create：首次操作
-// 时持迁移锁幂等应用版本计划全量语句。WithMigrateMode 只对本构造函数生效。
+// 时持迁移锁幂等应用版本计划全量语句。WithMigrateMode 对 NewDriver /
+// NewStore（内部 Driver 构造期）生效；显式传给包级 Migrate 返回
+// ErrMigrateModeUnsupported。
 func NewDriver(db *sql.DB, opts ...Option) event.Driver
 
 // NewInspector 构造只读查询面 event.Inspector（§2.10）：与 NewDriver 共享
@@ -885,9 +888,23 @@ func NewInspector(db *sql.DB, opts ...Option) event.Inspector
 
 // NewAdmin 构造管理面 event.Admin（§2.11）：与 NewDriver 共享连接与命名
 // 空间选项（同一 schema、同一迁移模式语义）。管理写路径不经 Driver 类型
-// 暴露——Admin 只经本构造获得；鉴权由使用方负责。写路径持与迁移执行
-// 共用的命名空间互斥锁并发射管理面观测（§2.9/§2.11 约束）。
+// 暴露——Admin 不经运行面类型获得：经本构造或组合对象 Store 聚合（同一
+// 内部构造路径）；鉴权由使用方负责。写路径持与迁移执行共用的命名空间
+// 互斥锁并发射管理面观测（§2.9/§2.11 约束）。
 func NewAdmin(db *sql.DB, opts ...Option) event.Admin
+
+// Store 组合对象（便利构造，非能力面）：形态与语义同 pgxc.Store——一个
+// 对象同时持有 Driver / Inspector / Admin 三面，选项解析一次、经同一份
+// 配置传导三面；内部只建一个 Driver 实例，各面行为与独立构造完全等价。
+// Store 不实现任何能力接口，构造不触发迁移。
+type Store struct {
+	Driver    event.Driver
+	Inspector event.Inspector
+	Admin     event.Admin
+}
+
+// NewStore 构造组合对象 Store。
+func NewStore(db *sql.DB, opts ...Option) *Store
 
 // Migrate 幂等应用版本计划（Create 语义）：单事务内取迁移锁、做接管校验
 // （对象集合与计划期望比对，仅缺对象放行）、执行计划内全部语句（基线与
@@ -920,7 +937,8 @@ func Capabilities() event.MigrationCapabilities
 package pgxc // github.com/jninng/go_event/pgxc（pgx v5）
 
 // NewDriver 基于 pgx v5 连接池构造 event.Driver。迁移模式语义与 postgrec
-// 相同（缺省 Create）；WithMigrateMode 只对本构造函数生效。
+// 相同（缺省 Create）；WithMigrateMode 对 NewDriver / NewStore（内部
+// Driver 构造期）生效；显式传给包级 Migrate 返回 ErrMigrateModeUnsupported。
 func NewDriver(pool *pgxpool.Pool, opts ...Option) event.Driver
 
 // NewInspector 构造只读查询面 event.Inspector（§2.10）：与 NewDriver 共享
@@ -929,10 +947,27 @@ func NewDriver(pool *pgxpool.Pool, opts ...Option) event.Driver
 func NewInspector(pool *pgxpool.Pool, opts ...Option) event.Inspector
 
 // NewAdmin 构造管理面 event.Admin（§2.11）：与 NewDriver 共享连接与命名
-// 空间选项。管理写路径不经 Driver 类型暴露——Admin 只经本构造获得；
-// 鉴权由使用方负责。写路径持与迁移执行共用的命名空间互斥锁并发射
-// 管理面观测（§2.9/§2.11 约束）。
+// 空间选项。管理写路径不经 Driver 类型暴露——Admin 不经运行面类型获得：
+// 经本构造或组合对象 Store 聚合（同一内部构造路径）；鉴权由使用方负责。
+// 写路径持与迁移执行共用的命名空间互斥锁并发射管理面观测（§2.9/§2.11
+// 约束）。
 func NewAdmin(pool *pgxpool.Pool, opts ...Option) event.Admin
+
+// Store 组合对象（便利构造，非能力面）：一个对象同时持有 Driver /
+// Inspector / Admin 三面。选项与 NewDriver 一致且解析一次、经同一份配置
+// 传导三面（观测共享同一 scope 与 logger / Observer）；内部只建一个
+// Driver 实例——Inspector 视图与 Admin 复用同一实例（共享 ensure 状态
+// 与失败负缓存），各面行为与独立构造完全等价。组合而非合并接口：Store
+// 不实现任何能力接口，core 也不定义 event.Store；构造不触发迁移（沿
+// NewDriver 现状，首次操作按迁移模式处理持久结构）。
+type Store struct {
+	Driver    event.Driver
+	Inspector event.Inspector
+	Admin     event.Admin
+}
+
+// NewStore 构造组合对象 Store。
+func NewStore(pool *pgxpool.Pool, opts ...Option) *Store
 
 // Migrate 幂等应用版本计划（Create 语义），与 postgrec.Migrate 相同的
 // 接管校验、整版单事务与失败回滚语义。
@@ -963,8 +998,8 @@ func WithRetention(d time.Duration) Option
 
 // WithMigrateMode 设置运行面迁移模式（缺省 Create）：Create 首次操作时
 // 幂等应用版本计划全量语句；Verify 只读校验、不执行 DDL；None 不建表也
-// 不校验。该选项只对 NewDriver 有意义，显式传给 Migrate 返回
-// ErrMigrateModeUnsupported。
+// 不校验。该选项对 NewDriver / NewStore（内部 Driver 构造期）生效，显式
+// 传给 Migrate 返回 ErrMigrateModeUnsupported。
 func WithMigrateMode(m event.MigrateMode) Option
 
 // WithObserver 注入类型化观测旁路（缺省无观察者）：当前仅管理面 Admin
@@ -1167,7 +1202,22 @@ func NewInspector(opts ...Option) event.Inspector
 // NewAdmin 构造进程内管理面 event.Admin（§2.11）：与传入的 Driver（须为
 // 本包 New 构造，与 NewInspector 共享同一底层实例）共享同一份内存状态，
 // 写路径不挂 Driver 类型；传入其他实现的 Driver 视为装配错误（panic）。
-func NewAdmin(d event.Driver) event.Admin
+// AdminOption：WithAdminObserver（观测旁路）、WithAdminLockWait（互斥锁
+// 等待上限，契约套件缩短用）。
+func NewAdmin(d event.Driver, opts ...AdminOption) event.Admin
+
+// Store 组合对象（便利构造，非能力面）：一个对象同时持有 Driver /
+// Inspector / Admin 三面，共享同一份内存状态与互斥锁。Admin 为缺省构造
+// （无 Observer、缺省锁等待）；需要观测注入或缩短锁等待的测试可经
+// NewAdmin(st.Driver, ...) 构造等价 Admin 替换（共享同一底层实例）。
+type Store struct {
+	Driver    event.Driver
+	Inspector event.Inspector
+	Admin     event.Admin
+}
+
+// NewStore 构造组合对象 Store（选项与 New 一致）。
+func NewStore(opts ...Option) *Store
 
 // Capabilities 返回零值能力声明：无持久结构，迁移为 no-op（无 DDL
 // 原子性、无锁、无探测、无错误分类）。

@@ -51,8 +51,8 @@ func WithRetention(d time.Duration) Option {
 
 // WithMigrateMode 设置运行面迁移模式（缺省 Create）：Create 首次使用时
 // 幂等应用版本计划全量语句（基线与各版本）；Verify 只读校验、不执行 DDL；
-// None 不建表也不校验。该选项只对 NewDriver 有意义，显式传给 Migrate
-// 返回 ErrMigrateModeUnsupported。
+// None 不建表也不校验。该选项对 NewDriver / NewStore（内部 Driver 构造期）
+// 生效，显式传给 Migrate 返回 ErrMigrateModeUnsupported。
 func WithMigrateMode(m event.MigrateMode) Option {
 	return func(c *config) {
 		c.mode = m

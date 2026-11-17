@@ -81,6 +81,14 @@ func TestInmemAdminReplaySuite(t *testing.T) {
 		inmem.NewAdmin(d, inmem.WithAdminLockWait(300*time.Millisecond)))
 }
 
+// Store 组合对象三面同源契约（便利构造，非能力面）：NewStore 构造的三面
+// 共享同一份内存状态——Driver 落库事实对 Inspector 可见、Admin 重放对
+// Driver 生效。各面完整语义仍由上述三套件约束，此处不重复。
+func TestInmemStoreSuite(t *testing.T) {
+	st := inmem.NewStore()
+	eventtest.RunStoreSuite(t, st.Driver, st.Inspector, st.Admin)
+}
+
 // NewAdmin 传入非本包构造的 Driver 视为装配错误（panic）。
 func TestForeignDriver_NewAdmin_Panics(t *testing.T) {
 	defer func() {

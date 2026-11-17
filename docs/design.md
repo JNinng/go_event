@@ -70,7 +70,8 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   于实例内存，由 core 在 Fetch 时作为条件传入，不在存储侧簿记。
 - **依赖注入友好**：注入面只有三个（Publisher / Runner / Driver），必选
   Go 接口仅 Driver 一个（查询面 Inspector 与管理面 Admin 为可选接口，按
-  能力探测接入——Admin 只经后端 NewAdmin 构造、不挂 Driver 类型；
+  能力探测接入——Admin 不经运行面类型获得（经后端 NewAdmin 构造或经组合
+  对象 Store 聚合，同一内部构造路径）、不挂 Driver 类型；
   Publisher 与 Runner 为具体类型，见 docs/api.md §1）；全部
   构造器 `NewX(依赖, opts...)` 显式注入，无包级可变状态、无 init 魔法；
   接口定义遵循 Go 惯例放在消费侧。core 不引 DI 框架依赖（wire 用普通构造
@@ -189,7 +190,8 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   窗口**：超窗行已被惰性清理删除，重放该键与「行不存在」同判别
   （ok=false）。无效果（行不存在或非 failed 终态）统一返回 ok=false，
   需要区分原因先经 Inspector 查询。写操作由独立 Admin 可选接口承载，
-  不进 Driver、不挂后端 Driver 类型，只经后端 `NewAdmin` 构造。写路径
+  不进 Driver、不挂后端 Driver 类型，不经运行面类型获得——经后端
+  `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径）。写路径
   加固（ADR 0010）：**持锁**——重放在事务内持有与迁移执行相同的命名
   空间互斥锁（键含 schema，与迁移串行化，等待有界，超时返回
   `ErrAdminLockTimeout`）；**行归属校验即 CAS 本身**——（事件 × 身份）
@@ -241,7 +243,7 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 消费编排  | Runner + Subscribe            | 订阅级声明消费方式（广播/认领命名式入口，同一 Runner 可混合承载）与消费者身份（仅认领消费，构造默认 + 订阅级覆盖）、并发、租约、轮询间隔、重试上限与退避（仅认领消费；广播消费失败即跳过，见 §5.2）；两种方式同一订阅签名（强类型糖）；签名见 docs/api.md                                              |
 | 后端缝合点 | Driver                        | 单次原子操作，需求条件（订阅类型集 + 租约过期判据 + 可认领/水位条件）在单条 Fetch/Claim 内下推：Append / Fetch、HeadPosition（广播消费，水位条件与基线锚点由 core 传入）/ Claim、Heartbeat、Complete、Fail（认领消费）；语义见 §5 与 ADR |
 | 查询面（可选） | Inspector                 | 只读查询，按能力探测接入（ADR 0005）：（事件 × 消费者身份）状态与重试计数；按身份的状态分档计数——「待处理」= 该身份无认领行，retrying / processing / failed / done 按认领行 status 分档（done 为归档档，五档互斥且完备）；failed 事件偏移分页列表（错误摘要与 failed_at 随行返回，ADR 0009）。与 Driver 共享连接与命名空间选项；只读、不参与认领/完成路径；结果仅在保留窗口内可见（硬边界，§5.2） |
-| 管理面（可选） | Admin                     | 写操作与运行面分离、不进 Driver、不挂后端 Driver 类型（ADR 0010）：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领——仅 failed 可重放（done 不可逆），单条 CAS 条件更新防竞态；重放置 retrying、claim_count=0、清租约、next_eligible_at=now、failed_at 清空、last_error 保留；经后端 `NewAdmin` 构造（与 Driver 共享连接与命名空间选项，鉴权归使用方）；重放窗口 = 保留窗口（§5.3）。写路径持与迁移执行共用的命名空间互斥锁（等待有界）、归属校验即 CAS、发射操作来源观测（指标/日志/Observer 事件）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接故障）；无自动 down，迁移侧无台账无需 reset/stamp 入口 |
+| 管理面（可选） | Admin                     | 写操作与运行面分离、不进 Driver、不挂后端 Driver 类型（ADR 0010）：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领——仅 failed 可重放（done 不可逆），单条 CAS 条件更新防竞态；重放置 retrying、claim_count=0、清租约、next_eligible_at=now、failed_at 清空、last_error 保留；不经运行面类型获得——经后端 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径；与 Driver 共享连接与命名空间选项，鉴权归使用方）；重放窗口 = 保留窗口（§5.3）。写路径持与迁移执行共用的命名空间互斥锁（等待有界）、归属校验即 CAS、发射操作来源观测（指标/日志/Observer 事件）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接故障）；无自动 down，迁移侧无台账无需 reset/stamp 入口 |
 | 可观测    | otel 指标 + slog + Observer     | 跟随全局装配（未配置 noop 静默，热路径只打点不打日志）；core 计量 driver 操作与消费编排，后端计量迁移生命周期与管理面写操作（`<scope>.migrate` 与 `<scope>.admin.replay`，发射点各自单一，无重复计量）；类型化 Observer 纯旁路（同步回调、库内 recover）；见 ADR 0008 与 api.md §2.9 |
 
 ## 7. 仓库布局
@@ -258,7 +260,7 @@ go_event/
 ├── postgrec/        # Postgres 后端（标准库）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── pgxc/            # Postgres 后端（pgx v5）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── postgresschema/  # Postgres 方言 DDL 单一事实源：版本计划、期望对象、共享执行器（无驱动依赖）
-├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunMigrationSuite/RunInspectorSuite/RunAdminReplaySuite
+├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunMigrationSuite/RunInspectorSuite/RunAdminReplaySuite/RunStoreSuite
 │   └── simmigrate/  # 迁移契约测试的进程内模拟 backend（语句边界故障注入）
 └── docs/
     ├── api.md       # API 文档
@@ -441,8 +443,9 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   计数、按身份的状态分档计数（「待处理」= 该身份无认领行）、failed 事件
   偏移分页列表；结果仅在保留窗口内可见（硬边界）。failed 手工重放与
   Admin 加固已落地（§6 表格「管理面（可选）」行）：写操作由独立可选接口
-  `Admin` 承载、不进 Driver、不挂后端 Driver 类型，只经后端 `NewAdmin`
-  构造；`ReplayFailed` 仅对 `failed` 终态重新置为可认领（`done` 不可逆、
+  `Admin` 承载、不进 Driver、不挂后端 Driver 类型，不经运行面类型获得
+  ——经后端 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径）；
+  `ReplayFailed` 仅对 `failed` 终态重新置为可认领（`done` 不可逆、
   不重放），语义与并发防护见 §5.3；加固约束（ADR 0010）：写路径持与
   迁移执行共用的命名空间互斥锁（等待有界）、行归属校验即 CAS、操作
   来源观测（`<scope>.admin.replay` 指标 + slog 审计日志 + Observer 事件，

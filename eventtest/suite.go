@@ -4,7 +4,9 @@
 // §5.2）；RunMigrationSuite 经 MigrationBackend 适配接口覆盖初始化面
 // （Migrate/Verify、三种迁移模式、导出物、并发首启与锁语义、Lock=none
 // 变体、语句边界故障注入）；RunInspectorSuite 覆盖只读查询面
-// event.Inspector（可选能力，按类型断言探测，ADR 0005）。用例级清单以
+// event.Inspector（可选能力，按类型断言探测，ADR 0005）；RunStoreSuite
+// 覆盖后端组合对象 Store 的三面同源（便利构造，各面完整语义仍由上述
+// 套件约束）。用例级清单以
 // 各 Run 入口的注册表为准。
 //
 // 用例命名遵循三段式「条件_动作_预期结果」。

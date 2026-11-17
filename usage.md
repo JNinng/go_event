@@ -533,7 +533,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
 
 只读查询面 `event.Inspector`（可选接口，pgxc / postgrec 均已提供）直接查询这两张表：状态与分档计数按 `event_claim` 行的 `status` 列与「无认领行」分档，failed 列表取 `status='failed'` 行并随行返回 `last_error` / `failed_at`——查询与落库事实严格对齐，见 [§11](#11-运维注意事项) 的「failed 事件查询」。`NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL，只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
 
-管理写路径由独立 `event.Admin`（可选接口，pgxc / postgrec / inmem 均已提供）承载：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领，写法与 `event_claim` 落库事实对齐（置 `retrying`、`claim_count=0`、清租约、`failed_at=NULL`、`last_error` 保留），见 [§11](#11-运维注意事项) 的「failed 手工重放（Admin）」。`NewAdmin` 与 `NewDriver` 共享连接与命名空间选项，写路径不经 Driver 类型暴露、只经该构造获得，鉴权由使用方负责。写路径在事务内持与迁移执行共用的命名空间互斥锁（与迁移串行化，等待有界），并发射操作来源观测（指标 / 日志 / Observer 事件，见 [§13](#13-可观测otel--slog)）。
+管理写路径由独立 `event.Admin`（可选接口，pgxc / postgrec / inmem 均已提供）承载：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领，写法与 `event_claim` 落库事实对齐（置 `retrying`、`claim_count=0`、清租约、`failed_at=NULL`、`last_error` 保留），见 [§11](#11-运维注意事项) 的「failed 手工重放（Admin）」。`NewAdmin` 与 `NewDriver` 共享连接与命名空间选项，写路径不经 Driver 类型暴露、不经运行面类型获得——经 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径，见 [§8.7](#87-组合对象-store)），鉴权由使用方负责。写路径在事务内持与迁移执行共用的命名空间互斥锁（与迁移串行化，等待有界），并发射操作来源观测（指标 / 日志 / Observer 事件，见 [§13](#13-可观测otel--slog)）。
 
 ### 8.4 迁移模式与权限
 
@@ -581,6 +581,39 @@ drv = inmem.New(inmem.WithRetention(time.Minute))
 ```
 
 条件过滤在内存模拟，仅供测试使用。
+
+### 8.7 组合对象 Store
+
+若调用方希望一个对象同时持有运行面 / 查询面 / 管理面，后端提供便利构造
+`NewStore`（组合而非合并接口；核心仍保持独立能力）。三后端形态一致
+（结构兼容、非接口契约——core 不定义 `event.Store`）：
+
+```go
+st := pgxc.NewStore(pool, pgxc.WithSchema("public")) // postgrec / inmem 同构
+
+pub := event.NewPublisher(st.Driver, event.WithLocalWake(wake))
+run := event.NewRunner(st.Driver, event.WithIdentity("worker"))
+// 排障与运维：st.Inspector 查询状态与 failed 列表；st.Admin 重放 failed
+admin := st.Admin
+```
+
+要点：
+
+- **便利构造，非能力面**：`Store` 是后端具体类型，不实现任何能力接口；
+  `NewPublisher` / `NewRunner` 仍接收 `st.Driver`。持有 Admin 是容器聚合，
+  不是把管理写路径挂到 Driver 类型上——对 `Driver` 做 `event.Admin` 类型
+  断言仍不成立，管理写路径只经 `st.Admin` 或 `NewAdmin` 获得，鉴权由
+  使用方负责（ADR 0010）。
+- **三面同源**：选项解析一次、经同一份配置传导（观测三面共享同一 scope
+  与 logger / Observer）；内部只建一个 Driver 实例——Inspector 视图与
+  Admin 复用同一实例（共享 ensure 状态与失败负缓存），各面行为与独立
+  构造（`NewDriver` / `NewInspector` / `NewAdmin`）完全等价，eventtest
+  的 `RunStoreSuite` 契约钉住三面互通。
+- **迁移语义沿 `NewDriver` 现状**：`NewStore` 构造不触发迁移，首次操作时
+  按迁移模式处理持久结构（缺省 `Create`），见 [§8.4](#84-迁移模式与权限)。
+- **inmem 的 Store**：三面共享同一份内存状态；`Store.Admin` 为缺省构造
+  （无 Observer），需要观测注入或缩短锁等待的测试可经
+  `inmem.NewAdmin(st.Driver, ...)` 构造等价 Admin 替换。
 
 ## 9. 测试
 
@@ -656,6 +689,8 @@ func TestMyBackendRetention(t *testing.T) {
 - `eventtest.AdminExclusionLock`（`HoldExclusionLock`）：后端测试装配从外部占用与 Admin 写互斥的命名空间锁（与迁移执行同一把——Postgres 后端为迁移 advisory 键，inmem 为进程内等价信号量），套件断言锁占用期间重放返回 `ErrAdminLockTimeout` 且行不变、释放后重放生效；
 - `eventtest.AdminObserverSetter`（`WithReplayObserver`）：返回挂接观测旁路的等价 Admin 实例，套件断言 `event.AdminReplayEvent` 的结果枚举与事件 × 身份。
 
+提供组合对象 `Store` 的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunStoreSuite(t, st.Driver, st.Inspector, st.Admin)`：套件只验证「三面同源、行为与独立构造等价」——同一 Store 的 Driver 落库事实对 Inspector 可见、Admin 重放对 Driver 生效（重放行可被再次认领并完成）；各面完整语义仍由上述三套件约束，不重复。
+
 迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
 ### 9.3 Postgres 集成测试
@@ -718,11 +753,14 @@ func TestMyBackendRetention(t *testing.T) {
 | --- | --- | --- |
 | `WithSchema(s)` | 表所在 schema | `public` |
 | `WithRetention(d)` | 保留窗口 | 7 天 |
-| `WithMigrateMode(m)` | 运行面迁移模式：`Create` / `Verify` / `None`（只对 `NewDriver` 有意义） | `Create` |
+| `WithMigrateMode(m)` | 运行面迁移模式：`Create` / `Verify` / `None`；对 `NewDriver` / `NewStore`（内部 Driver 构造期）生效，显式传给包级 `Migrate` 返回 `ErrMigrateModeUnsupported` | `Create` |
 | `WithLogger(l)` | 迁移与管理面生命周期日志 | `slog.Default()` |
 | `WithMeterProvider(mp)` | 迁移与管理面指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
 | `WithScopeName(s)` | 迁移与管理面指标 scope 与名前缀 | 模块名（`pgxc` / `postgrec`） |
 | `WithObserver(o)` | 类型化观测旁路（当前仅 Admin 发射 `AdminReplayEvent`） | 无 |
+
+以上选项同样适用于 `NewStore`（[§8.7](#87-组合对象-store)）：解析一次、
+经同一份配置传导三面。
 
 ## 11. 运维注意事项
 

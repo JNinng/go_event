@@ -11,8 +11,9 @@ import (
 // 鉴权由使用方负责：管理面对象只应授予运维角色。
 //
 // 能力探测（ADR 0005）：Admin 不进入 Driver 契约，且不在后端 Driver 类型
-// 上（与 Inspector 的类型断言探测不同）——调用方一律经后端的 NewAdmin 显式
-// 构造，与各自 Driver 共享连接与命名空间选项。形态与重放语义见
+// 上（与 Inspector 的类型断言探测不同）——不经运行面类型获得：经后端的
+// NewAdmin 显式构造，或经后端组合对象 Store 聚合（同一内部构造路径），
+// 与各自 Driver 共享连接与命名空间选项。形态与重放语义见
 // [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)。
 //
 // 边界（硬边界，写进契约）：

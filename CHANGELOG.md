@@ -6,6 +6,7 @@
 
 ### 新特性
 
+- **后端组合对象 `Store`（便利构造，非能力面）**：pgxc / postgrec / inmem 均提供 `NewStore`，一个对象同时持有 `Driver` / `Inspector` / `Admin` 三面（组合而非合并接口，核心仍保持独立能力，core 不定义 `event.Store`）。选项解析一次、经同一份配置传导三面（观测三面共享同一 scope 与 logger / Observer）；内部只建一个 Driver 实例——Inspector 视图与 Admin 复用同一实例（共享 ensure 状态与失败负缓存），各面行为与独立构造完全等价，`eventtest.RunStoreSuite` 契约钉住三面同源。持有 Admin 是容器聚合而非把管理写路径挂到 Driver 类型上（对 Driver 做 `event.Admin` 类型断言仍不成立，ADR 0010 口径不变）；构造不触发迁移（沿 `NewDriver` 现状，首次操作按迁移模式处理持久结构）。inmem 的 `Store.Admin` 为缺省构造（无 Observer），需要观测注入时可经 `inmem.NewAdmin(st.Driver, ...)` 构造等价 Admin 替换。
 - **认领轮事实汇总（接管与终态计数）**：`Driver.Claim` 返回 `ClaimResult{Leases, Takeovers, TerminalFailed}`——本轮发放的租约、接管过期租约而发放的数量（含接管后直接置 failed 的终态接管）、认领动作直接置 failed 的数量。计数取自后端落库事实（SQL 后端为终态 UPDATE 影响行数与认领接管标记，inmem 为内存计数），与 `Inspector.ClaimState` / `claim_count` 可对账；接管计数覆盖发放与终态两条路径。当前认领语义下置终态的下推条件要求租约已过期，认领侧终态必经接管路径（恒有 `TerminalFailed ≤ Takeovers`），一次终态接管同时计入两者；无主首认与 Fail 退避期满的重认领不计接管。决策记录见 [ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)。
   - **观测面**：新增指标 `<scope>.claim.takeover`（接管发放数）与 `<scope>.claim.terminal_failed`（认领侧直接置 failed 数，属性 `event` + `identity`，与 `<scope>.claim.granted` 同风格，仅计数非零时打点）；`Observer` 非破坏性演进至 `ObserverV4`（嵌入 V3），新增 `OnClaim(ClaimEvent)` 认领轮计数事件（仅成功轮次分发）。`Attempts > 1` 混合 Fail 重试与过期接管，不能代替接管计数（usage.md §6.7/§6.8）。
 - **失败错误摘要落库**：认领消费进入 `failed` 终态时，`event_claim` 行留存错误摘要（`last_error`）与终态时刻（`failed_at`），直接查库即可定位失败原因，无需回源应用日志。
@@ -15,7 +16,7 @@
   - pgxc / postgrec / inmem 均已提供：`NewInspector` 构造（与 `Driver` 共享连接与命名空间选项），或对 `Driver` 做 `event.Inspector` 类型断言探测。
   - 只读边界：不产生簿记、不参与认领/完成路径、不做租约过期推断；结果仅在保留窗口内可见（硬边界，超窗行被清理后自然不可见）。`eventtest` 新增 `RunInspectorSuite` 契约套件（三类查询与 Claim/Fail/Complete 落库事实比对）。
 - **`Admin` 管理面写接口（可选接口，不加入 `Driver`、不挂后端 `Driver` 类型）**：`ReplayFailed` 把（事件 × 消费者身份）的 `failed` 终态行重新置为可认领——仅 `failed` 可重放（`done` 不可逆；`active` / `retrying` 拒绝且不改动），单条 CAS 条件更新保证并发重放 / 认领 / Fail 竞态下不改写非 failed 行。重放置 `retrying`、`claim_count=0`（此后 Fail 的重试计数从合法范围重新开始）、清 `lease_token` / `lease_until`、`next_eligible_at=now`（立即可认领）、`failed_at` 清空、`last_error` 保留（ADR 0009 口径）；无效果（行不存在或非 failed）统一返回 `ok=false`；**重放窗口 = 保留窗口**。
-  - pgxc / postgrec / inmem 均已提供：`NewAdmin` 构造（与 `Driver` 共享连接与命名空间选项；管理写路径不经 `Driver` 类型暴露，只经本构造获得，鉴权由使用方负责）。
+  - pgxc / postgrec / inmem 均已提供：`NewAdmin` 构造（与 `Driver` 共享连接与命名空间选项；管理写路径不经 `Driver` 类型暴露、不经运行面类型获得——经 `NewAdmin` 构造或经组合对象 `Store` 聚合（同一内部构造路径），鉴权由使用方负责）。
   - **写路径加固**：重放在事务内持与迁移执行共用的命名空间互斥锁（键含 schema，不同命名空间互不阻塞；等待有界，超时返回新哨兵 `event.ErrAdminLockTimeout`——瞬时错误），与迁移执行串行化；行归属校验即 CAS 本身（事件 × 身份主键 + `status='failed'` 条件 + 构造期 schema 命名空间），已写进契约注释与文档；执行故障一律经 `error` 返回、不得折叠为 `ok=false`（错误分类：锁超时 / 迁移面哨兵 / 连接驱动故障）。
   - **新增公开 API**：`postgresschema.AcquireExclusiveLock`（命名空间互斥锁的有界等待实现，迁移执行器与管理面写操作共用）；core Admin 重放结果枚举常量 `AdminReplayOK` / `AdminReplayNoEffect` / `AdminReplayCanceled` / `AdminReplayLockTimeout` / `AdminReplayError`（`AdminReplayEvent.Result` 与指标 result 属性取值）；inmem Admin 构造选项 `AdminOption` / `WithAdminObserver` / `WithAdminLockWait`。
   - **操作来源记录**：每次重放发射 otel 指标 `<scope>.admin.replay`（`result`=ok/no_effect/canceled/lock_timeout/error 与 `schema` 属性）、slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附 error.type / error 分类属性）与类型化 Observer 事件 `AdminReplayEvent`（新增 `ObserverV3` 扩展接口，非破坏性演进；后端选项新增 `WithObserver`）。

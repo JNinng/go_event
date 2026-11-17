@@ -55,7 +55,12 @@ func NewDriver(db *sql.DB, opts ...Option) event.Driver {
 // newDriver 构造具体 Driver（*Driver 同时实现 event.Inspector，供
 // NewInspector 与调用方的类型断言探测共用）。
 func newDriver(db *sql.DB, opts ...Option) *Driver {
-	cfg := newConfig(opts)
+	return newDriverConfig(db, newConfig(opts))
+}
+
+// newDriverConfig 以已解析的配置构造具体 Driver：NewStore 用同一份配置
+// 构造三面，保证选项口径一致（不重复解析）。
+func newDriverConfig(db *sql.DB, cfg *config) *Driver {
 	d := &Driver{
 		db:        db,
 		schema:    cfg.schema,

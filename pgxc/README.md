@@ -10,11 +10,19 @@ _ = pgxc.Migrate(ctx, pool) // 部署/启动期可选：与缺省 Create 同义�
 drv := pgxc.NewDriver(pool, pgxc.WithRetention(7*24*time.Hour))
 // 运行账号仅 DML（+ 系统目录读）、表已由部署流程建好时：
 // drv := pgxc.NewDriver(pool, pgxc.WithMigrateMode(event.MigrateVerify))
+
+// 组合对象（可选便利）：一个对象持有 Driver / Inspector / Admin 三面。
+st := pgxc.NewStore(pool, pgxc.WithRetention(7*24*time.Hour))
+// st.Driver 传给 NewPublisher / NewRunner；st.Inspector 查询状态与
+// failed 列表；st.Admin 重放 failed 事件。
 ```
 
 缺省迁移模式 `Create` 在首次操作时持迁移锁幂等应用版本计划全量语句
 （基线与各版本；升级随部署隐式发生）；`Verify` 只读校验；`None` 不建表
-也不校验。无 DDL 权限的运行连接不能自动迁移，只能用后两者。
+也不校验。无 DDL 权限的运行连接不能自动迁移，只能用后两者。`NewStore`
+是便利构造（组合而非合并接口，非能力面）：选项解析一次、三面共享同一
+连接池与命名空间、观测口径一致，内部只建一个 Driver 实例，各面行为与
+独立构造完全等价；构造不触发迁移（沿 `NewDriver` 现状）。
 
 ## 能力边界表（ADR 0005）
 

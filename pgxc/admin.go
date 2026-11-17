@@ -34,11 +34,17 @@ type admin struct {
 
 // NewAdmin 构造管理面 event.Admin：与 NewDriver 共享连接与命名空间选项
 // （同一 schema、同一迁移模式语义——首次操作按模式处理持久结构）。管理
-// 写操作只经本构造获得，Driver 类型上不存在管理写路径；鉴权由使用方负责。
+// 写操作不经运行面类型获得——经本构造或组合对象 Store 聚合（同一内部
+// 构造路径）；Driver 类型上不存在管理写路径；鉴权由使用方负责。
 func NewAdmin(pool *pgxpool.Pool, opts ...Option) event.Admin {
-	cfg := newConfig(opts)
+	return newAdminOn(newDriver(pool, opts...), newConfig(opts))
+}
+
+// newAdminOn 以给定 Driver 与配置构造管理面载体：NewStore 复用其唯一
+// Driver 实例（共享 ensure 状态与失败负缓存），NewAdmin 自建实例。
+func newAdminOn(d *Driver, cfg *config) *admin {
 	return &admin{
-		d:      newDriver(pool, opts...),
+		d:      d,
 		logger: cfg.logger,
 		am:     newAdminMetrics(cfg.mp, cfg.scope),
 		obs:    cfg.obs,

@@ -183,6 +183,15 @@ func (s suiteAdmin) WithReplayObserver(o event.Observer) event.Admin {
 	return postgrec.NewAdmin(s.db, postgrec.WithSchema(s.schema), postgrec.WithObserver(o))
 }
 
+// Store 组合对象三面同源契约（便利构造，非能力面）：NewStore 构造的三面
+// 共享同一连接与命名空间——Driver 落库事实对 Inspector 可见、Admin 重放
+// 对 Driver 生效。各面完整语义仍由上述套件约束，此处不重复。
+func TestPostgrecStoreSuite(t *testing.T) {
+	db, _, schema := testDB(t)
+	st := postgrec.NewStore(db, postgrec.WithSchema(schema))
+	eventtest.RunStoreSuite(t, st.Driver, st.Inspector, st.Admin)
+}
+
 // 保留窗口惰性清理契约：每用例独立 schema + 短保留窗口的全新 Driver
 // （design.md §5.2）。
 func TestPostgrecRetentionSuite(t *testing.T) {

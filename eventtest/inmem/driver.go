@@ -8,7 +8,9 @@
 // 承载（NewAdmin，与 Driver 共享同一份内存状态，不挂 Driver 类型）：
 // failed 事件手工重放，语义与 Postgres 后端一致——写路径持与迁移执行
 // 等价的进程内互斥锁（本进程无迁移执行，契约等价形态）并发射类型化
-// Observer 事件（进程内不接 otel / slog）。
+// Observer 事件（进程内不接 otel / slog）。NewStore 提供三面组合对象
+// （便利构造，非能力面）：一个对象持有 Driver / Inspector / Admin，
+// 三面共享同一份内存状态与互斥锁。
 package inmem
 
 import (

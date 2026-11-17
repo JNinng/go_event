@@ -17,7 +17,7 @@ var (
 	ErrEmptyEventID = errors.New("event: empty event ID")
 
 	// ErrMigrateModeUnsupported：WithMigrateMode 显式传给 Migrate（该选项
-	// 只对 NewDriver 有意义）。
+	// 对 NewDriver / NewStore 的内部 Driver 构造期生效）。
 	ErrMigrateModeUnsupported = errors.New("event: migrate mode option unsupported on Migrate")
 
 	// ErrMigrationUnsupported：锁能力为无（LockNone）时 Create 不支持
