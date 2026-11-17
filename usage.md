@@ -5,6 +5,7 @@
 ## 目录
 
 - [1. 安装](#1-安装)
+- [快速开始（pgxc）](#快速开始pgxc)
 - [2. 核心模型](#2-核心模型)
 - [3. 装配](#3-装配)
 - [4. 发布事件](#4-发布事件)
@@ -16,6 +17,7 @@
 - [10. 选项速查](#10-选项速查)
 - [11. 运维注意事项](#11-运维注意事项)
 - [12. 错误与排查](#12-错误与排查)
+- [13. 可观测（otel + slog）](#13-可观测otel--slog)
 
 ## 1. 安装
 
@@ -33,6 +35,99 @@ go get github.com/jninng/go_event/eventtest  # 契约测试 / 进程内 Driver
 仓库本地开发使用 `go.work` 串联各 module，无需替换路径。子 module 独立发版，版本 tag 形如 `pgxc/v0.1.0`。
 
 对 Go 版本的要求以各 `go.mod` 为准。
+
+## 快速开始（pgxc）
+
+以 pgx v5 后端为例，一份可直接运行的完整程序（发布 + 认领消费）：
+
+```go
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"os/signal"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jninng/go_event"
+	"github.com/jninng/go_event/pgxc"
+)
+
+// 事件在包级声明一次：Name 是认领与路由的稳定标识，改名即破坏性变更。
+type OrderCreated struct{ OrderID string }
+
+var orderCreated = event.Declare[OrderCreated]("order.created")
+
+func main() {
+	// 进程退出信号 → ctx 取消；Runner 以 ctx 生命周期消费。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	// 连接由应用方建立（本库不携带数据库驱动）。
+	pool, err := pgxpool.New(ctx, "postgresql://postgres:secret@localhost:5432/app?sslmode=disable")
+	if err != nil {
+		slog.Error("connect", "error", err)
+		return
+	}
+	defer pool.Close()
+
+	// Driver：缺省 Create 模式，首次操作自动持迁移锁建表（需 DDL 权限）。
+	drv := pgxc.NewDriver(pool,
+		pgxc.WithSchema("public"),
+		pgxc.WithRetention(7*24*time.Hour),
+	)
+
+	// 发布：ID 自动生成，同 ID 重复发布幂等（首写为准）；事件侧糖与
+	// event.Publish(ctx, pub, orderCreated, ...) 等价（见 §4.1）。
+	pub := event.NewPublisher(drv)
+	if err := orderCreated.Publish(ctx, pub, OrderCreated{OrderID: "o-1"},
+		event.WithMetadata(map[string]string{"trace_id": "tr-1"})); err != nil {
+		slog.Error("publish", "error", err)
+		return
+	}
+
+	// 消费（认领：消费者身份 + 租约 + 心跳 + 失败重试）。订阅须在 Start 之前注册。
+	run := event.NewRunner(drv, event.WithPollInterval(5*time.Second))
+	if err := orderCreated.SubscribeClaim(run,
+		func(_ context.Context, e event.Envelope[OrderCreated]) error {
+			slog.Info("got order", "id", e.ID, "order", e.Payload.OrderID, "attempts", e.Attempts)
+			return nil // 返回错误计一次失败，按退避自动重试至上限
+		},
+		event.WithConsumerType("order-worker"),
+	); err != nil {
+		slog.Error("subscribe", "error", err)
+		return
+	}
+	if err := run.Start(ctx); err != nil {
+		slog.Error("start", "error", err)
+		return
+	}
+
+	<-ctx.Done() // 消费直至收到退出信号
+
+	// 优雅停机：停止认领，等在途 handler 跑完。
+	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = run.Stop(stopCtx)
+}
+```
+
+要点：
+
+- **换后端只换构造那一行**：`Driver` 接口后端无关，`Publisher` / `Runner` / 订阅代码对其他后端原样适用。
+- **迁移**：缺省 `Create` 在首次操作时自动建表；运行账号只有 DML 权限时改用 `Verify` / `None` 并由部署流程建表，见 [§8.4](#84-迁移模式与权限)。
+- **广播消费**：把 `SubscribeClaim` 换成 `SubscribeBroadcast`（发完即忘、无需消费者身份），见 [§5](#5-广播消费)。
+- **就近唤醒**：同一 `event.NewLocalWake()` 同时注入 `NewPublisher` 与 `NewRunner`，同进程发布可立即触发本实例拉取，见 [§3](#3-装配)。
+- **可观测**：otel 指标与 slog 日志缺省跟随全局装配，不注入即静默；需要接入见 [§13](#13-可观测otel--slog)。
+
+### 其他后端
+
+| 后端 | 载体 | 参考 |
+| --- | --- | --- |
+| `postgrec` | 标准库 `database/sql`（连接与驱动注册由使用方完成，如 pgx/v5/stdlib） | [§8.2](#82-postgrecdatabase_sql)、[postgrec/README.md](postgrec/README.md) |
+| `inmem` | 进程内实现，不碰真实存储 | [§8.6](#86-inmem)、[§9.1](#91-用-inmem-测试业务逻辑) |
 
 ## 2. 核心模型
 
@@ -553,6 +648,9 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithPublisherCodec(c)` | payload 编码 | JSON |
 | `WithLocalWake(w)` | 发布成功后的同进程唤醒 | 无 |
 | `WithMetadata(m)`（发布级） | 合并元数据 | 无 |
+| `WithMeterProvider(mp)` | 指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
+| `WithScopeName(s)` | 指标 scope 与名前缀 | `go_event` |
+| `WithObserver(o)` | 类型化观测旁路 | 无 |
 
 ### 10.2 Runner
 
@@ -563,6 +661,9 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithRunnerCodec(c)` | payload 解码 | JSON |
 | `WithLocalWake(w)` | 接收同进程唤醒 | 无 |
 | `WithLogger(l)` | 日志 | `slog.Default()` |
+| `WithMeterProvider(mp)` | 指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
+| `WithScopeName(s)` | 指标 scope 与名前缀 | `go_event` |
+| `WithObserver(o)` | 类型化观测旁路 | 无 |
 
 ### 10.3 订阅
 
@@ -586,6 +687,9 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithSchema(s)` | 表所在 schema | `public` |
 | `WithRetention(d)` | 保留窗口 | 7 天 |
 | `WithMigrateMode(m)` | 运行面迁移模式：`Create` / `Verify` / `None`（只对 `NewDriver` 有意义） | `Create` |
+| `WithLogger(l)` | 迁移生命周期日志 | `slog.Default()` |
+| `WithMeterProvider(mp)` | 迁移指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
+| `WithScopeName(s)` | 迁移指标 scope 与名前缀 | 模块名（`pgxc` / `postgrec`） |
 
 ## 11. 运维注意事项
 
@@ -668,3 +772,77 @@ func TestMyBackendRetention(t *testing.T) {
 - 拉取/认领失败。
 
 生产环境建议注入结构化 logger，并保留 `event_id`、`type`、`consumer` 字段用于排查。
+
+## 13. 可观测（otel + slog）
+
+指标走 `go.opentelemetry.io/otel/metric`、日志走 `log/slog`，默认跟随全
+局装配：未注入选项时构造期快照 `otel.GetMeterProvider()` / `slog.Default()`
+——未配置 otel 时 provider 即 noop，静默零成本；应用侧 `otel.SetMeterProvider`
+后，之后构造的组件自动接上。决策与口径分界见
+[ADR 0008](docs/adr/0008-observability.md)，签名与指标清单见
+[api.md §2.9](docs/api.md#29-可观测otel-指标--slog--observer)。
+
+### 13.1 装配示例
+
+```go
+// 应用侧自由装配 exporter / handler，库不感知。
+res := resource.NewWithAttributes("go_event")
+reader := sdkmetric.NewManualReader() // 生产用 periodic reader + exporter
+mp := sdkmetric.NewMeterProvider(
+    sdkmetric.WithResource(res), sdkmetric.WithReader(reader))
+defer mp.Shutdown(context.Background())
+
+publisher := event.NewPublisher(drv,
+    event.WithMeterProvider(mp),            // 缺省跟随全局
+    event.WithScopeName("go_event.orders"), // 部署期决策，勿随实例变化
+)
+runner := event.NewRunner(drv,
+    event.WithMeterProvider(mp), event.WithLogger(slog.Default()),
+    event.WithIdentity("orders-worker"),
+)
+```
+
+### 13.2 指标口径
+
+- **core**（scope 缺省 `go_event`）：`publish` / `fetch` / `claim` /
+  `heartbeat` / `complete` / `fail` 计数与耗时、`claim.granted`、
+  `lease.abandoned`、`consume` / `handle.duration`、`wake`——全部在 core
+  调用边界计量，后端不重复埋同口径操作指标。
+- **后端**（scope 缺省模块名）：仅迁移生命周期 `migrate` /
+  `migrate.duration`，发射点在包级 `Migrate` / `Verify`（driver ensure 同
+  路径，无重复计量）；`result` 区分
+  `ok` / `canceled` / `lock_timeout` / `permission_denied` / `verify_conflict` /
+  `permanent` / `transient`。
+- 属性只含枚举与标识符（`event` / `mode` / `result` / `identity` /
+  `schema`），事件 ID 与错误原文不入属性；Prometheus 导出侧自动做
+  `.`→`_` 并按单位追加 `_total` / `_seconds`。
+
+### 13.3 Observer 旁路
+
+需要进程内联动（非指标场景）时注入 `Observer`：回调在调用方 goroutine 同
+步执行、须微秒级返回，库内 recover panic；`ObserverV2` 增加停机放弃租约
+与停机完成事件（非破坏性扩展）。
+
+```go
+// 实现 Observer（三个方法）即满足 V2；只需实现关心的额外事件，
+// 其余留空方法体——库内 recover 保证旁路安全。
+type slaObserver struct{}
+
+func (slaObserver) OnPublish(e event.PublishEvent) {
+    if e.Result != "ok" {
+        slog.Warn("publish degraded", "event", e.Event, "result", e.Result)
+    }
+}
+func (slaObserver) OnConsume(event.ConsumeEvent) {}
+func (slaObserver) OnWake(event.WakeEvent)       {}
+func (slaObserver) OnLeaseAbandoned(e event.LeaseEvent) {
+    slog.Warn("lease abandoned on shutdown", "event", e.Event)
+}
+func (slaObserver) OnRunnerStopped(event.StopEvent) {}
+```
+
+### 13.4 测试断言
+
+otel 同步仪表接口密封，指标断言用 `sdk/metric` 的 ManualReader 收集
+`metricdata`；日志断言注入自定义 `slog.Handler`（本仓库测试即此写法，
+见 `observability_test.go`）。

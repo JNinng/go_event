@@ -47,7 +47,8 @@ func Declare[T any](name string) Event[T]
 
 // ---- 事件侧强类型入口（糖，委托给 Publisher / Runner 的实现） ----
 
-// Publish 发布事件（对称糖，等价 p.Publish(ctx, ev, payload, opts...)）。
+// Publish 发布事件（对称糖，等价 event.Publish(ctx, p, ev, payload, opts...)；
+// Go 方法不支持类型参数，Publisher 上无对应方法）。
 func (ev Event[T]) Publish(ctx context.Context, p *Publisher,
     payload T, opts ...PublishOption) error
 
@@ -540,6 +541,80 @@ const (
 )
 ```
 
+### 2.9 可观测（otel 指标 + slog 日志 + Observer）
+
+指标走 otel、日志走 slog，默认跟随全局装配（未配置时 otel 全局 provider
+即 noop，静默零成本）；选项优先、全局兜底，构造期快照固定。决策与口径
+分界见 [ADR 0008](adr/0008-observability.md)。
+
+```go
+// PublisherOption 与 RunnerOption 双面选项（同 WithLocalWake 形态）：
+func WithMeterProvider(mp metric.MeterProvider) // 缺省构造期快照 otel.GetMeterProvider()
+func WithScopeName(scope string)                // 缺省 "go_event"；部署期决策，勿随实例变化
+func WithObserver(o Observer)                   // 缺省无观察者
+
+// Runner 已有：
+func WithLogger(l *slog.Logger) // 缺省 slog.Default()
+
+// 观测旁路：回调同步执行、须微秒级返回；库内 recover panic。
+type Observer interface {
+    OnPublish(PublishEvent)
+    OnConsume(ConsumeEvent)
+    OnWake(WakeEvent)
+}
+
+type ObserverV2 interface { // 可选扩展，分发点类型断言
+    Observer
+    OnLeaseAbandoned(LeaseEvent) // 停机放弃租约（待接管）
+    OnRunnerStopped(StopEvent)   // TimedOut=true 表示等待在途超过调用方 ctx
+}
+
+type PublishEvent struct{ Event, Result string; Err error }
+type ConsumeEvent struct{ Mode, Event, Result string; Attempts int; Err error }
+type WakeEvent struct{ Event string; Notified, Dropped int }
+type LeaseEvent struct{ Event string }
+type StopEvent struct{ TimedOut bool }
+```
+
+`Result` 枚举：`ok` / `invalid_id` / `encode_error` / `append_error`（发布）；
+`ok` / `handler_error` / `handler_panic`（消费）；`error` / `canceled`（轮询）。
+`Mode`：`broadcast` / `claim`。
+
+**指标清单**（`<scope>.<动作>`；计数单位 `1`，耗时直方图单位 `s`；Prometheus
+导出侧自动转 `.`→`_` 并按单位追加 `_total`/`_seconds`）：
+
+| 指标 | 类型 | 属性 |
+| --- | --- | --- |
+| `go_event.publish` | Counter | `event`, `result` |
+| `go_event.publish.duration` | Histogram | `result`（仅 Append 已尝试时记录） |
+| `go_event.fetch` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
+| `go_event.claim` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
+| `go_event.claim.granted` | Counter | `event`, `identity` |
+| `go_event.lease.abandoned` | Counter | `event` |
+| `go_event.consume` | Counter | `mode`, `event`, `result` |
+| `go_event.handle.duration` | Histogram | `mode`, `event`, `result` |
+| `go_event.heartbeat` / `complete` / `fail` | Counter | `result`=ok/error |
+| `go_event.wake` | Counter | `result`=sent/dropped |
+
+属性值仅枚举与标识符（`identity` 为消费者身份，多实例区分维度）；业务
+payload（事件 ID、错误原文）不入属性。日志仅低频生命周期事件
+（`runner started/stopped`、`stopping, lease released for takeover` 等），
+错误经 `error.type` + `error` 字符串化上报。
+
+后端（pgxc / postgrec）只埋迁移生命周期，发射点单一（包级 `Migrate` /
+`Verify`，driver ensure 同路径无重复计量）：
+
+```go
+func WithLogger(l *slog.Logger) Option          // 缺省 slog.Default()
+func WithMeterProvider(mp metric.MeterProvider) Option // 缺省 otel.GetMeterProvider()
+func WithScopeName(scope string) Option         // 缺省模块名
+
+// 指标：<scope>.migrate（Counter）+ <scope>.migrate.duration（Histogram），
+// 属性 result=ok/canceled/lock_timeout/permission_denied/verify_conflict/
+// permanent/transient 与 schema；Migrate 成功打 Info 日志「migration applied」
+//（schema、mode、duration_seconds）。
+```
+
 ## 3. Postgres 后端签名（postgrec / pgxc）
 
 两个 Postgres 后端共享同一套能力与选项语义，仅连接载体不同：`postgrec`
@@ -839,7 +914,7 @@ func main() {
     _ = run.Start(ctx)
     defer run.Stop(ctx)
 
-    // 主流程：发布即返回，上游无感（事件侧糖与 pub.Publish 等价）
+    // 主流程：发布即返回，上游无感（事件侧糖与 event.Publish 等价）
     _ = docUploaded.Publish(ctx, pub, DocUploaded{DocID: "d-1"})
 }
 ```
