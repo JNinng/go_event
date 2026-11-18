@@ -79,8 +79,10 @@ TODO P1 收尾两项：
   时发出、不判断 deliver_at——推送只回答「有新行」，不回答「有可投递
   行」，消费侧空拉一趟由轮询兜底。
 - **payload 边界**：通道名 `go_event_wake_<schema>`（按 schema 隔离，
-  超出 Postgres 通道标识上限 63 字节的 schema 不适配——写路径退化为
-  无信号 INSERT，信号退化由轮询兜底，写路径永不因信号失败）；payload
+  超出 Postgres 通道标识上限 63 字节的 schema 以**确定性哈希通道名**
+  适配——前缀 + schema 前 32 字节 + 全名 FNV-1a 64 位哈希十六进制，
+  恰 63 字节；LISTEN 与 NOTIFY 两侧经同一函数派生必然一致，不存在退化
+  路径，写路径永不因信号失败）；payload
   只带 schema 名、**不带事件内容**（不携带事件 ID/type/payload）——
   信号无路由语义（通道本身即命名空间隔离），接收侧向本实例全部订阅
   广播唤醒（低频场景空拉一趟成本可忽略，design.md §1）。因此 core 的
@@ -95,7 +97,7 @@ TODO P1 收尾两项：
   负缓存同风格）并重新 LISTEN，连接生命周期以日志可见（`pgxc: wake
   listener connected` / `disconnected, reconnecting` / `connect failed,
   retrying` / `reconnect failed, retrying`——措辞区分断开、首连失败与
-  重连失败）。构造期非法 schema / 通道超限 / 连接池为 nil 时监听不
+  重连失败）。构造期非法 schema / 连接池为 nil 时监听不
   启动（信号退化由轮询兜底），不 fail-fast 整个进程。
 - **api 形态**：三个入口（`NewWake` / `Bind` / `Close`）+ core 一个
   桥接方法（`NotifyAll`），无新指标、无 Observer 事件、无新哨兵错误。

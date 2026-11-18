@@ -2,7 +2,9 @@ package pgxc
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,10 +14,17 @@ import (
 	"github.com/jninng/go_event"
 )
 
-// wakeChannelPrefix 是跨实例唤醒 NOTIFY 通道前缀，通道名 = 前缀 + schema
-// （ADR 0013 §2）。Postgres 通道标识上限 63 字节，超限的 schema 不适配
-// 唤醒通道——写路径退化为无信号 INSERT，跨实例唤醒由轮询兜底。
+// wakeChannelPrefix 是跨实例唤醒 NOTIFY 通道前缀，短 schema 通道名 =
+// 前缀 + schema（ADR 0013 §2）。Postgres 通道标识上限 63 字节：超限的
+// schema 以确定性哈希通道名适配（前缀 + 截断 + 全名哈希，两侧同源派生
+// 必然一致），不存在退化路径——任意合法 schema 都有唤醒通道。
 const wakeChannelPrefix = "go_event_wake_"
+
+// wakeChannelTrunc 是哈希通道名中保留的 schema 原名前缀长度：前缀 14
+// 字节 + 截断 32 字节 + 分隔 1 字节 + FNV-1a 64 位十六进制 16 字节
+// = 恰 63 字节（Postgres 标识上限）。schema 只允许标识符字符（ASCII），
+// 按字节截断安全。
+const wakeChannelTrunc = 32
 
 // appendInsertSQL 是事件 INSERT 的单一语句定义：普通 Append（自管连接，
 // 独立提交）与事务性 AppendTx（加入调用方业务事务）共用同一份，避免第
@@ -36,21 +45,18 @@ WITH ins AS (
 )
 SELECT pg_notify($7, $8) FROM ins`
 
-// appendInsertSQLNoWake 是无唤醒信号的 INSERT 变体：唤醒通道名超 Postgres
-// 标识上限时使用（信号路径退化，写路径语义与主变体完全一致，ADR 0013 §3）。
-const appendInsertSQLNoWake = `
-INSERT INTO %s.event (id, type, payload, metadata, occurred_at, deliver_at)
-VALUES ($1, $2, $3, $4::jsonb, $5, $6)
-ON CONFLICT (id) DO NOTHING`
-
-// wakeChannel 返回 schema 的唤醒通道名；超 Postgres 通道标识上限（63
-// 字节）返回空串（不适配，信号退化由轮询兜底）。
+// wakeChannel 返回 schema 的唤醒通道名：短 schema（前缀 + 全名不超
+// Postgres 标识上限 63 字节）直用全名；超限截取前 wakeChannelTrunc 字节
+// 并追加全名的 FNV-1a 64 位十六进制——确定性哈希，LISTEN 与 NOTIFY 两侧
+// 经同一函数派生必然一致（ADR 0013 §2）。
 func wakeChannel(schema string) string {
 	ch := wakeChannelPrefix + schema
-	if len(ch) > 63 {
-		return ""
+	if len(ch) <= 63 {
+		return ch
 	}
-	return ch
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(schema))
+	return wakeChannelPrefix + schema[:wakeChannelTrunc] + "_" + hex.EncodeToString(h.Sum(nil))
 }
 
 // deliverAtArg 把信封的 DeliverAt 归一为落库参数：零值存 NULL（立即可
@@ -63,19 +69,15 @@ func deliverAtArg(t time.Time) any {
 }
 
 // execAppend 执行事件 INSERT（普通 Append 与事务性 AppendTx 共用同一执行
-// 路径）：唤醒通道可用时走带 NOTIFY 的主变体，通道不可用时退化为无信号
-// 变体（写路径语义一致，仅跨实例信号缺位——由轮询兜底，ADR 0013 §3）。
+// 路径）：实际插入行时经 CTE 发跨实例唤醒 NOTIFY（幂等冲突不重发信号；
+// 延迟行同样在插入时发，不判断 deliver_at——推送只回答「有新行」，
+// ADR 0013 §2）。
 func (d *Driver) execAppend(ctx context.Context,
 	exec func(context.Context, string, ...any) (pgconn.CommandTag, error),
 	e event.RawEnvelope, meta string) error {
-	if d.wakeChannel != "" {
-		_, err := exec(ctx, fmt.Sprintf(appendInsertSQL, d.schema),
-			e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt),
-			d.wakeChannel, d.schema)
-		return err
-	}
-	_, err := exec(ctx, fmt.Sprintf(appendInsertSQLNoWake, d.schema),
-		e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt))
+	_, err := exec(ctx, fmt.Sprintf(appendInsertSQL, d.schema),
+		e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt),
+		d.wakeChannel, d.schema)
 	return err
 }
 

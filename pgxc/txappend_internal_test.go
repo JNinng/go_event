@@ -116,3 +116,43 @@ func TestTransactionalAppender_AppendTx_ExecFault_ReturnsWrappedError(t *testing
 		t.Fatalf("append tx = %v, want wrapped exec error", err)
 	}
 }
+
+// 唤醒通道名派生（ADR 0013 §2）：短 schema 直用前缀 + 全名；超 Postgres
+// 标识上限（63 字节）的 schema 走确定性哈希——恰 63 字节、同 schema 稳定、
+// 异 schema 不同名，LISTEN 与 NOTIFY 两侧经同一函数派生必然一致。
+func TestWakeChannel_LongSchema_DeterministicHash(t *testing.T) {
+	if got := wakeChannel("public"); got != "go_event_wake_public" {
+		t.Fatalf("short schema channel = %q, want direct name", got)
+	}
+
+	long := repeatSchema(56) // 前缀 14 字节 + 56 > 63：哈希路径
+	ch := wakeChannel(long)
+	if len(ch) > 63 {
+		t.Fatalf("hashed channel = %d bytes, want within Postgres identifier limit (63)", len(ch))
+	}
+	if !strings.HasPrefix(ch, wakeChannelPrefix) {
+		t.Fatalf("hashed channel = %q, want prefix %q", ch, wakeChannelPrefix)
+	}
+	if again := wakeChannel(long); again != ch {
+		t.Fatalf("channel not deterministic: %q vs %q", ch, again)
+	}
+	if other := wakeChannel(repeatSchema(55)); other == ch {
+		t.Fatal("distinct schemas must derive distinct channels")
+	}
+	// 截断边界：49 字节 schema（前缀 + 全名 = 63）仍是直名；50 字节起哈希。
+	exact := repeatSchema(49)
+	if got := wakeChannel(exact); got != wakeChannelPrefix+exact {
+		t.Fatalf("63-byte channel = %q, want direct name", got)
+	}
+	if got := wakeChannel(repeatSchema(50)); got == wakeChannelPrefix+repeatSchema(50) {
+		t.Fatal("64-byte channel must take the hash path")
+	}
+}
+
+func repeatSchema(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = 'a'
+	}
+	return string(b)
+}

@@ -50,9 +50,10 @@ type Wake struct {
 }
 
 // NewWake 构造跨实例唤醒总线并开始后台监听。schema 名在构造期校验：
-// 非法 schema、通道名超 Postgres 标识上限（63 字节）或连接池为 nil 时
-// 监听不启动（构造仍返回可用对象，跨实例信号退化由轮询兜底，ADR 0013
-// §3），仅记错误日志。选项与 NewDriver 共享（本面消费 schema 与 logger）。
+// 非法 schema 或连接池为 nil 时监听不启动（构造仍返回可用对象，跨实例
+// 信号退化由轮询兜底，ADR 0013 §3），仅记错误日志。任意合法 schema 都有
+// 唤醒通道（超长 schema 走确定性哈希通道名，见 wakeChannel）。选项与
+// NewDriver 共享（本面消费 schema 与 logger）。
 func NewWake(pool *pgxpool.Pool, opts ...Option) *Wake {
 	cfg := newConfig(opts)
 	w := &Wake{
@@ -63,11 +64,6 @@ func NewWake(pool *pgxpool.Pool, opts ...Option) *Wake {
 	if err := postgresschema.ValidateSchema(cfg.schema); err != nil {
 		w.logger.Error("pgxc: wake: invalid schema, listener not started",
 			"error", err.Error())
-		return w
-	}
-	if w.channel == "" {
-		w.logger.Warn("pgxc: wake channel exceeds Postgres identifier limit, listener not started",
-			"schema", cfg.schema)
 		return w
 	}
 	if pool == nil {

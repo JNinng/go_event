@@ -29,8 +29,9 @@ type Driver struct {
 	retention time.Duration
 	mode      event.MigrateMode
 	manager   schemaManager
-	// wakeChannel 是跨实例唤醒 NOTIFY 通道（前缀 + schema）；空串表示
-	// 通道不适配（超 Postgres 标识上限），写路径走无信号 INSERT 变体。
+	// wakeChannel 是跨实例唤醒 NOTIFY 通道（短 schema 为前缀 + 全名，
+	// 超长 schema 为确定性哈希通道名，见 wakeChannel）：任意合法 schema
+	// 都有通道，写路径恒带信号（ADR 0013 §2）。
 	wakeChannel string
 
 	ensureMu     sync.Mutex

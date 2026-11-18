@@ -198,6 +198,29 @@ func TestCrossInstanceNotify_MultipleInstances_AllWoken(t *testing.T) {
 	waitReceived(t, count2, 1, "instance 2 must be woken")
 }
 
+// 超长 schema（前缀 + 全名超 63 字节）：确定性哈希通道名适配（ADR 0013
+// §2）——LISTEN 与 NOTIFY 两侧同源派生，跨实例信号端到端可达，行为与
+// 短 schema 一致（不再有通道名退化路径）。
+func TestCrossInstanceNotify_OverlongSchema_HashedChannelWakes(t *testing.T) {
+	admin := migrationPool(t)
+	schema := repeatSchema(56) // 前缀 14 字节 + 56 > 63：哈希通道名
+	t.Cleanup(func() {
+		_, _ = admin.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+	})
+	if err := pgxc.Migrate(context.Background(), admin, pgxc.WithSchema(schema)); err != nil {
+		t.Fatalf("migrate overlong schema: %v", err)
+	}
+	count, _ := startWakeAssembly(t, schema, "", false) // 返回前 LISTEN 已就绪
+	pub := wakePublisher(t, schema)
+
+	if err := pub.PublishNoPayload(context.Background(),
+		event.Declare[event.NoPayload]("wake-cross-"+schema),
+		event.WithEventID("wake-long-1")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	waitReceived(t, count, 1, "notify over a hashed channel must wake the subscriber")
+}
+
 // 连接断开恢复：终止 LISTEN 专用连接（模拟断连），有界退避重连并重新
 // LISTEN（ADR 0013 §3）；重连窗口内的信号丢失由轮询兜底（ADR 0003），
 // 恢复后的信号路径照常端到端可达。重连完成以第二次「已连接」日志为

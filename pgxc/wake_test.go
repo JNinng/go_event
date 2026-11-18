@@ -119,9 +119,9 @@ func TestInvalidSchemaWake_NotStarted_NoPanic(t *testing.T) {
 	w.Close() // Close 幂等
 }
 
-// 通道名超 Postgres 标识上限：监听不启动（信号退化，ADR 0013 §3）。
-func TestOverlongChannelWake_NotStarted_NoPanic(t *testing.T) {
-	long := repeatSchema(56) // 前缀 14 字节 + 56 > 63
+// nil 连接池：监听不启动（构造仍返回可用对象），分发不 panic。
+func TestNilPoolWake_NotStarted_NoPanic(t *testing.T) {
+	long := repeatSchema(56) // 前缀 14 字节 + 56 > 63：哈希通道名路径
 	w := pgxc.NewWake(nil, pgxc.WithSchema(long), pgxc.WithLogger(discardSlog()))
 	w.Bind(event.NewLocalWake())
 	pgxc.NotifyForTest(w, "x")
