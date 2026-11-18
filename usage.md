@@ -292,8 +292,72 @@ err = pub.PublishNoPayload(ctx, cacheFlush)
   ID 是事件主键、**全局唯一**；重复发布同一 ID 首写为准，不校验 payload，新 payload 被丢弃（Metadata 与 OccurredAt 同样保留首写）。**跨事件类型复用同一 ID 不会报错**，而是静默视为同一事件、丢弃第二个 payload，因此业务键必须按类型加前缀（或与类型绑定）后才能当 ID 用。空串返回 `event.ErrEmptyEventID`；进程内锁不能跨实例去重，不要用它替代 ID 去重。
 - **幂等 Append**：重复发布同一 ID 视为成功，首写为准，不覆盖既有行、不触发重投。若需要“业务键去重”，应使用 `WithEventID` 传入按类型加前缀的稳定业务键。
 - **元数据透传**：`WithMetadata` 合并进事件元数据，后端原样存取。
-- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）属 P1 能力。
+- **延迟投递（`WithDeliverAt`）**：声明最早投递时刻（ADR 0013）——到期前行不满足 Fetch / Claim 的下推条件，到期后照常可投递；零值（缺省）= 立即，过去时刻等价立即不报错：
+
+  ```go
+  // 30 分钟后提醒（定时副作用）
+  err := reminderDue.Publish(ctx, pub, ReminderDue{UserID: u.ID},
+      event.WithEventID("reminder_due:"+reminderID),
+      event.WithDeliverAt(time.Now().Add(30*time.Minute)),
+  )
+  ```
+
+  仅声明「不早于」语义：投递仍经轮询/认领路径，最坏延迟等于轮询间隔，不保证恰在该时刻发生。**保留窗口自可投递时刻起算**（延迟行不因「等待投递」被清理，[§8.5](#85-保留窗口与惰性清理)）。**广播消费组合边界**：延迟行可能被内存水位越过而不再投递（[§5.2](#52-语义)）——需要定时必达用认领消费。
+- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）见 [§4.4](#44-事务内发布outbox)（`AppendTx` 同样可经 `RawEnvelope.DeliverAt` 设置延迟投递，语义与普通发布一致）。
 - 发布成功后若注入了 `LocalWake`，会向本进程对应类型的订阅发一次非阻塞唤醒信号。
+
+### 4.4 事务内发布（outbox）
+
+需要「业务写与事件入队原子生效」（outbox 模式）时，在**自己的业务事务**
+内用后端的 `TransactionalAppender` 追加事件；不需要事务内发布的场景可跳
+过本面。core 不定义接口（事务载体是后端具体类型），各后端以
+`NewTransactionalAppender` 构造或经 `Store.TransactionalAppender` 获得：
+
+```go
+ta := pgxc.NewTransactionalAppender(pool, pgxc.WithSchema("public"))
+
+tx, err := pool.Begin(ctx)
+if err != nil {
+    return err
+}
+defer tx.Rollback(ctx)
+
+if _, err := tx.Exec(ctx,
+    "INSERT INTO orders (id, amount) VALUES ($1, $2)", orderID, amount,
+); err != nil {
+    return err
+}
+// 事件 INSERT 与业务写共享同一事务，随事务原子提交/回滚（ADR 0012）。
+if err := ta.AppendTx(ctx, tx, event.RawEnvelope{
+    ID:         "order.created:" + orderID, // 业务键按类型加前缀
+    Type:       "order.created",
+    Payload:    payload,
+    OccurredAt: time.Now().UTC(),
+}); err != nil {
+    return err
+}
+if err := tx.Commit(ctx); err != nil {
+    return err
+}
+```
+
+语义边界（契约，`eventtest.RunTransactionalAppendSuite` 钉死）：
+
+- **提交与回滚归调用方**：库不 begin、不 commit；事务回滚不产生事件行，
+  幂等口径与普通发布一致（同 ID 首写为准）。
+- **提交前对外不可见**：未提交事务内的事件对 Fetch / Claim /
+  HeadPosition 均不可见；提交后经轮询/认领可见。
+- **广播投递边界（务必知晓）**：事务内发布不发就近唤醒信号；并发提交
+  的更大 position 会把广播实例的内存水位推过晚提交的行，该行对在途广播
+  实例可能**永久漏投**（详见 [§5.2](#52-语义)）。需要可靠投递的业务事件
+  用认领消费——Claim 直接查库，不受水位影响。
+- **不发射观测、不触发清理**：库侧发射点都在提交前、与回滚后的落库事实
+  可能矛盾，故 `AppendTx` 不发指标/日志/Observer 事件（业务事务成败在
+  调用方自己的提交点计量）；惰性清理 DELETE 不落入调用方事务，由普通
+  发布/认领路径照常机会性承担。
+- **position**：同事务内按追加序分配、不承诺跨事务连续；回滚消耗的序号
+  不回收（Postgres 序列不回收），缺口不影响消费契约（Fetch 严格大于、
+  升序）；`AppendTx` 不返回 position，不要把事务内的位置信息当水位用。
 
 ## 5. 广播消费
 
@@ -318,7 +382,9 @@ err := docUploaded.SubscribeBroadcast(run,
 
 - **发完即忘**：不承诺 at-least-once，不承诺保序；handler 返回错误或 panic 仅记日志并跳过，不重试、不阻塞、不设死信。
 - **存储侧无簿记**：已读水位保存在实例内存中，按订阅在 `Fetch` 时下推，只进不退。
-- **起点在 `Start`**：`Runner.Start` 内对每个广播订阅调用 `Driver.HeadPosition`，把水位锚定到该类型当前最大位置。**Start 返回之后发布的事件才会被投递**；停机期间与 Start 之前发布的事件不补投。
+- **起点在 `Start`**：`Runner.Start` 内对每个广播订阅调用 `Driver.HeadPosition`，把水位锚定到该类型当前最大位置。**Start 返回之后发布的事件才会被投递**；停机期间与 Start 之前发布的事件不补投。锚点只锚已提交行（[§4.4](#44-事务内发布outbox) 未提交事务内的事件不进基线）。
+- **事务内发布可能漏投（outbox 边界，ADR 0012）**：position 分配序与提交可见序在事务内发布下可能乱序——并发提交的更大 position 会把内存水位推过晚提交的行，该行对所有在途广播实例**永久不可见**（重启实例的基线锚定同样不含）。「Start 后发布的事件必然可投递」仅对普通发布路径成立（单语句独立提交，理论残余窗口可忽略——Postgres 无提交序全局串行化，幂等 Append 同 ID 冲突会等待在途事务，窗口非绝对为零、非绝对保证）；需要可靠投递的业务事件用认领消费（Claim 直接查库，不受水位影响）。
+- **延迟事件可能被水位越过（延迟 + 广播组合边界，ADR 0013）**：延迟行占用 position；到期前被下推条件过滤、不推进水位，但其后发布的即时行会把水位推过延迟行——该行到期后**不再有广播可见性**（与上一条同源：水位只进不退）。「延迟事件 + 广播消费者」只适用于漏掉可容忍的通知类事件；需要定时必达用认领消费（Claim 无水位条件，到期后最迟下一认领轮次可见）。
 - **多实例各自全收**：每个活跃实例独立拉取并处理全部事件，实例间互不感知；实例数不影响语义。
 - **只接受通用选项**：广播订阅只允许 `WithConcurrency` 与 `WithFetchLimit`；传入认领专属选项返回 `event.ErrNotClaimSubscription`。
 - **基线失败不启动**：任一广播订阅的 `HeadPosition` 查询失败，`Start` 返回错误且整体不启动，修复后可重试。
@@ -370,12 +436,13 @@ err := vectorize.SubscribeClaim(run,
 
 - handler 返回 `nil`：调用 `Complete` 置 `done`，幂等且不可逆。
 - handler 返回错误或 panic：调用 `Fail`，递增重试计数并按退避置为可再次认领；计数达 `RetryLimit` 时置 `failed` 终态，不再认领。
-- 租约过期被接管也计一次失败（前任未 Fail 而失去租约）；否则每轮挂死的事件会被无限接管。
+- 进入 `failed` 终态时，错误文本以清洗后的摘要落库（`last_error`，去除 Unicode 控制字符、截断 4 KiB、不含堆栈）并记录终态时刻（`failed_at`）；重试中不写。可直接查库排障（`SELECT ... FROM event_claim WHERE status = 'failed'`），见 [§8.3](#83-持久结构)。
+- 租约过期被接管也计一次失败（前任未 Fail 而失去租约）；否则每轮挂死的事件会被无限接管。接管达上限直接置 `failed`，只写 `failed_at`（该路径没有本次处理错误，无摘要）。
 - 退避由 `Backoff.Next(attempt)` 计算，`attempt` 从 1 开始。内建实现：
   - `event.LinearBackoff(base, max)`：`base × attempt`，封顶 `max`。
   - `event.ExponentialBackoff(base, max)`：`base × 2^(attempt-1)`，封顶 `max`。
   - 缺省 `ExponentialBackoff(1s, 1h)`；可实现 `event.Backoff` 自定义。
-- 迟到的 `Complete`/`Fail`（租约已过期或被接管）不生效：不会覆盖新属主状态，也不会递增计数。这是正常结果，Driver 返回 `nil`。
+- 迟到的 `Complete`/`Fail`（租约已过期或被接管）不生效：不会覆盖新属主状态，也不会递增计数或写入摘要。这是正常结果，Driver 返回 `nil`。
 
 ### 6.5 至少一次与幂等
 
@@ -413,6 +480,24 @@ _ = job.SubscribeClaim(run, func(ctx context.Context, e event.Envelope[Job]) err
 - `LastAttempt` 由 core 按订阅级 `RetryLimit` 计算：`Attempts >= RetryLimit` 时为 true（即本次是最后一次尝试）；用 `>=` 判定以防御多实例间的订阅配置差异。
 - 边界：最后一次尝试的租约可能未被真正执行（进程崩溃/停机、或 handler 超 `MaxProcessing` 被接管）；此后接管会在认领时直接置 `failed`、不再补发租约，因此 handler 不得假设 `LastAttempt` 必然出现。它只用于观测与幂等辅助，不能替代业务终态处理（当前版本不提供终态回调）。
 - 广播订阅恒为 `0` / `false`。
+- **`Attempts > 1` 不能当作接管计数**：它混合了显式 Fail 重试与过期租约接管两种来源；接管专属的事实由 `Driver.Claim` 随轮返回的 `ClaimResult` 承载（`Takeovers` 只计接管过期租约的发放、含终态接管；`TerminalFailed` 单独统计认领直接置 failed 的数量），经 `<scope>.claim.takeover` / `.terminal_failed` 指标与 `ObserverV4.OnClaim` 事件可见（ADR 0011）。
+
+### 6.8 接管与终态计数（ClaimResult）
+
+认领消费的多实例接管（前任失去租约）与「达重试上限直接置 failed」是排障
+与 SLA 观测的关键事实，`Claim` 把每轮的落库事实随 `ClaimResult` 返回，
+core 的 Runner 据此计量（与 `Inspector` 查询、落库状态可对账）：
+
+- `Leases`：本轮发放的租约；
+- `Takeovers`：本轮接管过期租约而发放的数量，含接管后直接置 failed 的
+  终态接管；无主首次认领与 Fail 退避期满的重认领（Fail 时已计入）不计入；
+- `TerminalFailed`：本轮认领动作直接置 failed 的数量。当前认领语义下置
+  终态的下推条件要求租约已过期，认领侧终态必经接管路径（恒有
+  `TerminalFailed ≤ Takeovers`），一次终态接管同时计入两者。
+
+`Lease` 不承载接管标记；直接调用 Driver 的应用可直接读 `ClaimResult`，
+经 Runner 编排的应用看 §13.2 的指标。决策与口径见
+[ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)。
 
 ## 7. 多身份与混合订阅
 
@@ -507,10 +592,14 @@ drv := postgrec.NewDriver(db,
 
 两个 Postgres 后端的表结构一致：
 
-- `event`：`id` 主键、`type`、`payload bytea`、`metadata jsonb`、`occurred_at`、`position bigserial`，并有 `(type, id)` 唯一约束与 `(type, position)` 索引。
-- `event_claim`：主键 `(event_id, consumer_type)`，含 `lease_token`、`lease_until`、`claim_count`、`status`、`next_eligible_at`；`event_id` 外键级联删除。
+- `event`：`id` 主键、`type`、`payload bytea`、`metadata jsonb`、`occurred_at`、`position bigserial`，以及版本计划 v3 加列 `deliver_at`（最早投递时刻，可空 timestamptz——NULL 即零值 = 立即可投递，延迟事件 ADR 0013），并有 `(type, id)` 唯一约束与 `(type, position)` 索引。
+- `event_claim`：主键 `(event_id, consumer_type)`，含 `lease_token`、`lease_until`、`claim_count`、`status`、`next_eligible_at`，以及版本计划 v2 加列 `last_error`（错误摘要，可空 text）与 `failed_at`（进入 `failed` 终态的时刻，可空 timestamptz）；`event_id` 外键级联删除。摘要与终态时刻仅终态写入：`failed_at` 非空 ⟺ 行当前处于 `failed` 终态；`last_error` 是最近一次终态失败的清洗后摘要（截断 4 KiB、去控制字符、不含堆栈，空错误文本落 NULL）。
 
 DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语句、期望对象与共享执行器，无驱动依赖），两个后端使用同一份计划。首次操作是否建表、建到什么程度由迁移模式决定，见 [§8.4](#84-迁移模式与权限)。缺省模式 `Create` 会在首次操作时以构造 Driver 的连接（通常是运行账号）幂等应用版本计划全量语句。
+
+只读查询面 `event.Inspector`（可选接口，pgxc / postgrec 均已提供）直接查询这两张表：状态与分档计数按 `event_claim` 行的 `status` 列与「无认领行」分档，failed 列表取 `status='failed'` 行并随行返回 `last_error` / `failed_at`——查询与落库事实严格对齐，见 [§11](#11-运维注意事项) 的「failed 事件查询」。`NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL，只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
+
+管理写路径由独立 `event.Admin`（可选接口，pgxc / postgrec / inmem 均已提供）承载：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领，写法与 `event_claim` 落库事实对齐（置 `retrying`、`claim_count=0`、清租约、`failed_at=NULL`、`last_error` 保留），见 [§11](#11-运维注意事项) 的「failed 手工重放（Admin）」。`NewAdmin` 与 `NewDriver` 共享连接与命名空间选项，写路径不经 Driver 类型暴露、不经运行面类型获得——经 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径，见 [§8.7](#87-组合对象-store)），鉴权由使用方负责。写路径在事务内持与迁移执行共用的命名空间互斥锁（与迁移串行化，等待有界），并发射操作来源观测（指标 / 日志 / Observer 事件，见 [§13](#13-可观测otel--slog)）。
 
 ### 8.4 迁移模式与权限
 
@@ -530,7 +619,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
 - **无 DDL 权限的运行连接不能自动迁移**：`Create` 与显式 `Migrate` 同义，都以构造 Driver 的连接（通常是运行账号）执行 DDL。权限不足时返回 `event.ErrMigrationPermissionDenied` 并 fail-fast；正确做法是在部署期用高权限连接建表（调用 `Migrate` 或执行 `SQL` 导出的脚本），运行期改用 `Verify` 或 `None`。若后端锁能力为无（`LockNone`），`Create` 返回 `event.ErrMigrationUnsupported`；DDL 原子性为无是另一维度，同样只能 `Verify`/`None`。
 - **失败缓存与重试有界**：`ensure` 的失败按 Driver 实例负缓存。瞬时错误（数据库不可用、`ErrMigrationLockTimeout`）按指数退避重试（100ms 起、封顶 30s），窗口内所有操作返回同一错误，不会在每次 Append/Claim 时重跑全部 DDL；永久配置错误（权限不足、对象定义冲突、非法 schema、后端不支持自动迁移）直接 fail-fast，不再重试。调用方取消不算迁移结论，不写入负缓存。
 - **部署补建后需重启或重建 Driver**：永久配置错误在 Driver 生命周期内保持；`Verify` 首次通过后同样缓存「已检查」。表结构在运行期被改动时，只有重建 Driver 才会重新判定。
-- **`Verify` 报告结构**：`event.VerifyReport` 含 `Issues []event.VerifyIssue`，每项含对象标识、对象类型、问题类别与处置说明（`Action`）；`Issues` 为空表示与计划期望一致。问题类别为 `missing`（对象缺失：待升级，处置为执行迁移；缺失基线列例外——迁移不修改既有表，须人工加列）与 `outdated`（定义与计划期望不一致，不自动修复）；`too_new` / `failed` 为预留枚举，当前模型不产生。
+- **`Verify` 报告结构**：`event.VerifyReport` 含 `Issues []event.VerifyIssue`，每项含对象标识、对象类型、问题类别与处置说明（`Action`）；`Issues` 为空表示与计划期望一致。问题类别为 `missing`（对象缺失：待升级，处置为执行迁移；版本加列如 `last_error` / `failed_at` 缺失即属此类，可由迁移自动补齐）与 `outdated`（定义与计划期望不一致，不自动修复；缺失基线列属此类——迁移不修改既有表，须人工加列）；`too_new` / `failed` 为预留枚举，当前模型不产生。
 - **`Statements` / `SQL` 导出物**：两者由同一版本计划派生。`Statements` 返回计划内全部语句清单（不含迁移锁）；`SQL` 返回可手工执行的整段脚本：以 `BEGIN` 开始，随后设 `lock_timeout` 并取迁移锁（锁语句位于全部 DDL 之前），随后依次输出计划内全部语句（基线 + 各版本，全部幂等），末尾 `COMMIT`。脚本整段可重放（中断重跑收敛）；手工执行 `SQL` 无需额外取锁；若按 `Statements` 逐条手工执行，必须先自行取锁并整段执行，否则并发首启会出现 DDL 竞态。
 - **保留窗口不受影响**：迁移模式只决定持久结构的初始化方式，不改变 [§8.5](#85-保留窗口与惰性清理) 的保留期与惰性清理语义。
 
@@ -538,7 +627,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
 
 ### 8.5 保留窗口与惰性清理
 
-- `WithRetention` 缺省 7 天。清理资格统一为：**超过保留窗口且无活跃租约的行，无论终态与否**；窗口以事件的 `OccurredAt` 判定。
+- `WithRetention` 缺省 7 天。清理资格统一为：**超过保留窗口且无活跃租约的行，无论终态与否**；窗口以事件的「可投递时刻」判定（`COALESCE(deliver_at, occurred_at)`，ADR 0013）——零值 `deliver_at` 行（含全部存量行）以 `occurred_at` 判定，语义与历史完全一致；延迟行不因「等待投递」被清理（保留期从可投递时刻起算），`deliver_at` 晚于保留窗口是合法用法、不截断不报错。
 - 清理是机会性的：随 `Append` 触发，并按 `max(retention/4, 50ms)` 做墙钟节流；清理失败静默，不影响主流程。
 - 对认领消费，保留窗口是语义硬边界：`done` 行过窗即删，“完成状态可查”只在窗口内成立；窗口必须覆盖最坏重试路径，建议：
 
@@ -546,6 +635,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
   保留窗口 ≥ 重试上限 × (最大退避 + 最大处理时长) + 心跳间隔 + 时钟偏差余量
   ```
 
+  使用延迟投递时窗口另需覆盖投递后的消费路径（自可投递时刻起算）。
 - 对广播消费，保留窗口仅是存储清理边界，没有额外投递语义。
 
 ### 8.6 inmem
@@ -557,7 +647,45 @@ drv := inmem.New()                          // 缺省不清理
 drv = inmem.New(inmem.WithRetention(time.Minute))
 ```
 
-条件过滤在内存模拟，仅供测试使用。
+条件过滤在内存模拟，仅供测试使用。事务性入队（outbox，[§4.4](#44-事务内发布outbox)）
+同样可用：`inmem.NewTransactionalAppender(drv)` 提供最小缓冲事务模拟
+（`BeginTx` / `AppendTx` / `Commit` / `Rollback`），便于业务代码在单元
+测试中走与生产一致的 outbox 路径。
+
+### 8.7 组合对象 Store
+
+若调用方希望一个对象同时持有运行面 / 查询面 / 管理面 / 事务性入队，后端
+提供便利构造 `NewStore`（组合而非合并接口；核心仍保持独立能力）。三后端
+形态一致（结构兼容、非接口契约——core 不定义 `event.Store`）：
+
+```go
+st := pgxc.NewStore(pool, pgxc.WithSchema("public")) // postgrec / inmem 同构
+
+pub := event.NewPublisher(st.Driver, event.WithLocalWake(wake))
+run := event.NewRunner(st.Driver, event.WithIdentity("worker"))
+// 排障与运维：st.Inspector 查询状态与 failed 列表；st.Admin 重放 failed
+admin := st.Admin
+// outbox：st.TransactionalAppender 在业务事务内追加事件（§4.4）
+ta := st.TransactionalAppender
+```
+
+要点：
+
+- **便利构造，非能力面**：`Store` 是后端具体类型，不实现任何能力接口；
+  `NewPublisher` / `NewRunner` 仍接收 `st.Driver`。持有 Admin 是容器聚合，
+  不是把管理写路径挂到 Driver 类型上——对 `Driver` 做 `event.Admin` 类型
+  断言仍不成立，管理写路径只经 `st.Admin` 或 `NewAdmin` 获得，鉴权由
+  使用方负责（ADR 0010）。
+- **三面同源**：选项解析一次、经同一份配置传导（观测三面共享同一 scope
+  与 logger / Observer）；内部只建一个 Driver 实例——Inspector 视图与
+  Admin 复用同一实例（共享 ensure 状态与失败负缓存），各面行为与独立
+  构造（`NewDriver` / `NewInspector` / `NewAdmin`）完全等价，eventtest
+  的 `RunStoreSuite` 契约钉住三面互通。
+- **迁移语义沿 `NewDriver` 现状**：`NewStore` 构造不触发迁移，首次操作时
+  按迁移模式处理持久结构（缺省 `Create`），见 [§8.4](#84-迁移模式与权限)。
+- **inmem 的 Store**：三面共享同一份内存状态；`Store.Admin` 为缺省构造
+  （无 Observer），需要观测注入或缩短锁等待的测试可经
+  `inmem.NewAdmin(st.Driver, ...)` 构造等价 Admin 替换。
 
 ## 9. 测试
 
@@ -606,12 +734,15 @@ func TestVectorizeFlow(t *testing.T) {
 
 ### 9.2 为新后端跑契约测试
 
-实现 `event.Driver` 后，必须通过全套契约测试：
+实现 `event.Driver` 后，必须通过全套契约测试。Driver 须实现
+`eventtest.ClaimStateReader`（套件据它断言 Fail 错误摘要与 `failed_at`
+的落库事实，[§6.4](#64-成功与失败)）：`eventtest/inmem` 原生实现，
+Postgres 后端在测试装配处以 SQL 查询 `event_claim` 行适配：
 
 ```go
 func TestMyBackendContract(t *testing.T) {
     drv := newMyDriver(t)
-    eventtest.RunSuite(t, drv)
+    eventtest.RunSuite(t, drv) // drv 须满足 eventtest.ClaimStateReader
 }
 
 func TestMyBackendRetention(t *testing.T) {
@@ -623,6 +754,18 @@ func TestMyBackendRetention(t *testing.T) {
 ```
 
 `RunRetentionSuite` 的 `newDriver` 不能复用实例：清理簿记按 Driver 实例记忆并有节流，共享实例会让部分用例被跳过。
+
+提供只读查询面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunInspectorSuite`：套件对传入的 Driver 做 `event.Inspector` 类型断言探测，失败即 Fatal——查询结果与 Claim/Fail/Complete 落库事实的比对是查询面契约的一部分。
+
+提供管理面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunAdminReplaySuite(t, d, admin)`：管理写路径不经 Driver 类型暴露，`admin` 由后端 `NewAdmin` 构造传入（与 `d` 共享状态/连接），缺失即 Fatal——重放语义（仅 failed 可重放、计数归零、判别统一、`last_error` 保留 / `failed_at` 清空、并发 CAS 防护）是管理面契约的一部分。互斥与操作来源记录同样是契约约束，套件经两个注入接口断言、缺失即 Fatal：
+- `eventtest.AdminExclusionLock`（`HoldExclusionLock`）：后端测试装配从外部占用与 Admin 写互斥的命名空间锁（与迁移执行同一把——Postgres 后端为迁移 advisory 键，inmem 为进程内等价信号量），套件断言锁占用期间重放返回 `ErrAdminLockTimeout` 且行不变、释放后重放生效；
+- `eventtest.AdminObserverSetter`（`WithReplayObserver`）：返回挂接观测旁路的等价 Admin 实例，套件断言 `event.AdminReplayEvent` 的结果枚举与事件 × 身份。
+
+提供组合对象 `Store` 的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunStoreSuite(t, st.Driver, st.Inspector, st.Admin)`：套件只验证「三面同源、行为与独立构造等价」——同一 Store 的 Driver 落库事实对 Inspector 可见、Admin 重放对 Driver 生效（重放行可被再次认领并完成）；各面完整语义仍由上述三套件约束，不重复。
+
+提供事务性入队（outbox）的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunTransactionalAppendSuite(t, d, beginTx)`：套件不绑定后端事务载体（pgxc 为 `pgx.Tx`、postgrec 为 `*sql.Tx`、inmem 为缓冲模拟），由测试装配把「事务内 Append / 提交 / 回滚」打包成 `eventtest.TxSession` 传入。覆盖回滚零事件、中途回滚连带先前 Append 一起丢弃（钉住「不逐条自治提交」）、提交前对外不可见（隔离性与 HeadPosition 锚点）、提交后广播/认领可见、事务内幂等（首写为准）、回滚 position 缺口不破坏消费、乱序边界（并发业务事务交错提交下广播漏投、认领不受影响，ADR 0012）。
+
+延迟事件（信封字段，全后端同形）加跑 `eventtest.RunDelayedDeliverySuite(t, drv)`：零值/过去时刻立即可投递、到期前 Fetch / Claim 不可见、恰好到期边界（时钟注入，含到时刻本身）、信封 `DeliverAt` 原样透传、延迟行与广播水位的组合边界（水位越过即不再广播、认领不受影响，ADR 0013）。
 
 迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
@@ -647,6 +790,7 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithEventID(id)`（发布级） | 显式指定事件 ID，优先于生成器；空串返回 `ErrEmptyEventID` | 使用生成器 |
 | `WithPublisherCodec(c)` | payload 编码 | JSON |
 | `WithLocalWake(w)` | 发布成功后的同进程唤醒 | 无 |
+| `WithDeliverAt(t)`（发布级） | 延迟投递：最早投递时刻，零值 = 立即；过去时刻等价立即（ADR 0013） | 立即可投递 |
 | `WithMetadata(m)`（发布级） | 合并元数据 | 无 |
 | `WithMeterProvider(mp)` | 指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
 | `WithScopeName(s)` | 指标 scope 与名前缀 | `go_event` |
@@ -686,15 +830,21 @@ func TestMyBackendRetention(t *testing.T) {
 | --- | --- | --- |
 | `WithSchema(s)` | 表所在 schema | `public` |
 | `WithRetention(d)` | 保留窗口 | 7 天 |
-| `WithMigrateMode(m)` | 运行面迁移模式：`Create` / `Verify` / `None`（只对 `NewDriver` 有意义） | `Create` |
-| `WithLogger(l)` | 迁移生命周期日志 | `slog.Default()` |
-| `WithMeterProvider(mp)` | 迁移指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
-| `WithScopeName(s)` | 迁移指标 scope 与名前缀 | 模块名（`pgxc` / `postgrec`） |
+| `WithMigrateMode(m)` | 运行面迁移模式：`Create` / `Verify` / `None`；对 `NewDriver` / `NewStore`（内部 Driver 构造期）生效，显式传给包级 `Migrate` 返回 `ErrMigrateModeUnsupported` | `Create` |
+| `WithLogger(l)` | 迁移与管理面生命周期日志 | `slog.Default()` |
+| `WithMeterProvider(mp)` | 迁移与管理面指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
+| `WithScopeName(s)` | 迁移与管理面指标 scope 与名前缀 | 模块名（`pgxc` / `postgrec`） |
+| `WithObserver(o)` | 类型化观测旁路（当前仅 Admin 发射 `AdminReplayEvent`） | 无 |
+
+以上选项同样适用于 `NewStore`（[§8.7](#87-组合对象-store)）：解析一次、
+经同一份配置传导三面。
 
 ## 11. 运维注意事项
 
 - **选型**：通知类用广播；需要补投、失败重试、完成追踪的任务用认领。
 - **广播不补投**：Start 之前与停机期间发布的事件不会投递；重启从当前头部开始。关键业务不要依赖广播保证送达。
+- **延迟事件投递是「不早于」**：`WithDeliverAt`（[§4.3](#43-发布语义)）保证到期前不被 Fetch / Claim 拾取，但不保证恰在该时刻投递——最坏延迟等于轮询间隔（需要更低延迟可调小 `WithPollInterval` 或用 pgxc `Wake` 的发布信号）。延迟事件与广播消费的组合有**水位越过边界**（[§5.2](#52-语义)）：延迟行可能被其后发布的即时行推过水位而永久漏广播——定时必达的延迟事件（提醒、定时任务类）用认领消费。保留窗口自可投递时刻起算（[§8.5](#85-保留窗口与惰性清理)），投递后的消费路径仍需窗口覆盖。
+- **outbox 事件与广播的组合边界**：事务内发布（[§4.4](#44-事务内发布outbox)）的事件可能被并发提交的更大 position 越过广播水位而**永久漏投**（ADR 0012）；outbox 模式下承载业务事实的事件应走认领消费，广播订阅只接受「漏掉可容忍」的通知类事件。`AppendTx` 不发射库侧观测（发射点在提交前，与回滚后的事实可能矛盾）——业务事务的成败指标在调用方自己的提交点计量；惰性清理不落入调用方事务，事件行仍受保留窗口约束。
 - **幂等**：认领消费一定按 at-least-once 设计 handler，以事件 ID 为幂等键。
 - **显式 ID 去重是全局的**：ID 全局唯一，不同事件类型必须使用带类型前缀的业务键；跨类型复用同一 ID 会静默丢弃第二个 payload。去重边界由存储保证，进程内锁不能跨实例去重。
 - **重复处理是正常的**：慢 handler 被误接管、心跳丢失等场景会出现并发重复处理；库不在消费路径做去重。
@@ -703,9 +853,24 @@ func TestMyBackendRetention(t *testing.T) {
 - **数据库权限**：自动迁移（`Create`）与显式 `Migrate` 同义，都需要 DDL 权限，且 `ensure` 在运行期以构造 Driver 的连接执行 DDL。**无 DDL 权限的运行连接不能自动迁移**：在部署期用高权限连接调用 `Migrate`（或执行 `SQL` 脚本）建表，运行期用 `WithMigrateMode(event.MigrateVerify)` 做启动自检，或 `None` 完全交给部署流程。
 - **升级随部署隐式发生**：新二进制包含新版本语句时，`Create` 的首次操作（或显式 `Migrate`、重放 `SQL` 脚本）会幂等补齐缺失对象，没有独立的升级命令与停服窗口控制；升级语义要求每个版本的语句向后兼容，或停服迁移。
 - **停机**：`Stop` 等待在途 handler；handler 本身过长会拖住停机，给 `Stop` 传超时 ctx 作为兜底。
-- **轮询开销**：默认 5s 轮询一次；低频场景可调大，需要低延迟时注入 `LocalWake`（仅同进程）或后续使用 LISTEN/NOTIFY（P1）。
+- **轮询开销**：默认 5s 轮询一次；低频场景可调大。需要低延迟时：同进程注入 `LocalWake`；跨实例用 pgxc 的 `Wake`（LISTEN/NOTIFY 推送唤醒，ADR 0013）——`wk.Bind(wake)` 桥接后，同 schema 任一实例发布即触发本实例立即拉取/认领；postgrec 无此面（退化轮询）。跨实例信号仅加速，不承载投递保证：`Wake` 的监听连接断开期间信号丢失由轮询兜底，且它长持一条池连接（连接池容量配置需留意）。延迟行（`WithDeliverAt`）的 NOTIFY 在插入时发出、不判断到期——消费侧可能空拉一趟，到期后由轮询照常拾取。
 - **消费者身份变更**：新增身份会重放窗口内全部历史事件；改名等同于新身份，不是断点续跑。
-- **failed 事件**：当前版本没有管理面接口；P1 将提供 failed 查询与手工重放（仅 `failed` 可重放，`done` 不可逆）。
+- **failed 事件查询（Inspector）**：只读查询面 `event.Inspector` 已提供三类查询，按能力探测接入（对 Driver 做 `event.Inspector` 类型断言，或经后端 `NewInspector` 显式构造，与 Driver 共享连接与命名空间选项）：
+  - 某（事件 × 消费者身份）的当前状态与重试计数：无认领行即「待处理」（ok=false），其余按落库 `status` 报 processing / retrying / done / failed（不做租约过期推断）；
+  - 按消费者身份对事件类型的分档计数：**「待处理」= 该身份无认领行**（而非「退避中」），retrying / processing / failed / done 按认领行 `status` 分档，五档互斥且合计等于该类型事件总数；
+  - failed 事件偏移分页列表：`last_error` / `failed_at` 随行返回，按 `failed_at` 降序（最新在前）、同刻按事件 ID 升序；Offset 越界返回空列表（非错误），`Limit <= 0` 返回空，偏移分页无快照——跨页间隙的终态变化可能造成重复或遗漏。**升级边界**：不变式「`failed_at` 非空 ⟺ failed」仅对 v2 加列后的写路径成立——v2 是 `ADD COLUMN`、无回填，升级前已存在的 failed 行该列为 NULL，列表中映射为零值。
+  - 结果仅在**保留窗口内可见**（硬边界）：超窗行被惰性清理删除后自然查不到，Inspector 不做额外过滤。
+  - `NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL——只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
+  - 也可直接查库定位：`event_claim` 的 `last_error` / `failed_at`（`failed_at IS NOT NULL` 即当前 failed 行，见 [§6.4](#64-成功与失败)）。
+- **failed 手工重放（Admin）**：管理写路径由独立 `event.Admin` 承载（pgxc / postgrec / inmem 均提供 `NewAdmin`，与 Driver 共享连接与命名空间选项；不进 Driver、不挂后端 Driver 类型——「非管理面路径无法调用」由类型形态保证），当前唯一操作 `ReplayFailed(ctx, eventID, consumerType, now)` 把（事件 × 消费者身份）的 failed 终态行重新置为可认领：
+  - 仅 `status='failed'` 的行可重放：`done` 幂等不可逆、不重放；`active`（租约活跃）与 `retrying`（自动重试退避中）拒绝且不改动；行不存在（事件未知、超保留窗口被清理、该身份尚无认领行）与非 failed 行判别统一——返回 `ok=false` 且无错误，需要区分原因先经 `Inspector.ClaimState` 查询；执行故障经 `error` 返回。
+  - 重放写入：置 `retrying`、`claim_count=0`（此后 Fail 的重试计数从合法范围重新开始）、清 `lease_token`、`lease_until` 置为重放时刻（原租约凭证失效）、`next_eligible_at=now`（立即可认领、不做退避）、`failed_at=NULL`、`last_error` 保留（排障历史，直到下一次终态失败覆盖）。
+  - 并发防护是单条条件更新（CAS，仅命中 `status='failed'`）：并发重放恰好一次生效；已被重新认领（接管）或已完成的行不受迟到重放影响。**行归属校验即 CAS 本身**：以（事件 × 消费者身份）主键定位唯一认领行、以 `status='failed'` 限定可改写集合，命名空间由构造期固定并校验的 schema 限定——不满足即不归属（不命中、`ok=false`），不产生跨行 / 跨命名空间改写。
+  - **与迁移互斥**：重放在事务内持与迁移执行相同的命名空间互斥锁（键含 schema，不同 schema 互不阻塞）——迁移执行期间发起的重放有界等待，超时返回 `event.ErrAdminLockTimeout`（瞬时错误，退避后重试）；互斥是串行化而非拒绝，锁释放后重放照常生效。
+  - **操作来源记录**：每次重放发射 otel 指标 `<scope>.admin.replay`（`result` 属性，见 [§13.2](#132-指标口径)）、一行 slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附 error.type / error 分类属性）与 `event.AdminReplayEvent` 观测事件（`WithObserver` 注入、`ObserverV3` 分发）。观测均为旁路，失败不影响业务结果。
+  - **错误分类与排查入口**：`event.ErrAdminLockTimeout`（锁等待超时，瞬时——检查是否有迁移执行或长事务持锁）；迁移面哨兵（`ErrInvalidSchema` / `ErrMigrationPermissionDenied` / `*event.VerifyError` 等，经首次操作的迁移模式处理产生，处置见 [§8.4](#84-迁移模式与权限)）；连接 / 驱动故障（原样包装，以 `error.type` / SQLSTATE 判别后按驱动语义处置）。执行故障一律 `error` 返回，不会折叠为 `ok=false`。
+  - **重放窗口 = 保留窗口**：超窗行已被惰性清理删除，重放该键即 `ok=false`——发现 failed 后应在保留窗口内处置；窗口配置见 [§8.5](#85-保留窗口与惰性清理)。
+  - 鉴权与操作审计由使用方负责：管理面对象只应授予运维角色。管理面只提供上行写操作，**不提供自动 down**；迁移侧无台账，无需 reset/stamp 入口，schema 异常经迁移重跑或人工修复（[§8.4](#84-迁移模式与权限)、[ADR 0007](docs/adr/0007-migration-mode-and-protocol.md)）。
 
 ## 12. 错误与排查
 
@@ -722,6 +887,7 @@ func TestMyBackendRetention(t *testing.T) {
 | `event.ErrMigrationUnsupported` | 锁能力为无（`LockNone`），`Create` 不支持自动迁移 | 改用 `Verify`/`None`，由部署流程建表 |
 | `event.ErrMigrateModeUnsupported` | `WithMigrateMode` 传给 `Migrate`，或模式取值非法 | 该选项只传给 `NewDriver`；检查模式取值 |
 | `event.ErrInvalidSchema` | schema 名非法（只允许 `^[A-Za-z_][A-Za-z0-9_]*$`） | 修正 schema 名；非法名不会进入任何 DML/DDL |
+| `event.ErrAdminLockTimeout` | Admin 写操作等待命名空间互斥锁超时（瞬时错误；锁与迁移执行共用） | 退避后重试；检查是否有迁移执行或其他管理写操作持锁（不同 schema 互不阻塞） |
 
 `Verify` 发现问题时返回类型化错误 `*event.VerifyError`，可用 `errors.As` 取回后读取 `Report`；它不是哨兵错误。
 
@@ -732,12 +898,12 @@ func TestMyBackendRetention(t *testing.T) {
 1. 事件是否在 `Runner.Start` 返回之后发布？Start 之前的事件按设计跳过。
 2. 发布与订阅的 `Event.Name` 是否完全一致？
 3. 发布与消费是否指向同一个数据库/schema？
-4. 跨实例场景是否只依赖 `LocalWake`？唤醒仅限同进程，跨实例依赖轮询，检查 `WithPollInterval`。
+4. 跨实例场景是否只依赖 `LocalWake`？唤醒仅限同进程；跨实例低延迟唤醒用 pgxc 的 `Wake`（LISTEN/NOTIFY，[§11](#11-运维注意事项)「轮询开销」），postgrec 依赖轮询——检查 `WithPollInterval`。
 
 **认领订阅不处理事件**
 
 1. 身份是否设置（`WithIdentity` 或 `WithConsumerType`）？
-2. 事件是否已处于该身份的 `done`/`failed` 终态？终态不会再次认领。
+2. 事件是否已处于该身份的 `done`/`failed` 终态？终态不会再次认领。`failed` 行可经 `event.Inspector` 查询定位原因（`LastError` / `FailedAt`），或直接查库 `last_error` / `failed_at`（[§6.4](#64-成功与失败)、[§11](#11-运维注意事项)）。
 3. 是否处于退避窗口？失败后要等 `next_eligible_at` 到期。
 4. 数据库连接与 schema 是否正确？
 
@@ -806,22 +972,36 @@ runner := event.NewRunner(drv,
 
 - **core**（scope 缺省 `go_event`）：`publish` / `fetch` / `claim` /
   `heartbeat` / `complete` / `fail` 计数与耗时、`claim.granted`、
+  `claim.takeover`（接管发放数，含终态接管——与 `ClaimResult.Takeovers`
+  同源、与落库事实一致）、`claim.terminal_failed`（认领侧直接置 failed 数）、
   `lease.abandoned`、`consume` / `handle.duration`、`wake`——全部在 core
-  调用边界计量，后端不重复埋同口径操作指标。
-- **后端**（scope 缺省模块名）：仅迁移生命周期 `migrate` /
+  调用边界计量，后端不重复埋同口径操作指标。接管与终态计数只在发生时
+  打点（无零值数据点）。
+- **后端**（scope 缺省模块名）：迁移生命周期 `migrate` /
   `migrate.duration`，发射点在包级 `Migrate` / `Verify`（driver ensure 同
   路径，无重复计量）；`result` 区分
   `ok` / `canceled` / `lock_timeout` / `permission_denied` / `verify_conflict` /
-  `permanent` / `transient`。
+  `permanent` / `transient`。管理面写操作 `admin.replay`（Counter），发射点
+  在 Admin 写方法；`result` 区分
+  `ok` / `no_effect` / `canceled` / `lock_timeout` / `error`（与
+  `event.AdminReplayEvent.Result` 同枚举），另带 `schema` 属性。
 - 属性只含枚举与标识符（`event` / `mode` / `result` / `identity` /
-  `schema`），事件 ID 与错误原文不入属性；Prometheus 导出侧自动做
+  `schema`），事件 ID 与错误原文不入属性（管理面 slog 审计日志可含
+  `event_id` / `consumer_type` 标识——标识符允许入日志；不含事件 payload
+  与 last_error 摘要，失败结果附 error.type / error 分类属性）；Prometheus
+  导出侧自动做
   `.`→`_` 并按单位追加 `_total` / `_seconds`。
 
 ### 13.3 Observer 旁路
 
 需要进程内联动（非指标场景）时注入 `Observer`：回调在调用方 goroutine 同
 步执行、须微秒级返回，库内 recover panic；`ObserverV2` 增加停机放弃租约
-与停机完成事件（非破坏性扩展）。
+与停机完成事件，`ObserverV3` 增加管理面重放事件，`ObserverV4` 增加认领轮
+的发放与接管/终态计数事件（`ClaimEvent`，与 `ClaimResult` 同口径；均为
+非破坏性扩展，分发点类型断言——未实现新版本接口的观察者不感知对应事件）。
+后端管理面的观测经后端构造选项注入（`pgxc.WithObserver` /
+`postgrec.WithObserver`，当前仅 `Admin` 发射事件）；认领轮事件由 core 的
+Runner 发射。
 
 ```go
 // 实现 Observer（三个方法）即满足 V2；只需实现关心的额外事件，
@@ -839,6 +1019,16 @@ func (slaObserver) OnLeaseAbandoned(e event.LeaseEvent) {
     slog.Warn("lease abandoned on shutdown", "event", e.Event)
 }
 func (slaObserver) OnRunnerStopped(event.StopEvent) {}
+func (slaObserver) OnAdminReplay(e event.AdminReplayEvent) {
+    slog.Info("admin replay", "event_id", e.EventID,
+        "consumer_type", e.ConsumerType, "result", e.Result)
+}
+func (slaObserver) OnClaim(e event.ClaimEvent) {
+    if e.Takeovers > 0 {
+        slog.Warn("lease takeover", "event", e.Event, "identity", e.Identity,
+            "takeovers", e.Takeovers, "terminal_failed", e.TerminalFailed)
+    }
+}
 ```
 
 ### 13.4 测试断言

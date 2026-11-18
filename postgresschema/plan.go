@@ -44,6 +44,16 @@ func Plan(schema string) ([]Version, error) {
 		return nil, err
 	}
 	versions := []Version{{Number: 1, Statements: stmts}}
+	v2, err := v2Statements(schema)
+	if err != nil {
+		return nil, err
+	}
+	versions = append(versions, Version{Number: 2, Statements: v2})
+	v3, err := v3Statements(schema)
+	if err != nil {
+		return nil, err
+	}
+	versions = append(versions, Version{Number: 3, Statements: v3})
 	// 后续版本在此按 Number 递增追加；每版至少一条语句。
 	return versions, nil
 }
@@ -165,6 +175,51 @@ func createEventClaimTable(schema string) string {
 	status           text        NOT NULL,
 	next_eligible_at timestamptz NOT NULL DEFAULT '-infinity'::timestamptz
 );`, schema, TableEventClaim)
+}
+
+// v2Statements 加列版本：event_claim 追加错误摘要列（last_error）与终态
+// 时刻列（failed_at），支撑失败摘要落库（docs/design.md §5.3）。语句幂等
+// 且 expand-only，一条语句恰好构造期望对象集合中的一个列对象；列均可空、
+// 无默认值，对既有行与旧二进制无害。
+func v2Statements(schema string) ([]string, error) {
+	if err := ValidateSchema(schema); err != nil {
+		return nil, err
+	}
+	cols := EventClaimVersionColumns()
+	stmts := make([]string, 0, len(cols))
+	for _, col := range cols {
+		stmts = append(stmts, fmt.Sprintf(
+			`ALTER TABLE %[1]s.%[2]s ADD COLUMN IF NOT EXISTS %[3]s %[4]s;`,
+			schema, TableEventClaim, col.Name, ddlType(col.DataType)))
+	}
+	return stmts, nil
+}
+
+// v3Statements 加列版本：event 追加投递时刻列（deliver_at），支撑延迟
+// 事件定时投递（docs/design.md §9.2、ADR 0013）。沿 v2 先例：语句幂等
+// 且 expand-only，一条语句恰好构造期望对象集合中的一个列对象；列可空、
+// 无默认值（NULL = 立即可投递），对既有行与旧二进制无害。
+func v3Statements(schema string) ([]string, error) {
+	if err := ValidateSchema(schema); err != nil {
+		return nil, err
+	}
+	cols := EventVersionColumns()
+	stmts := make([]string, 0, len(cols))
+	for _, col := range cols {
+		stmts = append(stmts, fmt.Sprintf(
+			`ALTER TABLE %[1]s.%[2]s ADD COLUMN IF NOT EXISTS %[3]s %[4]s;`,
+			schema, TableEvent, col.Name, ddlType(col.DataType)))
+	}
+	return stmts, nil
+}
+
+// ddlType 把列的期望类型（format_type 口径，见 Column.DataType）映射为
+// 建列 DDL 类型字面量。
+func ddlType(dataType string) string {
+	if dataType == "timestamp with time zone" {
+		return "timestamptz"
+	}
+	return dataType
 }
 
 // ensurePrimaryKey 探测表上是否已有主键（任意名称），缺失则补建。

@@ -67,6 +67,207 @@ func TestInmemContractSuite(t *testing.T) {
 	eventtest.RunSuite(t, inmem.New())
 }
 
+// 延迟事件契约（deliver_at 定时投递，ADR 0013 §1）：inmem 在内存模拟同一
+// 到期判据，契约套件全过。
+func TestInmemDelayedDeliverySuite(t *testing.T) {
+	eventtest.RunDelayedDeliverySuite(t, inmem.New())
+}
+
+// Inspector 查询面契约：inmem 原生实现（可选能力按类型断言探测，ADR 0005）。
+func TestInmemInspectorSuite(t *testing.T) {
+	eventtest.RunInspectorSuite(t, inmem.New())
+}
+
+// Admin 管理面重放契约：写路径由独立 Admin 承载（NewAdmin 构造，与 Driver
+// 共享同一份内存状态，不挂 Driver 类型）。互斥锁等待缩短为 300ms（套件
+// 的锁超时用例不需要真实等待上限）。
+func TestInmemAdminReplaySuite(t *testing.T) {
+	d := inmem.New()
+	eventtest.RunAdminReplaySuite(t, d,
+		inmem.NewAdmin(d, inmem.WithAdminLockWait(300*time.Millisecond)))
+}
+
+// Store 组合对象三面同源契约（便利构造，非能力面）：NewStore 构造的三面
+// 共享同一份内存状态——Driver 落库事实对 Inspector 可见、Admin 重放对
+// Driver 生效。各面完整语义仍由上述三套件约束，此处不重复。
+func TestInmemStoreSuite(t *testing.T) {
+	st := inmem.NewStore()
+	eventtest.RunStoreSuite(t, st.Driver, st.Inspector, st.Admin)
+}
+
+// 事务性入队契约（outbox 可选面，ADR 0012）：inmem 提供最小缓冲事务
+// 模拟，契约套件经 TxSession 适配统一跑，无需按后端能力门控。
+func TestInmemTransactionalAppendSuite(t *testing.T) {
+	d := inmem.New()
+	ta := inmem.NewTransactionalAppender(d)
+	eventtest.RunTransactionalAppendSuite(t, d, func(t *testing.T) eventtest.TxSession {
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		return &inmemTxSession{ta: ta, tx: tx}
+	})
+}
+
+// inmemTxSession 把 TransactionalAppender 的缓冲事务适配成套件 TxSession。
+type inmemTxSession struct {
+	ta *inmem.TransactionalAppender
+	tx *inmem.Tx
+}
+
+func (s *inmemTxSession) AppendTx(t *testing.T, e event.RawEnvelope) {
+	t.Helper()
+	if err := s.ta.AppendTx(t.Context(), s.tx, e); err != nil {
+		t.Fatalf("append tx: %v", err)
+	}
+}
+
+func (s *inmemTxSession) Commit(t *testing.T) {
+	t.Helper()
+	if err := s.tx.Commit(); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+}
+
+func (s *inmemTxSession) Rollback(t *testing.T) {
+	t.Helper()
+	if err := s.tx.Rollback(); err != nil {
+		t.Fatalf("rollback tx: %v", err)
+	}
+}
+
+// NewTransactionalAppender 传入非本包构造的 Driver 视为装配错误（panic，
+// 与 NewAdmin 同义）。
+func TestForeignDriver_NewTransactionalAppender_Panics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewTransactionalAppender with a foreign driver must panic")
+		}
+	}()
+	_ = inmem.NewTransactionalAppender(struct{ event.Driver }{})
+}
+
+// Tx 公开错误契约（docs/api.md §4）：nil 事务、非本 appender 开启的事务、
+// 已终结事务再操作三类错误路径显式断言。每子用例独立 Driver（隔离性）。
+func TestInmemTxSession_ErrorContract(t *testing.T) {
+	envelope := func(id string) event.RawEnvelope {
+		return event.RawEnvelope{
+			ID: id, Type: "txerr", Payload: []byte(`{}`), OccurredAt: time.Now(),
+		}
+	}
+	fresh := func(t *testing.T) (*inmem.TransactionalAppender, event.Driver) {
+		t.Helper()
+		d := inmem.New()
+		return inmem.NewTransactionalAppender(d), d
+	}
+
+	t.Run("NilTx_AppendTx_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		if err := ta.AppendTx(t.Context(), nil, envelope("nil-tx")); err == nil {
+			t.Fatal("AppendTx with a nil tx must return an error")
+		}
+	})
+	t.Run("ForeignAppenderTx_AppendTx_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		other := inmem.NewTransactionalAppender(inmem.New())
+		tx2, err := other.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin foreign tx: %v", err)
+		}
+		if err := ta.AppendTx(t.Context(), tx2, envelope("foreign-tx")); err == nil {
+			t.Fatal("AppendTx with a transaction opened by another appender must return an error")
+		}
+	})
+	t.Run("CommittedTx_AppendTxAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := ta.AppendTx(t.Context(), tx, envelope("post-commit")); err == nil {
+			t.Fatal("AppendTx on a committed tx must return an error")
+		}
+	})
+	t.Run("CommittedTx_CommitAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := tx.Commit(); err == nil {
+			t.Fatal("double commit must return an error")
+		}
+	})
+	t.Run("CommittedTx_Rollback_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := tx.Rollback(); err == nil {
+			t.Fatal("rollback after commit must return an error")
+		}
+	})
+	t.Run("RolledBackTx_AppendTxAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		if err := ta.AppendTx(t.Context(), tx, envelope("post-rollback")); err == nil {
+			t.Fatal("AppendTx on a rolled-back tx must return an error")
+		}
+	})
+	t.Run("RolledBackTx_Commit_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		if err := tx.Commit(); err == nil {
+			t.Fatal("commit after rollback must return an error")
+		}
+	})
+	t.Run("RolledBackTx_RollbackAgain_ReturnsError", func(t *testing.T) {
+		ta, _ := fresh(t)
+		tx, err := ta.BeginTx(t.Context())
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		if err := tx.Rollback(); err == nil {
+			t.Fatal("double rollback must return an error")
+		}
+	})
+}
+
+// NewAdmin 传入非本包构造的 Driver 视为装配错误（panic）。
+func TestForeignDriver_NewAdmin_Panics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewAdmin with a foreign driver must panic")
+		}
+	}()
+	_ = inmem.NewAdmin(struct{ event.Driver }{})
+}
+
 // 保留窗口惰性清理契约：每用例独立的短窗口全新 Driver（design.md §5.2）。
 func TestInmemRetentionSuite(t *testing.T) {
 	eventtest.RunRetentionSuite(t, func(t *testing.T) event.Driver {

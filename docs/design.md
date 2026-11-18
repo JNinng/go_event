@@ -68,8 +68,11 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   可认领/水位条件）在单条 Fetch/Claim 操作内下推，保证原子性
   （见 [ADR 0004](adr/0004-demand-driven-pull.md)）；广播消费的已读水位仅存
   于实例内存，由 core 在 Fetch 时作为条件传入，不在存储侧簿记。
-- **依赖注入友好**：注入面只有三个（Publisher / Runner / Driver），Go 接口
-  仅 Driver 一个（Publisher 与 Runner 为具体类型，见 docs/api.md §1）；全部
+- **依赖注入友好**：注入面只有三个（Publisher / Runner / Driver），必选
+  Go 接口仅 Driver 一个（查询面 Inspector 与管理面 Admin 为可选接口，按
+  能力探测接入——Admin 不经运行面类型获得（经后端 NewAdmin 构造或经组合
+  对象 Store 聚合，同一内部构造路径）、不挂 Driver 类型；
+  Publisher 与 Runner 为具体类型，见 docs/api.md §1）；全部
   构造器 `NewX(依赖, opts...)` 显式注入，无包级可变状态、无 init 魔法；
   接口定义遵循 Go 惯例放在消费侧。core 不引 DI 框架依赖（wire 用普通构造
   函数即可装配），必要时消费方自建 ProviderSet。
@@ -122,10 +125,19 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   锚点查询失败则 Start 返回错误、整体不启动。停机与重启期间发布的
   事件不补投，重启从当前位置开始（对齐 Redis Pub/Sub 的发完即忘语义）。
   需要不丢、可重试、可追踪的场景应使用认领消费。基线锚点为单条语句
-  快照；Postgres 上 position 分配序（bigserial）与提交可见序在并发发布
-  下存在理论上的乱序窗口（早分配的行晚提交会被水位越过）——Publish
-  保持单语句独立提交使该窗口可忽略，若未来引入业务事务内发布
-  （outbox，P1），该语义须随 outbox 一并重审。
+  快照，只锚已提交行（事务性入队未提交的行不进基线）；Postgres 上
+  position 分配序（bigserial）与提交可见序在并发发布下存在理论上的乱序
+  窗口（早分配的行晚提交会被水位越过）——普通 Publish 保持单语句独立
+  提交使该窗口可忽略，「Start 后发布的事件必然可投递」仅在此路径成立。
+  事务性入队（outbox）把窗口放大为常态：并发提交的更大 position 会把
+  内存水位推过晚提交的行，该行对所有在途广播实例永久不可见（重启实例
+  的基线锚定同样不含）——事务内发布下的广播投递为尽力而为，认领消费
+  不受影响（Claim 直接查库，晚提交行最迟在下一次认领轮次可见；重审定稿
+  见 [ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)
+  与 §6 表格「事务入队（可选）」行）。同源边界还有**延迟行被水位越过**
+  （§9.2「延迟事件」）：延迟行占用 position，其后的即时行会把水位推过它
+  ——延迟行到期后不再有广播可见性，需要定时必达用认领消费
+  （[ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)）。
 - 投递语义为尽力而为：handler 失败仅记日志并跳过，不重试、不阻塞、不设
   死信；不承诺 at-least-once，也不承诺保序（轮询批次并发处理下顺序天然
   不保）——均写进契约。
@@ -149,6 +161,9 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   未完成」为单位：显式 Fail 计入；租约过期被接管（前任未 Fail 而失去租约）
   在认领时同样计入，否则每轮挂死的事件会被无限接管、永不进入终态
   （细节见 [ADR 0006](adr/0006-broadcast-fire-and-forget-and-claim-retry.md)）。
+  接管与 Fail 重试在重试计数中不可区分（`Attempts` 混合两者），接管专属
+  的事实由 `Claim` 随轮返回：`ClaimResult.Takeovers` / `.TerminalFailed`
+  与落库事实一致（§9.2、[ADR 0011](adr/0011-claim-result-and-takeover-counting.md)）。
 - 一个事件可被 N 种 consumer\_type 各消费一次；同类型**同一时刻至多一个活跃
   租约**。租约过期被接管后，若旧实例仍存活（如慢 handler 被误接管），可能
   出现并发重复处理——整体投递语义仍是 at-least-once，不承诺恰好一次。
@@ -161,9 +176,42 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 - Complete/Fail 以**持有租约为前提**（对租约属主做条件更新）：租约过期或
   已被接管后，旧实例迟到的 Complete/Fail 不生效，不得递增 claim\_count 或
   覆盖新属主的认领状态（写进契约测试）。
+- **失败摘要落库**（[ADR 0009](adr/0009-error-summary-persistence.md)）：
+  `event_claim` 留存 `last_error`（错误摘要）与 `failed_at`（终态时刻）。
+  错误文本按不可信输入处理，口径为：移除全部 Unicode 控制字符（Cc 类，
+  含换行与制表符）、截断 4 KiB 字节（不撕裂 UTF-8 码点）、不落堆栈；清洗函数在 core
+  （`event.SanitizeErrorSummary`）供各后端共享。仅终态写入：本次 Fail 使行
+  进入 `failed` 终态时写摘要与时刻，重试中不写；接管终态只写 `failed_at`
+  （无本次处理错误）；迟到的 Fail 不写。不变式：`failed_at` 非空 ⟺ 行当前
+  处于 `failed` 终态；`last_error` 是最近一次终态失败的摘要（重放清
+  `failed_at`、保留 `last_error`，直到下一次终态失败覆盖）。Inspector 与
+  重放以该两列为数据源。
+- **failed 手工重放**（[ADR 0010](adr/0010-admin-write-plane-and-replay.md)）：
+  管理面写操作 `Admin.ReplayFailed` 把（事件 × 消费者身份）的 failed 终态
+  行重新置为可认领——仅 failed 可重放（done 幂等不可逆、不重放；active /
+  retrying 拒绝且不改动）。重放为单条条件更新（CAS，仅命中
+  `status='failed'`）：并发重放 / 认领 / Fail 竞态下不改写非 failed 行，
+  已被重新认领（接管）或已完成的行不受迟到重放影响。重放写入：置
+  `status='retrying'`、`claim_count=0`（此后 Fail 的重试计数从合法范围
+  重新开始）、清 `lease_token`、`lease_until` 置为重放时刻（原租约凭证
+  失效）、`next_eligible_at=now`（立即可认领，不做退避）、`failed_at`
+  清空、`last_error` 保留（见上文 ADR 0009 口径）。**重放窗口 = 保留
+  窗口**：超窗行已被惰性清理删除，重放该键与「行不存在」同判别
+  （ok=false）。无效果（行不存在或非 failed 终态）统一返回 ok=false，
+  需要区分原因先经 Inspector 查询。写操作由独立 Admin 可选接口承载，
+  不进 Driver、不挂后端 Driver 类型，不经运行面类型获得——经后端
+  `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径）。写路径
+  加固（ADR 0010）：**持锁**——重放在事务内持有与迁移执行相同的命名
+  空间互斥锁（键含 schema，与迁移串行化，等待有界，超时返回
+  `ErrAdminLockTimeout`）；**行归属校验即 CAS 本身**——（事件 × 身份）
+  主键 + status 条件 + 构造期固定的命名空间，不命中即不归属；**记录操作
+  来源**——otel 指标（`<scope>.admin.replay`）+ slog 审计日志 + 类型化
+  Observer 事件（`ObserverV3.OnAdminReplay`），均为旁路；**错误可判别**
+  ——锁超时（瞬时）、迁移面哨兵（ensure 原样上抛）与连接故障分列，执行
+  故障不折叠为 ok=false。
 - 终态是（事件 × consumer\_type）粒度：`done`/`failed` 仅对该身份自身生效，
-  终态事件不参与该身份的常规认领（done 幂等不可逆；failed 的手工重放归
-  管理面，见 §9.2）；新增 consumer\_type 重放全部窗口内历史——含其他身份
+  终态事件不参与该身份的常规认领（done 幂等不可逆；failed 经管理面手工
+  重放，见上文与 §9.2）；新增 consumer\_type 重放全部窗口内历史——含其他身份
   已 done/failed 的事件，各身份消费彼此独立。
 - 完成状态上游可查。适合任务类副作用（需要完成追踪与失败重试）。
 - 保留窗口是认领语义的硬边界：滞留超窗且无活跃租约的行会被清理（§5.2），
@@ -177,6 +225,9 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 - 订阅注册表（订阅 → 事件类型集；认领订阅绑定消费者身份）是需求的单一
   事实源，承担三重职责：把"我要什么"编译成查询条件下推到后端、就近唤醒
   的定向路由、事件的分发。
+- 延迟投递同属下推条件：`deliver_at <= now`（判据时钟由 core 下推，
+  [ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)），
+  未到期行在单条读取/认领操作内被过滤，不进拾取窗口。
 - 过滤必须发生在认领/读取时而非取回之后：先取后滤会把无法处理的行反复捞出，
   并破坏跨实例的认领语义。
 - 广播消费的已读水位由 core 按订阅类型在内存中维护并在 Fetch 时下推，只进
@@ -199,11 +250,16 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 能力    | 接口面                           | 语义要点                                                                                                                                                                 |
 | ----- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 事件声明  | 泛型 `Declare[T]` / `NoPayload` | Type 名是认领与路由的稳定标识；payload 默认 JSON codec、可插拔                                                                                                                          |
-| 事件信封  | Envelope                      | 发布侧唯一 ID、Type、Payload、元数据块（透传）、OccurredAt；Attempts/LastAttempt 为 core 运行时注入（认领消费按租约尝试序号与 RetryLimit 计算，广播恒 0/false）                                                                                                                          |
-| 生产    | Publisher                     | Publish 发布；ID 与元数据缺省自动填充；ID 生成器等构造级注入；outbox 拓展见生产化能力                                                                                                                |
+| 事件信封  | Envelope                      | 发布侧唯一 ID、Type、Payload、元数据块（透传）、OccurredAt、DeliverAt（最早投递时刻，零值=立即，ADR 0013）；Attempts/LastAttempt 为 core 运行时注入（认领消费按租约尝试序号与 RetryLimit 计算，广播恒 0/false）                                                                                                                          |
+| 生产    | Publisher                     | Publish 发布；ID 与元数据缺省自动填充；`WithDeliverAt` 声明延迟投递（ADR 0013）；ID 生成器等构造级注入；outbox 拓展见生产化能力                                                                                                                |
 | 消费编排  | Runner + Subscribe            | 订阅级声明消费方式（广播/认领命名式入口，同一 Runner 可混合承载）与消费者身份（仅认领消费，构造默认 + 订阅级覆盖）、并发、租约、轮询间隔、重试上限与退避（仅认领消费；广播消费失败即跳过，见 §5.2）；两种方式同一订阅签名（强类型糖）；签名见 docs/api.md                                              |
 | 后端缝合点 | Driver                        | 单次原子操作，需求条件（订阅类型集 + 租约过期判据 + 可认领/水位条件）在单条 Fetch/Claim 内下推：Append / Fetch、HeadPosition（广播消费，水位条件与基线锚点由 core 传入）/ Claim、Heartbeat、Complete、Fail（认领消费）；语义见 §5 与 ADR |
-| 可观测    | otel 指标 + slog + Observer     | 跟随全局装配（未配置 noop 静默，热路径只打点不打日志）；core 计量 driver 操作与消费编排，后端仅计量迁移生命周期（单一发射点，无重复计量）；类型化 Observer 纯旁路（同步回调、库内 recover）；见 ADR 0008 与 api.md §2.9 |
+| 查询面（可选） | Inspector                 | 只读查询，按能力探测接入（ADR 0005）：（事件 × 消费者身份）状态与重试计数；按身份的状态分档计数——「待处理」= 该身份无认领行，retrying / processing / failed / done 按认领行 status 分档（done 为归档档，五档互斥且完备）；failed 事件偏移分页列表（错误摘要与 failed_at 随行返回，ADR 0009）。与 Driver 共享连接与命名空间选项；只读、不参与认领/完成路径；结果仅在保留窗口内可见（硬边界，§5.2） |
+| 管理面（可选） | Admin                     | 写操作与运行面分离、不进 Driver、不挂后端 Driver 类型（ADR 0010）：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领——仅 failed 可重放（done 不可逆），单条 CAS 条件更新防竞态；重放置 retrying、claim_count=0、清租约、next_eligible_at=now、failed_at 清空、last_error 保留；不经运行面类型获得——经后端 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径；与 Driver 共享连接与命名空间选项，鉴权归使用方）；重放窗口 = 保留窗口（§5.3）。写路径持与迁移执行共用的命名空间互斥锁（等待有界）、归属校验即 CAS、发射操作来源观测（指标/日志/Observer 事件）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接故障）；无自动 down，迁移侧无台账无需 reset/stamp 入口 |
+| 事务入队（可选） | TransactionalAppender    | outbox（[ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)）：调用方在自己的业务事务内追加事件并随事务原子提交/回滚；core 不定义接口——事务载体是后端具体类型（pgxc 为 pgx.Tx、postgrec 为 *sql.Tx、inmem 为缓冲事务模拟），各后端提供 `NewTransactionalAppender` 构造（与 Driver 共享连接与命名空间选项）或经组合对象 Store 聚合，不经运行面类型获得。语义边界：提交与回滚归调用方（库不 begin/commit）；幂等与普通 Append 同口径（同 ID 首写为准）；提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；就近唤醒信号不覆盖事务内发布，广播消费下可能被并发提交的更大 position 越过水位而漏投（§5.2），认领消费不受影响；不触发惰性清理（清理 DELETE 不落入调用方事务）；不发射观测（库侧发射点在提交前，与回滚后的落库事实可能矛盾）；position 同事务内按 INSERT 序分配、不承诺跨事务连续，回滚不回收（Postgres 序列不回收，缺口不进消费契约） |
+| 可观测    | otel 指标 + slog + Observer     | 跟随全局装配（未配置 noop 静默，热路径只打点不打日志）；core 计量 driver 操作与消费编排，后端计量迁移生命周期与管理面写操作（`<scope>.migrate` 与 `<scope>.admin.replay`，发射点各自单一，无重复计量）；类型化 Observer 纯旁路（同步回调、库内 recover）；见 ADR 0008 与 api.md §2.9 |
+| 延迟投递    | RawEnvelope.DeliverAt          | 定时投递（[ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)）：最早投递时刻随信封落库（零值=立即），Fetch / Claim 下推 `deliver_at <= now`（判据时钟由 core 随 FetchQuery.Now / ClaimQuery.Now 下推，过滤在单条操作内完成，ADR 0004）；保留窗口自可投递时刻起算（COALESCE(deliver_at, occurred_at)）——延迟行不因「等待投递」被清理；HeadPosition / position 语义不变；**广播组合边界**：延迟行可被水位越过而不再投递（§5.2），需要定时必达用认领消费；经 Publish 的 `WithDeliverAt` 与事务性入队的 `RawEnvelope.DeliverAt` 均可设置 |
+| 跨实例唤醒（可选） | pgxc Wake                    | 低延迟唤醒（[ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)）：仅信号、不承载投递保证（ADR 0003 边界不变，错过的信号由周期 poll 兜底）。pgxc 原生 LISTEN/NOTIFY——发布侧 INSERT 经 CTE 发 `pg_notify`（仅实际插入行时；通道与 payload 只带 schema 名，不带事件内容；随事务提交可见，事务性入队的信号在提交时刻发出），订阅侧 `Wake` 专用连接 LISTEN `go_event_wake_<schema>`、断线有界退避重连，`Bind(*event.LocalWake)` 桥接为 `NotifyAll` 信号（跨实例信号触发本地已挂起的 Fetch/唤醒等待）；postgrec 退化轮询（database/sql 无驱动无关的 LISTEN 接入）；inmem 无跨实例面（同进程 LocalWake 已覆盖） |
 
 ## 7. 仓库布局
 
@@ -214,11 +270,12 @@ module path 为 `github.com/jninng/go_event`，子 module 为
 ```
 go_event/
 ├── doc.go / event.go / publisher.go / runner.go / driver.go /
-│   codec.go / errors.go / localwake.go / migrate.go         # core：契约与编排、迁移契约类型
+│   admin.go / inspector.go / errorsummary.go / codec.go /
+│   errors.go / localwake.go / migrate.go                    # core：契约与编排、迁移契约类型
 ├── postgrec/        # Postgres 后端（标准库）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── pgxc/            # Postgres 后端（pgx v5）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── postgresschema/  # Postgres 方言 DDL 单一事实源：版本计划、期望对象、共享执行器（无驱动依赖）
-├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunMigrationSuite
+├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunDelayedDeliverySuite/RunMigrationSuite/RunInspectorSuite/RunAdminReplaySuite/RunStoreSuite/RunTransactionalAppendSuite
 │   └── simmigrate/  # 迁移契约测试的进程内模拟 backend（语句边界故障注入）
 └── docs/
     ├── api.md       # API 文档
@@ -230,8 +287,10 @@ go_event/
 
 核心语义在各后端必须达到「原生或模拟」档——「不支持」即无法通过 eventtest
 全套契约测试，核心语义不存在该档位；各后端文档必须给出能力边界表，注明每项
-语义的实现档位。非核心的可选能力（延迟事件、管理面查询、NOTIFY 推送唤醒等）
-走可选拓展接口 + 能力探测，与 outbox 同模式。
+语义的实现档位。非核心的可选能力（延迟事件、管理面查询、跨实例推送唤醒等）
+按可选拓展面接入（探测或后端具体构造，与 outbox 同模式；延迟事件已落地为
+信封字段 + 全后端同形实现，跨实例唤醒由 pgxc 提供、postgrec 退化轮询，
+[ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)）。
 
 **持久结构初始化按迁移模式处理**（[ADR 0007](adr/0007-migration-mode-and-protocol.md)）：
 
@@ -341,8 +400,11 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
 - **就近消费**：同进程发布唤醒本实例立即拉取/认领（仅信号，不跳过存储）。
 - **可观测**：日志走 stdlib `slog`，指标走 `go.opentelemetry.io/otel/metric`
   并跟随全局装配（未配置时 otel 全局 provider 即 noop，热路径零开销）；
-  core 计量 driver 操作与消费编排，后端计量迁移生命周期（单一发射点）；
-  类型化 `Observer` 为纯旁路（同步回调、库内 recover）。见 ADR 0008 与
+  core 计量 driver 操作与消费编排（含认领侧接管与终态计数，
+  `<scope>.claim.takeover` / `<scope>.claim.terminal_failed`），后端计量
+  迁移生命周期（单一发射点）；类型化 `Observer` 为纯旁路（同步回调、
+  库内 recover）。见 ADR 0008、
+  [ADR 0011](adr/0011-claim-result-and-takeover-counting.md) 与
   [api.md §2.9](api.md)。
 - **Postgres 后端**：event / event\_claim 两表、幂等版本计划 DDL、SKIP LOCKED
   认领、惰性清理（资格：超窗且无活跃租约，无论状态；保留窗口可配，历史
@@ -359,30 +421,84 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   基线锚定与起点语义/失败跳过且不阻塞/广播各自全收/水位单调；无参事件
   的广播与认领；类型间不互相饿死；认领消费互斥（含并发认领）/接管/
   接管计入重试/心跳/超时停续/退避重试/重试耗尽终态/迟到 Complete 与
-  Fail 不生效/新身份重放全部窗口内历史/超限行不占限额槽位；公共的
+  Fail 不生效/新身份重放全部窗口内历史/超限行不占限额槽位；接管与终态
+  计数随 ClaimResult 与落库事实一致——普通发放零计数、接管发放
+  Takeovers=1、终态接管双计、Fail 重试重认领与 retrying 行重认领不计
+  接管且不认领侧置终态、混合批次只计接管行并可与 Attempts/落库状态
+  对账；公共的
   ID 唯一与幂等 Append 首写为准、元数据透传、HeadPosition 基线锚点；
+  错误摘要与终态时刻仅终态写入（含接管终态仅写 failed\_at）、重试中与
+  迟到 Fail 不写、摘要截断与去控制字符；
   持久结构初始化的幂等可重复执行；迁移契约 `RunMigrationSuite`（空库/
   完整/部分/冲突、三模式 Driver 首启、导出物、并发首启、锁释放、
   Lock=none、语句边界故障注入与回滚/收敛）；保留窗口清理资格
-  （RunRetentionSuite））。
+  （RunRetentionSuite）；只读查询面 Inspector（`RunInspectorSuite`：
+  三类查询与 Claim/Fail/Complete 落库事实比对——状态与重试计数、分档
+  口径含 done 归档、failed 分页边界与摘要事实、只读稳定性）；管理面
+  重放（`RunAdminReplaySuite`：重放后可再认领并完成、重试计数归零与
+  循环重放、done/active/retrying/未知键无效果且判别统一、last_error
+  保留与 failed_at 清空、并发重放恰好一次生效、被接管后迟到重放不
+  污染新属主、互斥锁占用期间锁超时且行不变/释放后重放生效、观测事件
+  ok/no_effect/lock_timeout 结果与事件 × 身份一致））；延迟事件
+  （`RunDelayedDeliverySuite`：零值立即、到期边界含到时刻、Fetch / Claim
+  到期前过滤、信封透传、延迟行与广播水位的组合边界；`RunRetentionSuite`
+  增保留期组合用例；`RunTransactionalAppendSuite` 增 AppendTx 延迟用例；
+  `RunSuite` 增 Publish 路径用例）。
 
 ### 9.2 生产化能力（P1）
 
-- **outbox**：调用方事务内追加事件并随事务原子提交（后端可选拓展接口）。
-- **观测（接管计数）**：`Claim` 接口计划变更为
-  `ClaimResult{Leases, Takeovers, TerminalFailed}`，`Takeovers` 统计本次
-  认领中的租约接管（含终态接管），`TerminalFailed` 单独统计认领时直接置
-  failed 的数量；`Lease` 不再承担接管标记（v0.x 允许破坏性变更）。基础
-  观测面（otel 指标 + slog + 类型化 Observer）已在 P0 落地，见 §9.1 与
-  ADR 0008。
-- **管理面**：滞留/failed 事件查询、手工重放（仅针对 `failed` 终态重新置为
-  可认领；`done` 不可逆、不重放）、dead-letter 处置钩子、失败信息留存
-  （最后错误摘要）、存量消费者身份的重命名迁移（§5.1）。迁移侧无台账，
-  不需要 reset/stamp 入口；schema 异常经迁移重跑或人工修复。
-- **延迟事件**：deliver\_at 定时投递（Postgres 原生；其余后端为可选能力，见
-  能力边界）；未到投递时间的行不满足 Fetch/Claim 的下推条件，与广播消费
-  组合的边界（延迟行被内存水位越过即不再投递）写进文档。
-- **低延迟唤醒**：PG LISTEN/NOTIFY 推送唤醒，未支持的后端退化回轮询。
+- **outbox（事务性入队）**：已落地——见 §6 表格「事务入队（可选）」行与
+  [ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)。
+  core 不定义接口（事务载体是后端具体类型），pgxc / postgrec / inmem 各
+  提供 `TransactionalAppender`（`NewTransactionalAppender` 构造或经组合
+  对象 Store 聚合）：业务事务与事件入队原子提交/回滚，不需要事务内发布
+  的场景可跳过本面。广播位置语义已随本项重审定稿（§5.2）：事务内发布下
+  广播投递为尽力而为（可能被并发提交的更大 position 越过水位而漏投），
+  认领消费不受影响；契约套件 `RunTransactionalAppendSuite` 钉死回滚零
+  事件、提交前不可见、提交后可见、事务内幂等、回滚缺口与乱序边界。
+- **观测（接管计数）**：已落地——`Claim` 返回
+  `ClaimResult{Leases, Takeovers, TerminalFailed}`：`Takeovers` 统计本次
+  认领中「接管过期租约」而发放的数量（含终态接管；无主首认与 Fail 退避
+  期满的重认领不计入），`TerminalFailed` 独立统计认领动作直接置 failed
+  的数量（当前认领语义下置终态的下推条件要求租约已过期，故认领侧终态
+  必经接管路径，恒有 TerminalFailed ≤ Takeovers）；一次终态接管同时计入
+  两者。计数取自后端落库事实（SQL 后端为终态 UPDATE 影响行数与认领标记，
+  inmem 为内存计数），与 Inspector.ClaimState / claim\_count 可对账；
+  `Lease` 不承载接管标记（v0.x 允许破坏性变更）。观测面：<scope>.claim.takeover
+  与 <scope>.claim.terminal_failed 指标 + `ObserverV4.OnClaim` 事件（ADR 0008
+  与 [ADR 0011](adr/0011-claim-result-and-takeover-counting.md)）。
+- **管理面**：查询面 `Inspector` 已落地（§6 表格「查询面（可选）」行）：
+  只读可选接口、按能力探测接入，提供（事件 × 消费者身份）状态与重试
+  计数、按身份的状态分档计数（「待处理」= 该身份无认领行）、failed 事件
+  偏移分页列表；结果仅在保留窗口内可见（硬边界）。failed 手工重放与
+  Admin 加固已落地（§6 表格「管理面（可选）」行）：写操作由独立可选接口
+  `Admin` 承载、不进 Driver、不挂后端 Driver 类型，不经运行面类型获得
+  ——经后端 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径）；
+  `ReplayFailed` 仅对 `failed` 终态重新置为可认领（`done` 不可逆、
+  不重放），语义与并发防护见 §5.3；加固约束（ADR 0010）：写路径持与
+  迁移执行共用的命名空间互斥锁（等待有界）、行归属校验即 CAS、操作
+  来源观测（`<scope>.admin.replay` 指标 + slog 审计日志 + Observer 事件，
+  均为旁路）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接
+  故障分列，执行故障不折叠为 ok=false）。剩余项仍在规划：dead-letter
+  处置钩子、存量消费者身份的重命名迁移（§5.1）。失败信息留存
+  （最后错误摘要与终态时刻）已落地（§5.3、
+  [ADR 0009](adr/0009-error-summary-persistence.md)），是 Inspector 查询
+  与重放的数据源。迁移侧无台账，不需要 reset/stamp 入口；schema 异常经
+  迁移重跑或人工修复。
+- **延迟事件**：已落地——见 §6 表格「延迟投递」行与
+  [ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)。
+  信封可选字段 `DeliverAt`（零值=立即），Publish（`WithDeliverAt`）与
+  事务性入队（`RawEnvelope.DeliverAt`）均可设置；未到期行不满足
+  Fetch / Claim 的下推条件（判据时钟由 core 下推，过滤在单条操作内
+  完成）；保留窗口自可投递时刻起算（Postgres 后端为版本计划 v3 加列
+  `event.deliver_at timestamptz` 可空，零值行语义不变、无需回填）；
+  与广播消费组合的边界写进文档（§5.2）：延迟行被内存水位越过即不再
+  投递，需要定时必达用认领消费。
+- **低延迟唤醒**：跨实例推送已落地（pgxc）——见 §6 表格「跨实例唤醒
+  （可选）」行与 ADR 0013：仅信号、不承载投递保证（ADR 0003 边界不变）；
+  pgxc 走 LISTEN/NOTIFY（专用连接、断线重连、payload 只带 schema 名），
+  postgrec 退化轮询（不做实现，能力边界表注明），inmem 无跨实例面
+  （同进程 `LocalWake` 已覆盖）。
 
 ### 9.3 扩展能力（P2）
 
@@ -390,9 +506,11 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   JetStream（首选）、RocketMQ（候选，限 5.x）、Redis Stream、RabbitMQ；
   Kafka 排除。映射与边界详见
   [ADR 0005](adr/0005-backend-capability-boundary.md)。
-- **可选拓展接口**（能力探测，能力边界表标明各后端支持度）：outbox
-  （TransactionalAppender）、延迟事件、管理面查询、NOTIFY 推送唤醒、
-  真推送投递（DeliverySource）。
+- **可选拓展接口**（能力探测或后端具体构造，能力边界表标明各后端支持
+  度）：延迟事件与跨实例推送唤醒已提前落地（§9.2，形态见 §6 表格——
+  延迟事件为信封字段、唤醒为 pgxc 具体构造 `Wake`）；管理面查询、真
+  推送投递（DeliverySource）仍为规划项；outbox
+  （TransactionalAppender）已提前落地（§9.2）。
 - **事件链**：correlation\_id / causation\_id 贯穿，追踪一条业务链上的事件族。
 - **批量认领**：一次抢多条，降低高吞吐下的 DB 往返。
 - **限流/背压**：按类型限速，防止下游过载。

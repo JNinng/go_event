@@ -17,7 +17,9 @@ func (noopDriver) Fetch(context.Context, FetchQuery) ([]RawEnvelope, error) {
 
 func (noopDriver) HeadPosition(context.Context, string) (string, error) { return "", nil }
 
-func (noopDriver) Claim(context.Context, ClaimQuery) ([]Lease, error) { return nil, nil }
+func (noopDriver) Claim(context.Context, ClaimQuery) (ClaimResult, error) {
+	return ClaimResult{}, nil
+}
 
 func (noopDriver) Heartbeat(context.Context, HeartbeatRequest) error { return nil }
 

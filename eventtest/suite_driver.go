@@ -322,22 +322,25 @@ func testFetchReadOnly(t *testing.T, d event.Driver) {
 }
 
 // Claim 限额：至多返回 Limit 条（docs/api.md §2.4；core 认领预取按此契约
-// 计算每轮批大小）。
+// 计算每轮批大小）。普通发放轮的接管/终态计数为零。
 func testClaimLimit(t *testing.T, d event.Driver) {
 	typ := t.Name()
 	appendEvent(t, d, "cl1", typ, "1", nil)
 	appendEvent(t, d, "cl2", typ, "2", nil)
 	appendEvent(t, d, "cl3", typ, "3", nil)
 
-	ls, err := d.Claim(t.Context(), event.ClaimQuery{
+	res, err := d.Claim(t.Context(), event.ClaimQuery{
 		Type: typ, ConsumerType: "cl", Lease: time.Minute, Limit: 1,
 		RetryLimit: 5, Now: baseNow,
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(ls) != 1 {
-		t.Fatalf("limit 1 must cap claim batch at 1 lease, got %d", len(ls))
+	if len(res.Leases) != 1 {
+		t.Fatalf("limit 1 must cap claim batch at 1 lease, got %d", len(res.Leases))
+	}
+	if res.Takeovers != 0 || res.TerminalFailed != 0 {
+		t.Fatalf("fresh grant must not count takeovers/terminal, got %+v", res)
 	}
 }
 
@@ -391,7 +394,7 @@ func testClaimConcurrentDisjoint(t *testing.T, d event.Driver) {
 	for range claimers {
 		claimWg.Go(func() {
 			for {
-				ls, err := d.Claim(t.Context(), event.ClaimQuery{
+				res, err := d.Claim(t.Context(), event.ClaimQuery{
 					Type: typ, ConsumerType: "cc", Lease: time.Hour, Limit: 2,
 					RetryLimit: 10, Now: baseNow,
 				})
@@ -399,11 +402,11 @@ func testClaimConcurrentDisjoint(t *testing.T, d event.Driver) {
 					t.Errorf("claim: %v", err)
 					return
 				}
-				if len(ls) == 0 {
+				if len(res.Leases) == 0 {
 					return
 				}
 				mu.Lock()
-				for _, l := range ls {
+				for _, l := range res.Leases {
 					seen[l.Envelope.ID]++
 				}
 				mu.Unlock()
@@ -423,70 +426,89 @@ func testClaimConcurrentDisjoint(t *testing.T, d event.Driver) {
 }
 
 // 接管：租约过期后可被再认领，且计入重试（Attempts 递增，ADR 0006）。
+// 接管发放计数：Takeovers=1、TerminalFailed=0（design.md §9.2）。
 func testClaimTakeover(t *testing.T, d event.Driver) {
 	typ := t.Name()
 	appendEvent(t, d, "tk1", typ, "1", nil)
 
-	first := claim(t, d, typ, "tk", time.Minute, baseNow)
-	if len(first) != 1 || first[0].Attempts != 1 {
+	first := claimResult(t, d, typ, "tk", time.Minute, baseNow)
+	if len(first.Leases) != 1 || first.Leases[0].Attempts != 1 {
 		t.Fatalf("first claim: %+v", first)
 	}
-	token1 := first[0].LeaseToken
+	if first.Takeovers != 0 || first.TerminalFailed != 0 {
+		t.Fatalf("fresh claim must not count takeover/terminal, got %+v", first)
+	}
+	token1 := first.Leases[0].LeaseToken
 
 	// 租约过期（base+2m > base+1m）→ 接管认领，Attempts 递增。
-	second := claim(t, d, typ, "tk", time.Minute, baseNow.Add(2*time.Minute))
-	if len(second) != 1 {
-		t.Fatalf("expired lease must be reclaimable, got %d", len(second))
+	second := claimResult(t, d, typ, "tk", time.Minute, baseNow.Add(2*time.Minute))
+	if len(second.Leases) != 1 {
+		t.Fatalf("expired lease must be reclaimable, got %+v", second)
 	}
-	if second[0].Attempts != 2 {
-		t.Fatalf("takeover must increment attempts, want 2 got %d", second[0].Attempts)
+	if second.Leases[0].Attempts != 2 {
+		t.Fatalf("takeover must increment attempts, want 2 got %d", second.Leases[0].Attempts)
 	}
-	if second[0].LeaseToken == token1 {
+	if second.Takeovers != 1 || second.TerminalFailed != 0 {
+		t.Fatalf("takeover grant must count Takeovers=1 TerminalFailed=0, got %+v", second)
+	}
+	if second.Leases[0].LeaseToken == token1 {
 		t.Fatal("takeover must issue a new lease token")
 	}
-	if !second[0].LeaseUntil.Equal(baseNow.Add(2 * time.Minute).Add(time.Minute)) {
-		t.Fatalf("lease until = now+lease, got %v", second[0].LeaseUntil)
+	if !second.Leases[0].LeaseUntil.Equal(baseNow.Add(2 * time.Minute).Add(time.Minute)) {
+		t.Fatalf("lease until = now+lease, got %v", second.Leases[0].LeaseUntil)
 	}
 }
 
 // 接管计入重试 + 上限：达 RetryLimit 的接管认领不再发放租约、直接置
-// failed 终态（ADR 0006「不再被认领」）。
+// failed 终态（ADR 0006「不再被认领」）。接管计数覆盖发放与终态两条
+// 路径：接管发放 Takeovers=1/TerminalFailed=0；终态接管 Takeovers=1 且
+// TerminalFailed=1（design.md §9.2）。
 func testClaimOverLimitTerminal(t *testing.T, d event.Driver) {
 	typ := t.Name()
 	appendEvent(t, d, "ov1", typ, "1", nil)
 	const retryLimit = 2
-	doClaim := func(now time.Time) []event.Lease {
+	doClaim := func(now time.Time) event.ClaimResult {
 		t.Helper()
-		ls, err := d.Claim(t.Context(), event.ClaimQuery{
+		res, err := d.Claim(t.Context(), event.ClaimQuery{
 			Type: typ, ConsumerType: "ov", Lease: time.Minute, Limit: 10,
 			RetryLimit: retryLimit, Now: now,
 		})
 		if err != nil {
 			t.Fatalf("claim: %v", err)
 		}
-		return ls
+		return res
 	}
 
-	// 第 1 次认领（Attempts=1）。
-	ls := doClaim(baseNow)
-	if len(ls) != 1 {
-		t.Fatalf("first claim: %+v", ls)
+	// 第 1 次认领（Attempts=1，无主首认非接管）。
+	res := doClaim(baseNow)
+	if len(res.Leases) != 1 || res.Leases[0].Attempts != 1 {
+		t.Fatalf("first claim: %+v", res)
+	}
+	if res.Takeovers != 0 || res.TerminalFailed != 0 {
+		t.Fatalf("fresh claim must not count takeover/terminal, got %+v", res)
 	}
 	// 过期接管 → 计入第 2 次失败 = 尚未达 RetryLimit=2 → 发放第 2 次尝试。
-	ls = doClaim(baseNow.Add(2 * time.Minute))
-	if len(ls) != 1 || ls[0].Attempts != 2 {
-		t.Fatalf("second attempt within limit must be handed out, got %+v", ls)
+	// 接管发放：Takeovers=1、TerminalFailed=0。
+	res = doClaim(baseNow.Add(2 * time.Minute))
+	if len(res.Leases) != 1 || res.Leases[0].Attempts != 2 {
+		t.Fatalf("second attempt within limit must be handed out, got %+v", res)
+	}
+	if res.Takeovers != 1 || res.TerminalFailed != 0 {
+		t.Fatalf("takeover grant must count Takeovers=1 TerminalFailed=0, got %+v", res)
 	}
 	// 第 2 次尝试也失去租约 → 再接管将计入第 3 次失败，超过 RetryLimit
-	// → 置 failed、不发放。
-	ls = doClaim(baseNow.Add(4 * time.Minute))
-	if len(ls) != 0 {
-		t.Fatalf("over-limit takeover must not hand out lease, got %+v", ls)
+	// → 置 failed、不发放。终态接管同时计入两者。
+	res = doClaim(baseNow.Add(4 * time.Minute))
+	if len(res.Leases) != 0 {
+		t.Fatalf("over-limit takeover must not hand out lease, got %+v", res)
 	}
-	// 终态后永不再认领。
-	ls = doClaim(baseNow.Add(time.Hour))
-	if len(ls) != 0 {
-		t.Fatalf("failed terminal must never be claimed, got %+v", ls)
+	if res.Takeovers != 1 || res.TerminalFailed != 1 {
+		t.Fatalf("terminal takeover must count Takeovers=1 TerminalFailed=1, got %+v", res)
+	}
+	// 终态后永不再认领，计数归零。
+	res = doClaim(baseNow.Add(time.Hour))
+	if len(res.Leases) != 0 || res.Takeovers != 0 || res.TerminalFailed != 0 {
+		t.Fatalf("failed terminal must never be claimed, got %+v", res)
 	}
 }
 
@@ -500,14 +522,14 @@ func testClaimOverLimitSlot(t *testing.T, d event.Driver) {
 	const retryLimit = 2
 	doClaim := func(now time.Time, limit int) []event.Lease {
 		t.Helper()
-		ls, err := d.Claim(t.Context(), event.ClaimQuery{
+		res, err := d.Claim(t.Context(), event.ClaimQuery{
 			Type: typ, ConsumerType: "os", Lease: time.Minute, Limit: limit,
 			RetryLimit: retryLimit, Now: now,
 		})
 		if err != nil {
 			t.Fatalf("claim: %v", err)
 		}
-		return ls
+		return res.Leases
 	}
 	fail := func(lease event.Lease, now time.Time) {
 		t.Helper()
@@ -553,15 +575,155 @@ func testClaimOverLimitSlot(t *testing.T, d event.Driver) {
 	// os1 failed；os2 活跃租约过期且接管将达上限（2+1 >= 2）→ 置 failed
 	// 不占槽位；新行 os3 无主 → Limit=1 恰好发放给 os3。
 	appendEvent(t, d, "os3", typ, "3", nil)
-	ls = doClaim(baseNow.Add(5*time.Minute), 1)
-	if len(ls) != 1 || ls[0].Envelope.ID != "os3" {
-		t.Fatalf("over-limit row must not consume slot; want [os3], got %+v", ls)
+	res, err := d.Claim(t.Context(), event.ClaimQuery{
+		Type: typ, ConsumerType: "os", Lease: time.Minute, Limit: 1,
+		RetryLimit: retryLimit, Now: baseNow.Add(5 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(res.Leases) != 1 || res.Leases[0].Envelope.ID != "os3" {
+		t.Fatalf("over-limit row must not consume slot; want [os3], got %+v", res)
+	}
+	// 超限翻转（os2）计入终态接管：Takeovers=1、TerminalFailed=1；
+	// 无主首认（os3）不计入接管。
+	if res.Takeovers != 1 || res.TerminalFailed != 1 {
+		t.Fatalf("over-limit flip must count terminal takeover, got %+v", res)
 	}
 	// os2 已随超限翻转进入终态：永不再认领（os3 租约过期被重认领属正常）。
 	ls = doClaim(baseNow.Add(6*time.Minute), 10)
 	for _, l := range ls {
 		if l.Envelope.ID == "os2" {
 			t.Fatalf("flipped over-limit row must be terminal, got lease %+v", l)
+		}
+	}
+}
+
+// Fail 重试的重认领不算接管：retrying 行的租约已被 Fail 释放、退避期满
+// 重认领不接管任何租约——Takeovers=0（接管专属计数不与 Fail 重试混同，
+// `Attempts > 1` 不能代替接管计数，design.md §9.2）。
+func testFailRetryReclaimNotTakeover(t *testing.T, d event.Driver) {
+	typ := t.Name()
+	appendEvent(t, d, "fr1", typ, "1", nil)
+
+	ls := claim(t, d, typ, "fr", time.Minute, baseNow)
+	if len(ls) != 1 {
+		t.Fatalf("first claim: %+v", ls)
+	}
+	if err := d.Fail(t.Context(), event.FailRequest{
+		EventID: "fr1", ConsumerType: "fr", LeaseToken: ls[0].LeaseToken,
+		RetryLimit: 5, Backoff: linearBackoffMs(), Now: baseNow,
+	}); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	// 退避期满重认领：Attempts 递增（含本次 = 2），但不计接管。
+	res := claimResult(t, d, typ, "fr", time.Minute, baseNow.Add(time.Second))
+	if len(res.Leases) != 1 || res.Leases[0].Attempts != 2 {
+		t.Fatalf("retry reclaim: %+v", res)
+	}
+	if res.Takeovers != 0 || res.TerminalFailed != 0 {
+		t.Fatalf("retry reclaim must not count takeover/terminal, got %+v", res)
+	}
+}
+
+// 非接管路径不产生认领侧终态：retrying 行不因 RetryLimit 下调而在认领时
+// 置 failed——置终态的下推条件只针对「过期租约接管」（ADR 0006），行被
+// 正常重认领发放（Attempts 超出下调后的 RetryLimit 属订阅配置差异边界），
+// 落库状态与计数一致（design.md §9.2）。
+func testRetryingOverLimitRowNoTerminalOnClaim(t *testing.T, d event.Driver) {
+	typ := t.Name()
+	appendEvent(t, d, "rn1", typ, "1", nil)
+
+	// Fail 一次（RetryLimit=5 → count=1，retrying）。
+	ls := claim(t, d, typ, "rn", time.Minute, baseNow)
+	if len(ls) != 1 {
+		t.Fatalf("first claim: %+v", ls)
+	}
+	if err := d.Fail(t.Context(), event.FailRequest{
+		EventID: "rn1", ConsumerType: "rn", LeaseToken: ls[0].LeaseToken,
+		RetryLimit: 5, Backoff: linearBackoffMs(), Now: baseNow,
+	}); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	// 以更低的 RetryLimit=1 认领：retrying 行重认领发放，不置终态。
+	res := claimResult(t, d, typ, "rn", time.Minute, baseNow.Add(time.Second))
+	if len(res.Leases) != 1 || res.Leases[0].Attempts != 2 {
+		t.Fatalf("retrying row must be re-claimed, got %+v", res)
+	}
+	if res.Takeovers != 0 || res.TerminalFailed != 0 {
+		t.Fatalf("retrying reclaim must not count takeover/terminal, got %+v", res)
+	}
+	// 对账落库事实：行为 active（非 failed），未被认领动作置终态。
+	rd, ok := d.(ClaimStateReader)
+	if !ok {
+		t.Fatalf("driver %T must implement ClaimStateReader", d)
+	}
+	st := readClaimState(t, rd, "rn1", "rn")
+	if st.Status != "active" {
+		t.Fatalf("status = %q, want active (claim must not terminalize retrying rows)", st.Status)
+	}
+}
+
+// 批量认领混合计数：无主首认 + 过期租约接管 + Fail 重试重认领同轮发放，
+// Takeovers 只计接管行；Attempts 与落库状态可对账（design.md §9.2）。
+func testMixedBatchClaimCounts(t *testing.T, d event.Driver) {
+	typ := t.Name()
+	appendEvent(t, d, "mb2", typ, "2", nil) // 将成为过期接管
+	appendEvent(t, d, "mb3", typ, "3", nil) // 将成为 Fail 重试重认领
+
+	// mb2/mb3 先认领一次（count=0）。
+	ls := claim(t, d, typ, "mb", time.Minute, baseNow)
+	if len(ls) != 2 {
+		t.Fatalf("first claim want 2 leases, got %+v", ls)
+	}
+	var mb2, mb3 event.Lease
+	for _, l := range ls {
+		switch l.Envelope.ID {
+		case "mb2":
+			mb2 = l
+		case "mb3":
+			mb3 = l
+		}
+	}
+	if mb2.Envelope.ID == "" || mb3.Envelope.ID == "" {
+		t.Fatalf("want mb2/mb3 claimed, got %+v", ls)
+	}
+	// mb3 显式 Fail（retrying，count=1）；mb2 保持活跃直至过期。
+	if err := d.Fail(t.Context(), event.FailRequest{
+		EventID: mb3.Envelope.ID, ConsumerType: "mb", LeaseToken: mb3.LeaseToken,
+		RetryLimit: 5, Backoff: linearBackoffMs(), Now: baseNow,
+	}); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	// mb1 在首认之后追加：混合轮中为无主首认。
+	appendEvent(t, d, "mb1", typ, "1", nil)
+
+	// 混合轮：mb1 无主首认（Takeovers 不计）、mb2 过期接管（计 1）、
+	// mb3 退避期满重认领（不计）。
+	res := claimResult(t, d, typ, "mb", time.Minute, baseNow.Add(2*time.Minute))
+	if len(res.Leases) != 3 {
+		t.Fatalf("mixed batch must grant 3 leases, got %+v", res)
+	}
+	if res.Takeovers != 1 || res.TerminalFailed != 0 {
+		t.Fatalf("mixed batch must count exactly the takeover, got %+v", res)
+	}
+	attempts := map[string]int{}
+	for _, l := range res.Leases {
+		attempts[l.Envelope.ID] = l.Attempts
+	}
+	if attempts["mb1"] != 1 || attempts["mb2"] != 2 || attempts["mb3"] != 2 {
+		t.Fatalf("attempts = %v, want mb1=1 (fresh) mb2=2 (takeover) mb3=2 (retry)", attempts)
+	}
+	// 对账落库事实：三行均为 active 租约内处理中。
+	rd, ok := d.(ClaimStateReader)
+	if !ok {
+		t.Fatalf("driver %T must implement ClaimStateReader", d)
+	}
+	for _, id := range []string{"mb1", "mb2", "mb3"} {
+		if st := readClaimState(t, rd, id, "mb"); st.Status != "active" {
+			t.Fatalf("status of %s = %q, want active", id, st.Status)
 		}
 	}
 }

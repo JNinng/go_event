@@ -71,8 +71,8 @@ func TestPlan(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PlannedStatements: %v", err)
 		}
-		if len(paired) != 9 {
-			t.Fatalf("plan statements = %d, want 9 (baseline v1)", len(paired))
+		if len(paired) != 12 {
+			t.Fatalf("plan statements = %d, want 12 (baseline v1: 9 + v2 add-column: 2 + v3 add-column: 1)", len(paired))
 		}
 		objs := postgresschema.ExpectedObjects("public")
 		if len(objs) != len(paired) {
@@ -95,6 +95,94 @@ func TestPlan(t *testing.T) {
 			if strings.Contains(ps.SQL, "CONSTRAINT ") && strings.Contains(ps.SQL, "CREATE TABLE") {
 				t.Fatalf("table DDL must not inline constraints (constraints go through DO blocks): %s", ps.SQL)
 			}
+		}
+	})
+	t.Run("VersionTwo_Statements_AddEventClaimColumnsIdempotent", func(t *testing.T) {
+		plan, err := postgresschema.Plan("tenant")
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		if len(plan) != 3 {
+			t.Fatalf("plan versions = %d, want 3", len(plan))
+		}
+		v2 := plan[1]
+		if v2.Number != 2 || len(v2.Statements) != 2 {
+			t.Fatalf("v2 = %+v, want 2 add-column statements", v2)
+		}
+		// 一条 ALTER ... ADD COLUMN IF NOT EXISTS 恰好对应一个列对象。
+		paired, err := postgresschema.PlannedStatements("tenant")
+		if err != nil {
+			t.Fatalf("PlannedStatements: %v", err)
+		}
+		want := []struct {
+			name   string
+			ddl    string
+			column string
+			typ    string
+		}{
+			{"tenant.event_claim.last_error", "ALTER TABLE tenant.event_claim ADD COLUMN IF NOT EXISTS last_error text;", "last_error", "text"},
+			{"tenant.event_claim.failed_at", "ALTER TABLE tenant.event_claim ADD COLUMN IF NOT EXISTS failed_at timestamptz;", "failed_at", "timestamptz"},
+		}
+		for i, w := range want {
+			ps := paired[9+i]
+			if ps.SQL != w.ddl {
+				t.Fatalf("v2 statement %d = %q, want %q", i, ps.SQL, w.ddl)
+			}
+			if ps.Object.Kind != event.KindColumn || ps.Object.Name != w.name {
+				t.Fatalf("v2 statement %d pairs with %+v, want column object %s", i, ps.Object, w.name)
+			}
+			if len(ps.Object.Columns) != 1 || ps.Object.Columns[0].Name != w.column {
+				t.Fatalf("column object %s must declare exactly column %s: %+v", w.name, w.column, ps.Object.Columns)
+			}
+			if ps.Object.Columns[0].NotNull {
+				t.Fatalf("version column %s must be nullable (expand-compatible)", w.name)
+			}
+			if w.typ == "timestamptz" && ps.Object.Columns[0].DataType != "timestamp with time zone" {
+				t.Fatalf("column %s expected type = %q, want format_type form", w.name, ps.Object.Columns[0].DataType)
+			}
+		}
+		// 每条 v2 语句幂等：重复执行语义由 IF NOT EXISTS 保证（文本检查）。
+		for _, stmt := range v2.Statements {
+			if !strings.Contains(stmt, "ADD COLUMN IF NOT EXISTS") {
+				t.Fatalf("v2 statement must be idempotent ADD COLUMN IF NOT EXISTS: %s", stmt)
+			}
+		}
+	})
+	t.Run("VersionThree_Statement_AddsEventDeliverAtIdempotent", func(t *testing.T) {
+		plan, err := postgresschema.Plan("tenant")
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		v3 := plan[2]
+		if v3.Number != 3 || len(v3.Statements) != 1 {
+			t.Fatalf("v3 = %+v, want exactly 1 add-column statement", v3)
+		}
+		// 一条 ALTER ... ADD COLUMN IF NOT EXISTS 恰好对应一个列对象。
+		paired, err := postgresschema.PlannedStatements("tenant")
+		if err != nil {
+			t.Fatalf("PlannedStatements: %v", err)
+		}
+		ps := paired[11]
+		if ps.SQL != "ALTER TABLE tenant.event ADD COLUMN IF NOT EXISTS deliver_at timestamptz;" {
+			t.Fatalf("v3 statement = %q", ps.SQL)
+		}
+		if ps.Object.Kind != event.KindColumn || ps.Object.Name != "tenant.event.deliver_at" {
+			t.Fatalf("v3 statement pairs with %+v, want column object tenant.event.deliver_at", ps.Object)
+		}
+		if ps.Object.Table != "event" {
+			t.Fatalf("v3 column owning table = %q, want event", ps.Object.Table)
+		}
+		if len(ps.Object.Columns) != 1 || ps.Object.Columns[0].Name != "deliver_at" {
+			t.Fatalf("column object must declare exactly deliver_at: %+v", ps.Object.Columns)
+		}
+		if ps.Object.Columns[0].NotNull {
+			t.Fatal("deliver_at must be nullable (expand-compatible, zero value = immediate)")
+		}
+		if ps.Object.Columns[0].DataType != "timestamp with time zone" {
+			t.Fatalf("deliver_at type = %q, want format_type form", ps.Object.Columns[0].DataType)
+		}
+		if !strings.Contains(v3.Statements[0], "ADD COLUMN IF NOT EXISTS") {
+			t.Fatalf("v3 statement must be idempotent ADD COLUMN IF NOT EXISTS: %s", v3.Statements[0])
 		}
 	})
 }
@@ -209,7 +297,7 @@ func TestExpectedObjects(t *testing.T) {
 			t.Fatalf("ExpectedObjects(invalid) = %d objects, want nil", len(objs))
 		}
 	})
-	t.Run("Default_ExpectedObjects_CoverBaselineInStableOrder", func(t *testing.T) {
+	t.Run("Default_ExpectedObjects_CoverBaselineAndVersionsInStableOrder", func(t *testing.T) {
 		objs := postgresschema.ExpectedObjects("public")
 		wantKinds := []event.ObjectKind{
 			event.KindSchema,
@@ -221,6 +309,9 @@ func TestExpectedObjects(t *testing.T) {
 			event.KindConstraint,
 			event.KindConstraint,
 			event.KindIndex,
+			event.KindColumn,
+			event.KindColumn,
+			event.KindColumn,
 		}
 		if len(objs) != len(wantKinds) {
 			t.Fatalf("ExpectedObjects = %d, want %d", len(objs), len(wantKinds))
@@ -252,6 +343,31 @@ func TestExpectedObjects(t *testing.T) {
 		if objs[7].ForeignKey == nil || objs[7].ForeignKey.RefTable != "event" {
 			t.Fatalf("foreign key object = %+v", objs[7])
 		}
+		// v2 版本加列对象：限定名含列、归属表为 event_claim、单列可空定义。
+		wantCols := []string{"public.event_claim.last_error", "public.event_claim.failed_at"}
+		for i, name := range wantCols {
+			obj := objs[9+i]
+			if obj.Name != name || obj.Table != "event_claim" {
+				t.Fatalf("version column object %d = %+v, want %s on event_claim", 9+i, obj, name)
+			}
+			if len(obj.Columns) != 1 || obj.Columns[0].NotNull {
+				t.Fatalf("version column object %s must carry a single nullable column: %+v", name, obj.Columns)
+			}
+		}
+		if objs[9].Columns[0].DataType != "text" ||
+			objs[10].Columns[0].DataType != "timestamp with time zone" {
+			t.Fatalf("version column types = %q / %q, want text / timestamp with time zone",
+				objs[9].Columns[0].DataType, objs[10].Columns[0].DataType)
+		}
+		// v3 版本加列对象：event.deliver_at，单列可空定义（零值 = 立即）。
+		obj := objs[11]
+		if obj.Name != "public.event.deliver_at" || obj.Table != "event" {
+			t.Fatalf("v3 column object = %+v, want public.event.deliver_at on event", obj)
+		}
+		if len(obj.Columns) != 1 || obj.Columns[0].NotNull ||
+			obj.Columns[0].DataType != "timestamp with time zone" {
+			t.Fatalf("v3 column object must carry a single nullable timestamptz: %+v", obj.Columns)
+		}
 	})
 }
 
@@ -266,8 +382,9 @@ func TestRepairable(t *testing.T) {
 		{"MissingTable_Repairable_ReturnsTrue", reportOf(event.KindTable, event.ProblemMissing), true},
 		{"MissingIndex_Repairable_ReturnsTrue", reportOf(event.KindIndex, event.ProblemMissing), true},
 		{"MissingConstraint_Repairable_ReturnsTrue", reportOf(event.KindConstraint, event.ProblemMissing), true},
-		{"MissingColumn_Repairable_ReturnsFalse", reportOf(event.KindColumn, event.ProblemMissing), false},
+		{"MissingVersionColumn_Repairable_ReturnsTrue", reportOf(event.KindColumn, event.ProblemMissing), true},
 		{"OutdatedTable_Repairable_ReturnsFalse", reportOf(event.KindTable, event.ProblemOutdated), false},
+		{"OutdatedColumn_Repairable_ReturnsFalse", reportOf(event.KindColumn, event.ProblemOutdated), false},
 		{"OutdatedConstraint_Repairable_ReturnsFalse", reportOf(event.KindConstraint, event.ProblemOutdated), false},
 	}
 	for _, tt := range tests {
@@ -322,7 +439,7 @@ func TestDiff(t *testing.T) {
 			t.Fatalf("issue = %+v, want column/outdated", issue)
 		}
 	})
-	t.Run("MissingColumn_Diff_ReportsMissingColumn", func(t *testing.T) {
+	t.Run("MissingBaselineColumn_Diff_ReportsOutdatedNotRepairable", func(t *testing.T) {
 		snap := fullSnapshot()
 		table := snap.Tables["event"]
 		var kept []postgresschema.ColumnState
@@ -336,10 +453,65 @@ func TestDiff(t *testing.T) {
 		report := postgresschema.Diff(postgresschema.ExpectedObjects("public"), snap)
 		issue, ok := findIssue(report, "public.event.metadata")
 		if !ok {
-			t.Fatalf("issues = %+v, want missing for public.event.metadata", report.Issues)
+			t.Fatalf("issues = %+v, want report for public.event.metadata", report.Issues)
+		}
+		// 基线列缺失属定义偏差（迁移不改既有表），报告 outdated 而非 missing。
+		if issue.Kind != event.KindColumn || issue.Problem != event.ProblemOutdated {
+			t.Fatalf("issue = %+v, want column/outdated", issue)
+		}
+	})
+	t.Run("MissingVersionColumn_Diff_ReportsMissingRepairable", func(t *testing.T) {
+		snap := fullSnapshot()
+		table := snap.Tables["event_claim"]
+		var kept []postgresschema.ColumnState
+		for _, col := range table.Columns {
+			if col.Name != "failed_at" {
+				kept = append(kept, col)
+			}
+		}
+		table.Columns = kept
+		snap.Tables["event_claim"] = table
+		report := postgresschema.Diff(postgresschema.ExpectedObjects("public"), snap)
+		issue, ok := findIssue(report, "public.event_claim.failed_at")
+		if !ok {
+			t.Fatalf("issues = %+v, want report for public.event_claim.failed_at", report.Issues)
 		}
 		if issue.Kind != event.KindColumn || issue.Problem != event.ProblemMissing {
 			t.Fatalf("issue = %+v, want column/missing", issue)
+		}
+		if !postgresschema.Repairable(report) {
+			t.Fatalf("missing version column must be repairable, issues = %+v", report.Issues)
+		}
+	})
+	t.Run("WrongVersionColumnType_Diff_ReportsOutdatedColumn", func(t *testing.T) {
+		snap := fullSnapshot()
+		table := snap.Tables["event_claim"]
+		for i := range table.Columns {
+			if table.Columns[i].Name == "last_error" {
+				table.Columns[i].DataType = "integer"
+			}
+		}
+		snap.Tables["event_claim"] = table
+		report := postgresschema.Diff(postgresschema.ExpectedObjects("public"), snap)
+		issue, ok := findIssue(report, "public.event_claim.last_error")
+		if !ok {
+			t.Fatalf("issues = %+v, want report for public.event_claim.last_error", report.Issues)
+		}
+		if issue.Kind != event.KindColumn || issue.Problem != event.ProblemOutdated {
+			t.Fatalf("issue = %+v, want column/outdated", issue)
+		}
+		if postgresschema.Repairable(report) {
+			t.Fatal("outdated column definition must not be repairable")
+		}
+	})
+	t.Run("MissingTable_Diff_ReportsVersionColumnsMissing", func(t *testing.T) {
+		// 表缺失时列对象按缺失报告（每对象恰一问题，随表补齐收敛）。
+		snap := fullSnapshot()
+		delete(snap.Tables, "event_claim")
+		report := postgresschema.Diff(postgresschema.ExpectedObjects("public"), snap)
+		issue, ok := findIssue(report, "public.event_claim.last_error")
+		if !ok || issue.Problem != event.ProblemMissing {
+			t.Fatalf("issues = %+v, want missing public.event_claim.last_error", report.Issues)
 		}
 	})
 	t.Run("WrongPrimaryKeyColumns_Diff_ReportsOutdatedConstraint", func(t *testing.T) {
@@ -415,15 +587,15 @@ func TestDiff(t *testing.T) {
 }
 
 func fullSnapshot() postgresschema.Snapshot {
-	eventCols := make([]postgresschema.ColumnState, 0, 6)
-	for _, col := range postgresschema.EventColumns() {
+	eventCols := make([]postgresschema.ColumnState, 0, 7)
+	for _, col := range append(postgresschema.EventColumns(), postgresschema.EventVersionColumns()...) {
 		eventCols = append(eventCols, postgresschema.ColumnState{
 			Name: col.Name, DataType: col.DataType, NotNull: col.NotNull,
 			HasSequenceDefault: col.Sequence,
 		})
 	}
-	claimCols := make([]postgresschema.ColumnState, 0, 7)
-	for _, col := range postgresschema.EventClaimColumns() {
+	claimCols := make([]postgresschema.ColumnState, 0, 9)
+	for _, col := range append(postgresschema.EventClaimColumns(), postgresschema.EventClaimVersionColumns()...) {
 		claimCols = append(claimCols, postgresschema.ColumnState{
 			Name: col.Name, DataType: col.DataType, NotNull: col.NotNull,
 			HasSequenceDefault: col.Sequence,

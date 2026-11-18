@@ -18,7 +18,8 @@ import (
 // 失败整体回滚、中断重跑即收敛；升级随部署隐式发生。
 //
 // 需要 DDL 权限，仅 DML 账号应改用 Verify/None（部署流程建表）；
-// WithMigrateMode 只对 NewDriver 有意义，显式传入返回 ErrMigrateModeUnsupported。
+// WithMigrateMode 对 NewDriver / NewStore（内部 Driver 构造期）生效，
+// 显式传入本函数返回 ErrMigrateModeUnsupported。
 func Migrate(ctx context.Context, db *sql.DB, opts ...Option) error {
 	cfg := newConfig(opts)
 	if cfg.modeSet {

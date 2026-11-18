@@ -21,3 +21,15 @@ func SetLockWaitTimeoutForTest(d time.Duration) func() {
 	lockWaitTimeout = d
 	return func() { lockWaitTimeout = old }
 }
+
+// SetAdminLockWaitForTest 缩短管理写互斥锁等待上限（仅测试编译单元可见），
+// 返回恢复函数。
+func SetAdminLockWaitForTest(d time.Duration) func() {
+	old := adminLockWait
+	adminLockWait = d
+	return func() { adminLockWait = old }
+}
+
+// NotifyForTest 模拟一次 NOTIFY 到达（仅测试编译单元可见）：绕过 LISTEN
+// 连接，直接驱动分发路径（桥接 → NotifyAll）。
+func NotifyForTest(w *Wake, payload string) { w.dispatch(payload) }

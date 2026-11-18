@@ -57,3 +57,24 @@ func (w *LocalWake) notify(typ string) (notified, dropped int) {
 	}
 	return notified, dropped
 }
+
+// NotifyAll 向本实例全部已订阅类型发唤醒信号（非阻塞；跨实例唤醒的桥接
+// 入口，ADR 0013）：支持原生推送的后端（pgxc LISTEN/NOTIFY）收到通知后
+// 经此注入信号，语义与发布侧 notify 一致——仅信号、不承载投递保证，丢弃
+// 与错过的信号由周期 poll 兜底（ADR 0003 边界不变）。返回送达与丢弃的
+// 订阅通道数。并发安全。
+func (w *LocalWake) NotifyAll() (notified, dropped int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, m := range w.subs {
+		for ch := range m {
+			select {
+			case ch <- struct{}{}:
+				notified++
+			default:
+				dropped++
+			}
+		}
+	}
+	return notified, dropped
+}

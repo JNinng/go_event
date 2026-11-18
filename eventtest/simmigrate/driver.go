@@ -97,9 +97,9 @@ func (d *driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 	return d.inner.HeadPosition(ctx, typ)
 }
 
-func (d *driver) Claim(ctx context.Context, q event.ClaimQuery) ([]event.Lease, error) {
+func (d *driver) Claim(ctx context.Context, q event.ClaimQuery) (event.ClaimResult, error) {
 	if err := d.ready(ctx); err != nil {
-		return nil, err
+		return event.ClaimResult{}, err
 	}
 	return d.inner.Claim(ctx, q)
 }

@@ -3,6 +3,7 @@ package postgrec
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jninng/go_event"
@@ -84,4 +85,62 @@ func (mm *migrationMetrics) record(ctx context.Context, scope, schema string,
 	mm.migrate.Add(ctx, 1, attrs)
 	mm.migrateDuration.Record(ctx, elapsed.Seconds(),
 		metric.WithAttributes(attribute.String(attrResult, res)))
+}
+
+// adminMetrics 是管理面写操作仪表集（发射点单一：admin 写方法）。属性
+// 只有枚举与标识符（result / schema），事件 ID 与错误原文禁入。
+type adminMetrics struct {
+	replay metric.Int64Counter
+}
+
+func newAdminMetrics(mp metric.MeterProvider, scope string) *adminMetrics {
+	if mp == nil {
+		mp = otel.GetMeterProvider() // 兜底：未配置时即 noop provider
+	}
+	m := mp.Meter(scope)
+	am := &adminMetrics{}
+	am.replay, _ = m.Int64Counter(scope+".admin.replay",
+		metric.WithDescription("管理面重放结果计数"), metric.WithUnit("1"))
+	return am
+}
+
+// adminResult 管理面重放结果枚举（值即 event 的 Admin 重放结果枚举）。
+func adminResult(ok bool, err error) string {
+	switch {
+	case err == nil && ok:
+		return event.AdminReplayOK
+	case err == nil:
+		return event.AdminReplayNoEffect
+	case errors.Is(err, context.Canceled):
+		return event.AdminReplayCanceled
+	case errors.Is(err, event.ErrAdminLockTimeout):
+		return event.AdminReplayLockTimeout
+	default:
+		return event.AdminReplayError
+	}
+}
+
+// record 计量一次管理面重放（ctx 携带 trace 关联）。
+func (am *adminMetrics) record(ctx context.Context, schema string, ok bool, err error) {
+	res := adminResult(ok, err)
+	am.replay.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrResult, res),
+		attribute.String(attrSchema, schema)))
+}
+
+// observeAdminReplay 管理面重放观测旁路分发：经 ObserverV3 类型断言，
+// 未实现 V3 的观察者不感知管理面事件；回调 recover panic，纯旁路。
+func observeAdminReplay(o event.Observer, ev event.AdminReplayEvent) {
+	v3, ok := o.(event.ObserverV3)
+	if !ok {
+		return
+	}
+	defer func() { _ = recover() }()
+	v3.OnAdminReplay(ev)
+}
+
+// logErrAttrs 日志错误属性（OTel 语义约定：error.type 类型名 + error
+// 字符串化，不携带堆栈）。
+func logErrAttrs(err error) []any {
+	return []any{"error.type", fmt.Sprintf("%T", err), "error", err.Error()}
 }

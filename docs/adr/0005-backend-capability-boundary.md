@@ -18,6 +18,10 @@ core 语义（两种消费方式、租约、重试）需要落到多个后端。
   **能力边界表**，注明每项语义的实现档位。
 - 非核心的可选能力（延迟事件、管理面查询、NOTIFY 推送唤醒等）走**可选拓展
   接口 + 能力探测**，与 outbox 同模式；使用方按探测结果决定启用与否。
+  注：outbox 形态后经 [ADR 0012](0012-outbox-transactional-append-and-broadcast-ordering.md)
+  定稿为各后端的具体类型构造（core 不定义接口——事务载体是后端具体类型，
+  如 `pgx.Tx` / `*sql.Tx`），不经运行面类型获得、类型断言探测不适用；
+  其余可选拓展接口仍为本段模式。
 - Driver 保持**拉形状**（Claim/Fetch 返回批次）：推送型后端经其拉式 API
   适配（JetStream Fetch、XREADGROUP 等）；真推送投递留作可选
   DeliverySource 拓展，不动基线。

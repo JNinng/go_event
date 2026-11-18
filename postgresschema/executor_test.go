@@ -214,7 +214,7 @@ func consistentSnapshot() Snapshot {
 		SchemaExists: true,
 		Tables: map[string]TableState{
 			TableEvent:      {RelKind: "r", Columns: toColStates(EventColumns())},
-			TableEventClaim: {RelKind: "r", Columns: toColStates(EventClaimColumns())},
+			TableEventClaim: {RelKind: "r", Columns: toColStates(append(EventClaimColumns(), EventClaimVersionColumns()...))},
 		},
 		Constraints: map[string]ConstraintState{
 			"event_pk":           {Name: "event_pk", Type: "p", Table: TableEvent, Columns: []string{"id"}},

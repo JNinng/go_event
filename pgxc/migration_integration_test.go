@@ -111,17 +111,17 @@ func exerciseDML(t *testing.T, drv event.Driver, typ, prefix string) {
 		t.Fatal("fetch returned no events")
 	}
 
-	leases, err := drv.Claim(ctx, event.ClaimQuery{
+	claim, err := drv.Claim(ctx, event.ClaimQuery{
 		Type: typ, ConsumerType: prefix + "-c1",
 		Lease: time.Minute, Limit: 10, RetryLimit: 3, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(leases) != 1 {
-		t.Fatalf("claim leases = %d, want 1", len(leases))
+	if len(claim.Leases) != 1 {
+		t.Fatalf("claim leases = %d, want 1", len(claim.Leases))
 	}
-	lease := leases[0]
+	lease := claim.Leases[0]
 	if err := drv.Heartbeat(ctx, event.HeartbeatRequest{
 		EventID: lease.Envelope.ID, ConsumerType: lease.ConsumerType,
 		LeaseToken: lease.LeaseToken, Extend: time.Minute, Now: now,
@@ -136,19 +136,19 @@ func exerciseDML(t *testing.T, drv event.Driver, typ, prefix string) {
 	}
 
 	appendEvent(t, drv, typ, prefix+"-2")
-	leases, err = drv.Claim(ctx, event.ClaimQuery{
+	claim, err = drv.Claim(ctx, event.ClaimQuery{
 		Type: typ, ConsumerType: prefix + "-c2",
 		Lease: time.Minute, Limit: 10, RetryLimit: 1, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("claim second: %v", err)
 	}
-	if len(leases) == 0 {
+	if len(claim.Leases) == 0 {
 		t.Fatal("second claim returned no leases")
 	}
 	if err := drv.Fail(ctx, event.FailRequest{
-		EventID: leases[0].Envelope.ID, ConsumerType: leases[0].ConsumerType,
-		LeaseToken: leases[0].LeaseToken, RetryLimit: 1,
+		EventID: claim.Leases[0].Envelope.ID, ConsumerType: claim.Leases[0].ConsumerType,
+		LeaseToken: claim.Leases[0].LeaseToken, RetryLimit: 1,
 		Backoff: event.LinearBackoff(time.Second, time.Second), Now: now,
 	}); err != nil {
 		t.Fatalf("fail: %v", err)
@@ -1057,6 +1057,146 @@ func TestCanceledContext(t *testing.T) {
 		}
 		if schemaExists(t, pool, schema) {
 			t.Fatal("canceled first append must not create objects")
+		}
+	})
+}
+
+// provisionVersion 顺序执行指定版本的计划语句（模拟旧二进制创建的存量
+// 基线，供升级路径用例）。
+func provisionVersion(t *testing.T, pool *pgxpool.Pool, schema string, version int) {
+	t.Helper()
+	plan, err := postgresschema.Plan(schema)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if version < 1 || version > len(plan) {
+		t.Fatalf("version %d out of plan range", version)
+	}
+	ctx := context.Background()
+	for i, stmt := range plan[version-1].Statements {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("provision v%d statement %d: %v\n%s", version, i, err, stmt)
+		}
+	}
+}
+
+func columnExists(t *testing.T, pool *pgxpool.Pool, schema, table, column string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(),
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)`,
+		schema, table, column).Scan(&exists); err != nil {
+		t.Fatalf("column exists %s.%s.%s: %v", schema, table, column, err)
+	}
+	return exists
+}
+
+// 旧二进制（v1 基线）升级：Migrate 幂等补齐 v2 加列（last_error /
+// failed_at），升级随部署隐式发生（ADR 0007）；Verify 对 v1 基线报告
+// 缺失列（待升级）。
+func TestMigrateUpgradesV1Baseline(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("V1Baseline_Migrate_AddsErrorSummaryColumns", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate over v1 baseline: %v", err)
+		}
+		if !columnExists(t, pool, schema, "event_claim", "last_error") ||
+			!columnExists(t, pool, schema, "event_claim", "failed_at") {
+			t.Fatal("v2 columns not added to event_claim")
+		}
+	})
+	t.Run("V1Baseline_MigrateTwice_Idempotent", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 1: %v", err)
+		}
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 2: %v", err)
+		}
+	})
+	t.Run("V1Baseline_Verify_ReportsMissingVersionColumns", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify on v1 baseline = %v, want *VerifyError (missing columns)", err)
+		}
+		requireIssue(t, report,
+			postgresschema.Qualified(schema, "event_claim")+".last_error",
+			event.KindColumn, event.ProblemMissing)
+		requireIssue(t, verifyErr.Report,
+			postgresschema.Qualified(schema, "event_claim")+".failed_at",
+			event.KindColumn, event.ProblemMissing)
+	})
+	t.Run("V1Baseline_DriverFirstAppend_UpgradeConverges", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema))
+		exerciseDML(t, drv, "t.upgrade", "up1")
+		if !columnExists(t, pool, schema, "event_claim", "last_error") {
+			t.Fatal("create-mode first use must upgrade v1 baseline with new columns")
+		}
+	})
+}
+
+// 旧二进制（v2）升级：Migrate 幂等补齐 v3 加列（event.deliver_at，延迟
+// 事件 ADR 0013），升级随部署隐式发生（ADR 0007）；Verify 对 v2 基线
+// 报告缺失列（待升级）。
+func TestMigrateUpgradesV2Baseline(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("V2Baseline_Migrate_AddsDeliverAtColumn", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate over v2 baseline: %v", err)
+		}
+		if !columnExists(t, pool, schema, "event", "deliver_at") {
+			t.Fatal("v3 column deliver_at not added to event")
+		}
+	})
+	t.Run("V2Baseline_MigrateTwice_Idempotent", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 1: %v", err)
+		}
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 2: %v", err)
+		}
+	})
+	t.Run("V2Baseline_Verify_ReportsMissingDeliverAt", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify on v2 baseline = %v, want *VerifyError (missing column)", err)
+		}
+		requireIssue(t, report,
+			postgresschema.Qualified(schema, "event")+".deliver_at",
+			event.KindColumn, event.ProblemMissing)
+	})
+	t.Run("V2Baseline_DriverFirstAppend_UpgradeConverges", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema))
+		exerciseDML(t, drv, "t.upgrade3", "up3")
+		if !columnExists(t, pool, schema, "event", "deliver_at") {
+			t.Fatal("create-mode first use must upgrade v2 baseline with deliver_at")
 		}
 	})
 }

@@ -6,7 +6,8 @@ import (
 )
 
 // MigrateMode 是运行面（Driver 构造期）的迁移模式（design.md §8）。
-// 模式只对 NewDriver 有意义：显式传给 Migrate 返回 ErrMigrateModeUnsupported。
+// 模式对 NewDriver / NewStore（内部 Driver 构造期）生效：显式传给 Migrate
+// 返回 ErrMigrateModeUnsupported。
 type MigrateMode int
 
 const (

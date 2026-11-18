@@ -272,6 +272,8 @@ func Diff(expected []Object, snap Snapshot) event.VerifyReport {
 			}
 		case event.KindTable:
 			issues = append(issues, diffTable(obj, snap)...)
+		case event.KindColumn:
+			issues = append(issues, diffColumn(obj, snap)...)
 		case event.KindConstraint:
 			issues = append(issues, diffConstraint(obj, snap)...)
 		case event.KindIndex:
@@ -296,13 +298,42 @@ func diffTable(obj Object, snap Snapshot) []event.VerifyIssue {
 		actual, found := findColumn(state, want.Name)
 		name := obj.Name + "." + want.Name
 		if !found {
-			issues = append(issues, newIssue(name, event.KindColumn, event.ProblemMissing,
+			// 基线列属于表的定义：已存在的表缺基线列属定义偏差——建表
+			// 语句（CREATE TABLE IF NOT EXISTS）对既有表不生效，迁移不能
+			// 补齐，必须人工处置；版本加列走独立列对象（diffColumn）。
+			issues = append(issues, newIssue(name, event.KindColumn, event.ProblemOutdated,
 				"add the column manually to match the plan (the migration does not alter existing tables)"))
 			continue
 		}
 		if actual.DataType != want.DataType || actual.NotNull != want.NotNull ||
 			(want.Sequence && !actual.HasSequenceDefault) {
 			issues = append(issues, newIssue(name, event.KindColumn, event.ProblemOutdated,
+				"align the column definition with the plan manually (not auto-repaired)"))
+		}
+	}
+	return issues
+}
+
+// diffColumn 比对单个版本加列（独立列对象，ALTER TABLE ... ADD COLUMN IF
+// NOT EXISTS 构造）与快照：所属表缺失或非可承载数据的表时按缺失列报告
+// （表级问题由表对象单独报告）；缺失可由迁移补齐。
+func diffColumn(obj Object, snap Snapshot) []event.VerifyIssue {
+	state, ok := snap.Tables[obj.Table]
+	if !ok || (state.RelKind != "r" && state.RelKind != "p") {
+		return []event.VerifyIssue{newIssue(obj.Name, obj.Kind, event.ProblemMissing,
+			"run the migration (Create) or the SQL script to create the table")}
+	}
+	var issues []event.VerifyIssue
+	for _, want := range obj.Columns {
+		actual, found := findColumn(state, want.Name)
+		if !found {
+			issues = append(issues, newIssue(obj.Name, obj.Kind, event.ProblemMissing,
+				"run the migration (Create) or the SQL script to add the column"))
+			continue
+		}
+		if actual.DataType != want.DataType || actual.NotNull != want.NotNull ||
+			(want.Sequence && !actual.HasSequenceDefault) {
+			issues = append(issues, newIssue(obj.Name, obj.Kind, event.ProblemOutdated,
 				"align the column definition with the plan manually (not auto-repaired)"))
 		}
 	}
@@ -382,17 +413,18 @@ func diffIndex(obj Object, snap Snapshot) []event.VerifyIssue {
 }
 
 // Repairable 报告问题集合是否能由版本计划补齐：缺失的 schema/表/索引/
-// 约束可由计划的幂等语句构造；缺失的基线列不能（其构造语句是
-// CREATE TABLE IF NOT EXISTS，对已存在的表不生效，属定义偏差，必须人工
-// 处置；后续版本以 ADD COLUMN IF NOT EXISTS 加列时再放开该档）；定义
-// 冲突（outdated）不能，必须人工处置。
+// 约束/版本加列可由计划的幂等语句构造（版本加列的构造语句是
+// ALTER TABLE ... ADD COLUMN IF NOT EXISTS，对既有表生效）；缺失的基线
+// 列不能（其构造语句是 CREATE TABLE IF NOT EXISTS，对已存在的表不生效，
+// 属定义偏差，Diff 报告为 outdated、必须人工处置）；定义冲突（outdated）
+// 不能，必须人工处置。
 func Repairable(report event.VerifyReport) bool {
 	for _, issue := range report.Issues {
 		if issue.Problem != event.ProblemMissing {
 			return false
 		}
 		switch issue.Kind {
-		case event.KindSchema, event.KindTable, event.KindIndex, event.KindConstraint:
+		case event.KindSchema, event.KindTable, event.KindIndex, event.KindConstraint, event.KindColumn:
 		default:
 			return false
 		}

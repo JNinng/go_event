@@ -1,9 +1,16 @@
 // Package eventtest 契约测试套件：接口的语义就是这套测试，新后端必须
 // 全过（design.md §1、§9.1）。RunSuite 覆盖公共、广播读取、认领消费与
 // core 编排语义；RunRetentionSuite 覆盖保留窗口惰性清理资格（design.md
-// §5.2）；RunMigrationSuite 经 MigrationBackend 适配接口覆盖初始化面
+// §5.2；保留窗口自可投递时刻起算，ADR 0013）；RunDelayedDeliverySuite
+// 覆盖延迟事件（deliver_at 定时投递、到期边界、水位组合边界，ADR 0013）；
+// RunMigrationSuite 经 MigrationBackend 适配接口覆盖初始化面
 // （Migrate/Verify、三种迁移模式、导出物、并发首启与锁语义、Lock=none
-// 变体、语句边界故障注入）。用例级清单以各 Run 入口的注册表为准。
+// 变体、语句边界故障注入）；RunInspectorSuite 覆盖只读查询面
+// event.Inspector（可选能力，按类型断言探测，ADR 0005）；RunStoreSuite
+// 覆盖后端组合对象 Store 的三面同源（便利构造，各面完整语义仍由上述
+// 套件约束）；RunTransactionalAppendSuite 覆盖 outbox 事务性入队（可选
+// 面，经 TxSession 适配注入事务载体，ADR 0012）。用例级清单以
+// 各 Run 入口的注册表为准。
 //
 // 用例命名遵循三段式「条件_动作_预期结果」。
 package eventtest
@@ -47,6 +54,9 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("ExpiredLease_Claim_TakeoverIncrementsAttempts", func(t *testing.T) { testClaimTakeover(t, d) })
 	t.Run("OverLimitTakeover_Claim_TerminalNoLease", func(t *testing.T) { testClaimOverLimitTerminal(t, d) })
 	t.Run("OverLimitRow_Claim_DoesNotConsumeLimitSlot", func(t *testing.T) { testClaimOverLimitSlot(t, d) })
+	t.Run("FailRetryReclaim_ClaimResult_NotTakeover", func(t *testing.T) { testFailRetryReclaimNotTakeover(t, d) })
+	t.Run("RetryingOverLimitRow_ClaimResult_NoTerminalOnClaim", func(t *testing.T) { testRetryingOverLimitRowNoTerminalOnClaim(t, d) })
+	t.Run("MixedBatch_ClaimResult_CountsSumAndReconcile", func(t *testing.T) { testMixedBatchClaimCounts(t, d) })
 	t.Run("SmallLimit_Claim_CapsBatch", func(t *testing.T) { testClaimLimit(t, d) })
 	t.Run("TerminalRows_Claim_Skipped", func(t *testing.T) { testClaimSkipTerminal(t, d) })
 	t.Run("NewConsumerType_Claim_ReplaysHistory", func(t *testing.T) { testNewConsumerReplays(t, d) })
@@ -57,6 +67,24 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("StaleToken_Fail_NoIncrement", func(t *testing.T) { testLateFail(t, d) })
 	t.Run("BackoffWindow_Claim_DelayedUntilEligible", func(t *testing.T) { testFailBackoff(t, d) })
 	t.Run("RetryLimitFail_Fail_TerminalNoReclaim", func(t *testing.T) { testFailRetryLimit(t, d) })
+
+	// ---- Fail 错误摘要落库口径（docs/design.md §5.3；经 ClaimStateReader
+	// ---- 断言落库事实）----
+	reader, ok := d.(ClaimStateReader)
+	if !ok {
+		t.Fatalf("driver %T must implement ClaimStateReader: the error summary "+
+			"persistence facts are part of the Driver contract", d)
+	}
+	t.Run("TerminalFailWithError_Fail_StoresSanitizedSummary", func(t *testing.T) { testFailSummaryTerminalStores(t, d, reader) })
+	t.Run("TerminalFailWithError_Fail_StoresFailedAtAtFailNow", func(t *testing.T) { testFailSummaryTerminalFailedAt(t, d, reader) })
+	t.Run("NonTerminalFail_Fail_LeavesSummaryAndFailedAtUnwritten", func(t *testing.T) { testFailSummaryRetryingUnwritten(t, d, reader) })
+	t.Run("TerminalFailEmptyError_Fail_StoresNoSummary", func(t *testing.T) { testFailSummaryEmptyError(t, d, reader) })
+	t.Run("StaleTokenWithError_Fail_DoesNotWriteSummaryOrFailedAt", func(t *testing.T) { testFailSummaryLateFailUnwritten(t, d, reader) })
+	t.Run("OverLimitTakeover_Claim_StoresFailedAtWithoutSummary", func(t *testing.T) { testFailSummaryTakeoverTerminal(t, d, reader) })
+	t.Run("ExactlyLimitError_Fail_StoresUntruncatedSummary", func(t *testing.T) { testFailSummaryExactlyLimit(t, d, reader) })
+	t.Run("OverLimitError_Fail_TruncatesSummaryToLimitBytes", func(t *testing.T) { testFailSummaryTruncated(t, d, reader) })
+	t.Run("ControlCharError_Fail_StoresStrippedSummary", func(t *testing.T) { testFailSummaryControlChars(t, d, reader) })
+	t.Run("HandlerErrorViaRunner_TerminalFail_StoresHandlerMessage", func(t *testing.T) { testFailSummaryRunnerPushdown(t, d, reader) })
 
 	// ---- core 编排（Runner/Publisher 基于 Driver 的端到端语义）----
 	t.Run("PreStartEvents_Broadcast_SkippedAndPostStartDelivered", func(t *testing.T) { testBroadcastOnlyAfterStart(t, d) })
@@ -83,13 +111,15 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("InFlightHandler_Stop_WaitsUntilCompletion", func(t *testing.T) { testGracefulStop(t, d) })
 	t.Run("AfterStop_Claim_NotResumed", func(t *testing.T) { testClaimNotResumedAfterStop(t, d) })
 	t.Run("LocalWakePublish_Runner_ImmediateDelivery", func(t *testing.T) { testLocalWake(t, d) })
+	t.Run("PublishWithDeliverAt_FetchAndClaim_FilteredUntilDue", func(t *testing.T) { testPublishWithDeliverAt(t, d) })
 	t.Run("ClaimOnlyOption_BroadcastSubscribe_Rejected", func(t *testing.T) { testGuardClaimOnlyOnBroadcast(t, d) })
 	t.Run("MissingIdentity_ClaimSubscribe_Rejected", func(t *testing.T) { testGuardMissingIdentity(t, d) })
 	t.Run("PostStartSubscribe_RejectedErrRunnerStarted", func(t *testing.T) { testGuardSubscribeAfterStart(t, d) })
 }
 
 // RunRetentionSuite 运行保留窗口惰性清理契约（design.md §5.2：清理资格
-// 为「超窗且无活跃租约，无论终态与否」）。newDriver 须为每个用例返回
+// 为「超窗且无活跃租约，无论终态与否」；保留窗口自可投递时刻起算——
+// deliver_at 非零以其为判据，ADR 0013 §1）。newDriver 须为每个用例返回
 // **已配置保留窗口**的全新 Driver 实例（清理簿记按 Driver 实例记忆，
 // 共享实例会因节流跳过清理；窗口时长由构造方决定，用例以足够久远的
 // OccurredAt 构造超窗行）。
@@ -98,9 +128,30 @@ func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver) {
 	t.Run("ExpiredActiveLease_Cleanup_Retained", func(t *testing.T) { testRetentionActiveLeaseRetained(t, newDriver) })
 	t.Run("ExpiredTerminal_Cleanup_Deleted", func(t *testing.T) { testRetentionTerminalDeleted(t, newDriver) })
 	t.Run("WithinWindow_Cleanup_Retained", func(t *testing.T) { testRetentionWithinWindowRetained(t, newDriver) })
+	t.Run("UndeliveredDelayedBeyondOccurredAt_Cleanup_RetainedUntilDue", func(t *testing.T) { testRetentionDelayedUndeliveredRetained(t, newDriver) })
+	t.Run("OverdueDeliverAtBeyondWindow_Cleanup_Deleted", func(t *testing.T) { testRetentionDelayedOverdueDeleted(t, newDriver) })
 }
 
 // ---- 公共测试设施 ----
+
+// ClaimState 认领行的落库事实快照（事件 × 消费者身份）：Fail 的错误摘要
+// 与终态时刻写入口径以此断言（docs/design.md §5.3）。空串/零值表示对应
+// 列为 NULL（未提供/未写入）。
+type ClaimState struct {
+	Status    string    // 行状态：active / retrying / done / failed
+	LastError string    // 错误摘要（清洗后文本）
+	FailedAt  time.Time // 行进入 failed 终态的时刻
+}
+
+// ClaimStateReader 是认领行落库事实的观察接口：RunSuite 用它断言 Fail
+// 错误摘要与 failed_at 的写入时机与口径。Driver 必须实现（inmem 原生
+// 实现；Postgres 后端在测试装配处以 SQL 适配 event_claim 行）。
+type ClaimStateReader interface {
+	// ReadClaimState 返回认领行的当前落库事实；行不存在时 ok 为 false。
+	// 行缺失以外的查询失败属测试装配故障，经 t 报错终止（不得折叠为
+	// 「行不存在」）。
+	ReadClaimState(t *testing.T, eventID, consumerType string) (ClaimState, bool)
+}
 
 // baseNow 契约测试的基准时钟：Driver 判据一律取入参 Now，不依赖宿主
 // 时钟。取当前墙钟值——避免与后端保留窗口清理（以 occurred_at 对比墙钟）
@@ -145,14 +196,22 @@ func appendOccurredAt(t *testing.T, d event.Driver, id, typ string,
 func claim(t *testing.T, d event.Driver, typ, consumerType string,
 	lease time.Duration, now time.Time) []event.Lease {
 	t.Helper()
-	ls, err := d.Claim(t.Context(), event.ClaimQuery{
+	return claimResult(t, d, typ, consumerType, lease, now).Leases
+}
+
+// claimResult 认领并返回完整落库事实汇总（接管/终态计数用例与对账用例
+// 需要 ClaimResult；仅取租约的用例用 claim）。
+func claimResult(t *testing.T, d event.Driver, typ, consumerType string,
+	lease time.Duration, now time.Time) event.ClaimResult {
+	t.Helper()
+	res, err := d.Claim(t.Context(), event.ClaimQuery{
 		Type: typ, ConsumerType: consumerType, Lease: lease, Limit: 10,
 		RetryLimit: 5, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	return ls
+	return res
 }
 
 // comparePosition 按数值比较 Position 字符串（后端 Position 为数值全序）。

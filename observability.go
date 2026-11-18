@@ -78,10 +78,46 @@ type LeaseEvent struct {
 	Event string
 }
 
+// ClaimEvent 是一次认领轮的观测事件：发放与接管/终态计数随 Driver.Claim
+// 的 ClaimResult 返回，与落库事实一致（design.md §9.2）。仅成功轮次
+// 分发（失败轮次经 <scope>.claim 指标的 result=error 与日志可见）；
+// 空轮次（零发放）同样分发——与指标侧「计数非零才打点」不对称，
+// 观察者以事件为轮级事实流、以指标为聚合口径。
+type ClaimEvent struct {
+	Event          string
+	Identity       string
+	Leases         int // 本轮发放租约数
+	Takeovers      int // 本轮接管发放数量（含终态接管）
+	TerminalFailed int // 本轮认领动作直接置 failed 的数量
+}
+
 // StopEvent 是 Runner 停机完成的观测事件；TimedOut 表示等待在途 handler
 // 超过调用方 ctx（在途 handler 不受影响，继续跑完）。
 type StopEvent struct {
 	TimedOut bool
+}
+
+// Admin 重放结果枚举（AdminReplayEvent.Result 与后端管理面指标 result
+// 属性的取值）。ok / no_effect 之外均为失败返回：canceled 是调用方取消
+// （不记错误日志），lock_timeout 是命名空间互斥锁等待超时（瞬时，可
+// 重试），error 是其余执行故障（连接、迁移面等）。
+const (
+	AdminReplayOK          = "ok"           // 重放生效（行原为 failed 且已重放）
+	AdminReplayNoEffect    = "no_effect"    // 无效果（ok=false 且无错误）
+	AdminReplayCanceled    = "canceled"     // 调用方取消
+	AdminReplayLockTimeout = "lock_timeout" // 互斥锁等待超时（瞬时）
+	AdminReplayError       = "error"        // 执行故障
+)
+
+// AdminReplayEvent 是一次管理面重放的观测事件（ADR 0010：管理写操作记录
+// 操作来源）。EventID × ConsumerType 是重放对象（事件 × 消费者身份，仅
+// 标识不入指标属性）；Result 取 Admin 重放结果枚举值；Err 仅在失败结果
+// （canceled / lock_timeout / error）时非 nil。
+type AdminReplayEvent struct {
+	EventID      string
+	ConsumerType string
+	Result       string
+	Err          error
 }
 
 // Observer 观测旁路接口：回调在调用方 goroutine 同步执行，须微秒级返回；
@@ -97,6 +133,21 @@ type ObserverV2 interface {
 	Observer
 	OnLeaseAbandoned(LeaseEvent)
 	OnRunnerStopped(StopEvent)
+}
+
+// ObserverV3 可选扩展接口：管理面写操作观测（嵌入 ObserverV2 同款非破坏
+// 性演进，分发点类型断言——未实现 V3 的观察者不感知管理面事件）。
+type ObserverV3 interface {
+	ObserverV2
+	OnAdminReplay(AdminReplayEvent)
+}
+
+// ObserverV4 可选扩展接口：认领轮接管与终态计数观测（嵌入 ObserverV3
+// 同款非破坏性演进，分发点类型断言——未实现 V4 的观察者不感知认领轮
+// 事件）。对应指标为 <scope>.claim.takeover 与 <scope>.claim.terminal_failed。
+type ObserverV4 interface {
+	ObserverV3
+	OnClaim(ClaimEvent)
 }
 
 type meterOption struct{ mp metric.MeterProvider }
@@ -167,6 +218,12 @@ func (h observerHub) runnerStopped(ev StopEvent) {
 	}
 }
 
+func (h observerHub) claim(ev ClaimEvent) {
+	if v4, ok := h.obs.(ObserverV4); ok {
+		safeObserve(func() { v4.OnClaim(ev) })
+	}
+}
+
 func safeObserve(fn func()) {
 	defer func() { _ = recover() }()
 	fn()
@@ -197,17 +254,19 @@ func newPublisherMetrics(mp metric.MeterProvider, scope string) *publisherMetric
 
 // runnerMetrics 是消费侧仪表集（构建方式同 publisherMetrics）。
 type runnerMetrics struct {
-	fetch          metric.Int64Counter
-	fetchDuration  metric.Float64Histogram
-	claim          metric.Int64Counter
-	claimDuration  metric.Float64Histogram
-	claimGranted   metric.Int64Counter
-	leaseAbandoned metric.Int64Counter
-	consume        metric.Int64Counter
-	handleDuration metric.Float64Histogram
-	heartbeat      metric.Int64Counter
-	complete       metric.Int64Counter
-	fail           metric.Int64Counter
+	fetch               metric.Int64Counter
+	fetchDuration       metric.Float64Histogram
+	claim               metric.Int64Counter
+	claimDuration       metric.Float64Histogram
+	claimGranted        metric.Int64Counter
+	claimTakeover       metric.Int64Counter
+	claimTerminalFailed metric.Int64Counter
+	leaseAbandoned      metric.Int64Counter
+	consume             metric.Int64Counter
+	handleDuration      metric.Float64Histogram
+	heartbeat           metric.Int64Counter
+	complete            metric.Int64Counter
+	fail                metric.Int64Counter
 }
 
 func newRunnerMetrics(mp metric.MeterProvider, scope string) *runnerMetrics {
@@ -226,6 +285,12 @@ func newRunnerMetrics(mp metric.MeterProvider, scope string) *runnerMetrics {
 		metric.WithDescription("认领耗时"), metric.WithUnit("s"))
 	rm.claimGranted, _ = m.Int64Counter(scope+".claim.granted",
 		metric.WithDescription("认领发放租约数"), metric.WithUnit("1"))
+	rm.claimTakeover, _ = m.Int64Counter(scope+".claim.takeover",
+		metric.WithDescription("认领接管发放数（含接管后直接置 failed 的终态接管；与落库事实一致）"),
+		metric.WithUnit("1"))
+	rm.claimTerminalFailed, _ = m.Int64Counter(scope+".claim.terminal_failed",
+		metric.WithDescription("认领侧达重试上限直接置 failed 数（当前语义必经接管路径，ADR 0006）"),
+		metric.WithUnit("1"))
 	rm.leaseAbandoned, _ = m.Int64Counter(scope+".lease.abandoned",
 		metric.WithDescription("停机放弃租约数（待其他实例接管）"), metric.WithUnit("1"))
 	rm.consume, _ = m.Int64Counter(scope+".consume",

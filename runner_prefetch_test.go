@@ -2,6 +2,7 @@ package event_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"sync"
@@ -39,9 +40,10 @@ type claimProbeDriver struct {
 	probeMu   sync.Mutex
 	claimQs   []event.ClaimQuery
 	claimErrs int // 剩余注入 Claim 错误的次数
-	batches   [][]event.Lease
+	results   []event.ClaimResult
 	beats     []event.HeartbeatRequest
 	completes []event.CompleteRequest
+	fails     []event.FailRequest
 
 	claimSignal chan struct{} // 每次 Claim 非阻塞投递一次（容量 1）
 }
@@ -53,11 +55,18 @@ func newClaimProbeDriver() *claimProbeDriver {
 	}
 }
 
-// enqueueBatch 追加一批 Claim 返回值：按调用顺序消耗，耗尽后返回空批次。
+// enqueueBatch 追加一批 Claim 返回的租约（计数为零的 ClaimResult）：
+// 按调用顺序消耗，耗尽后返回空批次。
 func (d *claimProbeDriver) enqueueBatch(leases ...event.Lease) {
+	d.enqueueResult(event.ClaimResult{Leases: leases})
+}
+
+// enqueueResult 追加一次 Claim 返回的完整 ClaimResult（可编程接管/终态
+// 计数，供观测指标断言）：按调用顺序消耗，耗尽后返回零值结果。
+func (d *claimProbeDriver) enqueueResult(res event.ClaimResult) {
 	d.probeMu.Lock()
 	defer d.probeMu.Unlock()
-	d.batches = append(d.batches, leases)
+	d.results = append(d.results, res)
 }
 
 // failClaims 让接下来 n 次 Claim 返回 errStub。
@@ -67,17 +76,17 @@ func (d *claimProbeDriver) failClaims(n int) {
 	d.claimErrs = n
 }
 
-func (d *claimProbeDriver) Claim(_ context.Context, q event.ClaimQuery) ([]event.Lease, error) {
+func (d *claimProbeDriver) Claim(_ context.Context, q event.ClaimQuery) (event.ClaimResult, error) {
 	d.probeMu.Lock()
 	d.claimQs = append(d.claimQs, q)
-	var out []event.Lease
+	var out event.ClaimResult
 	var err error
 	if d.claimErrs > 0 {
 		d.claimErrs--
 		err = errStub
-	} else if len(d.batches) > 0 {
-		out = d.batches[0]
-		d.batches = d.batches[1:]
+	} else if len(d.results) > 0 {
+		out = d.results[0]
+		d.results = d.results[1:]
 	}
 	d.probeMu.Unlock()
 
@@ -100,6 +109,20 @@ func (d *claimProbeDriver) Complete(_ context.Context, c event.CompleteRequest) 
 	defer d.probeMu.Unlock()
 	d.completes = append(d.completes, c)
 	return nil
+}
+
+func (d *claimProbeDriver) Fail(_ context.Context, f event.FailRequest) error {
+	d.probeMu.Lock()
+	defer d.probeMu.Unlock()
+	d.fails = append(d.fails, f)
+	return nil
+}
+
+// failedRequests 已记录的 Fail 请求（保持调用顺序）。
+func (d *claimProbeDriver) failedRequests() []event.FailRequest {
+	d.probeMu.Lock()
+	defer d.probeMu.Unlock()
+	return append([]event.FailRequest(nil), d.fails...)
 }
 
 func (d *claimProbeDriver) claimCount() int {
@@ -641,5 +664,103 @@ func TestClaimError_Poll_ContinuesUntilSuccess(t *testing.T) {
 	})
 	if got := d.claimCount(); got < 2 {
 		t.Fatalf("claim calls = %d, want >= 2 (failure then success)", got)
+	}
+}
+
+// handler 错误下推 Fail：handler 返回错误时，core 以该错误文本作为
+// FailRequest.Error 下推（后端清洗后落库为终态摘要）。
+func TestHandlerError_Fail_CarriesHandlerErrorText(t *testing.T) {
+	d := newClaimProbeDriver()
+	d.enqueueBatch(prefetchLease("pe-1"))
+	handlerErr := errors.New("boom: delivery failed")
+
+	ctx := context.Background()
+	ev := event.Declare[runPayload](prefetchType)
+	run := event.NewRunner(d, event.WithPollInterval(2*time.Millisecond), event.WithLogger(quietLogger()))
+	if err := ev.SubscribeClaim(run,
+		func(context.Context, event.Envelope[runPayload]) error { return handlerErr },
+		event.WithConsumerType(prefetchConsumer),
+		event.WithConcurrency(1),
+		event.WithFetchLimit(10),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitForUnit(t, 2*time.Second, "fail recorded for failed handler", func() bool {
+		return len(d.failedRequests()) == 1
+	})
+	if got := d.failedRequests()[0].Error; got != handlerErr.Error() {
+		t.Fatalf("FailRequest.Error = %q, want %q", got, handlerErr.Error())
+	}
+}
+
+// handler panic 下推 Fail：panic 转为 handlerPanicError 后同样携带文本
+// 下推（认领消费 panic 计一次失败重试）。
+func TestHandlerPanic_Fail_CarriesPanicErrorText(t *testing.T) {
+	d := newClaimProbeDriver()
+	d.enqueueBatch(prefetchLease("pp-1"))
+
+	ctx := context.Background()
+	ev := event.Declare[runPayload](prefetchType)
+	run := event.NewRunner(d, event.WithPollInterval(2*time.Millisecond), event.WithLogger(quietLogger()))
+	if err := ev.SubscribeClaim(run,
+		func(context.Context, event.Envelope[runPayload]) error {
+			panic("detonate")
+		},
+		event.WithConsumerType(prefetchConsumer),
+		event.WithConcurrency(1),
+		event.WithFetchLimit(10),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitForUnit(t, 2*time.Second, "fail recorded for panicked handler", func() bool {
+		return len(d.failedRequests()) == 1
+	})
+	if got := d.failedRequests()[0].Error; got != "event: handler panic: detonate" {
+		t.Fatalf("FailRequest.Error = %q, want handler panic text", got)
+	}
+}
+
+// handler 成功不下推 Fail：只调用 Complete，不产生任何 Fail 请求。
+func TestHandlerSuccess_Complete_NoFailRecorded(t *testing.T) {
+	d := newClaimProbeDriver()
+	d.enqueueBatch(prefetchLease("ok-1"))
+
+	ctx := context.Background()
+	ev := event.Declare[runPayload](prefetchType)
+	run := event.NewRunner(d, event.WithPollInterval(2*time.Millisecond), event.WithLogger(quietLogger()))
+	if err := ev.SubscribeClaim(run,
+		func(context.Context, event.Envelope[runPayload]) error { return nil },
+		event.WithConsumerType(prefetchConsumer),
+		event.WithConcurrency(1),
+		event.WithFetchLimit(10),
+		event.WithLease(time.Second),
+		event.WithHeartbeat(50*time.Millisecond),
+	); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := run.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+	waitForUnit(t, 2*time.Second, "event completed", func() bool {
+		return slices.Contains(d.completedEventIDs(), "ok-1")
+	})
+	if got := d.failedRequests(); len(got) != 0 {
+		t.Fatalf("successful handler must not record Fail, got %d", len(got))
 	}
 }

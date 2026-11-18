@@ -17,7 +17,7 @@ var (
 	ErrEmptyEventID = errors.New("event: empty event ID")
 
 	// ErrMigrateModeUnsupported：WithMigrateMode 显式传给 Migrate（该选项
-	// 只对 NewDriver 有意义）。
+	// 对 NewDriver / NewStore 的内部 Driver 构造期生效）。
 	ErrMigrateModeUnsupported = errors.New("event: migrate mode option unsupported on Migrate")
 
 	// ErrMigrationUnsupported：锁能力为无（LockNone）时 Create 不支持
@@ -27,6 +27,11 @@ var (
 	// ErrMigrationLockTimeout：等待迁移锁超时，属瞬时错误（退避后重试，
 	// 不得缓存为永久错误）。
 	ErrMigrationLockTimeout = errors.New("event: migration lock timeout")
+
+	// ErrAdminLockTimeout：管理面写操作等待命名空间互斥锁超时，属瞬时
+	// 错误（退避后重试）。锁与迁移执行共用同一把（键含 schema）——等待
+	// 对象是迁移执行或其他管理写操作；不同命名空间互不阻塞。
+	ErrAdminLockTimeout = errors.New("event: admin lock timeout")
 
 	// ErrMigrationPermissionDenied：DDL 权限不足，属永久配置错误（可能由
 	// 底层驱动的权限错误包装）。

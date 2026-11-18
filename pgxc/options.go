@@ -2,6 +2,16 @@
 // （*pgxpool.Pool）。event / event_claim 两表、FOR UPDATE SKIP LOCKED
 // 认领、惰性清理；与 postgrec 共享同一套能力与选项语义（docs/api.md §3）。
 //
+// 可选能力面（均不经运行面类型获得，与各自 Driver 共享连接与命名空间
+// 选项）：只读查询面 Inspector（NewInspector 或对 Driver 类型断言探测）、
+// 管理面 Admin（NewAdmin，写路径不挂 Driver 类型，ADR 0010）、事务性
+// 入队 TransactionalAppender（NewTransactionalAppender，调用方在自己的
+// pgx.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）、跨实例
+// 唤醒 Wake（NewWake 构造、Bind 桥接 LocalWake，LISTEN/NOTIFY 仅信号、
+// 不承载投递保证，ADR 0013）。延迟投递（event.deliver_at，WithDeliverAt /
+// RawEnvelope.DeliverAt）为 Driver 语义内字段，未到期行不满足 Fetch /
+// Claim 下推条件。
+//
 // 持久结构按 NewDriver 的迁移模式处理：缺省 Create 在首次使用时持迁移锁
 // 幂等应用版本计划全量语句（基线与各版本，升级随部署隐式发生，协议见
 // docs/adr/0007）；Verify 只读校验，None 不建也不校验——后两种模式要求
@@ -27,9 +37,10 @@ type config struct {
 	mode      event.MigrateMode
 	modeSet   bool
 
-	logger *slog.Logger         // 迁移生命周期日志（缺省构造期快照 slog.Default()）
+	logger *slog.Logger         // 迁移/管理面生命周期日志（缺省构造期快照 slog.Default()）
 	mp     metric.MeterProvider // nil = 未注入（newConfig 快照全局，未装配时即 noop）
 	scope  string
+	obs    event.Observer // 管理面观测旁路（缺省无观察者）
 }
 
 // WithSchema 表所在 schema（缺省 public）。
@@ -47,8 +58,8 @@ func WithRetention(d time.Duration) Option {
 
 // WithMigrateMode 设置运行面迁移模式（缺省 Create）：Create 首次使用时
 // 幂等应用版本计划全量语句（基线与各版本）；Verify 只读校验、不执行 DDL；
-// None 不建表也不校验。该选项只对 NewDriver 有意义，显式传给 Migrate
-// 返回 ErrMigrateModeUnsupported。
+// None 不建表也不校验。该选项对 NewDriver / NewStore（内部 Driver 构造期）
+// 生效，显式传给 Migrate 返回 ErrMigrateModeUnsupported。
 func WithMigrateMode(m event.MigrateMode) Option {
 	return func(c *config) {
 		c.mode = m
@@ -87,4 +98,12 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 // 模块名 pgxc。部署期决策——改名会使仪表盘口径漂移。
 func WithScopeName(scope string) Option {
 	return func(c *config) { c.scope = scope }
+}
+
+// WithObserver 注入类型化观测旁路（缺省无观察者）：当前仅管理面 Admin
+// 发射观测事件（AdminReplayEvent，经 ObserverV3 分发；未实现 V3 的观察者
+// 不感知）。回调在调用方 goroutine 同步执行、须微秒级返回，库内 recover
+// panic；观测是纯旁路，不改变业务语义。
+func WithObserver(o event.Observer) Option {
+	return func(c *config) { c.obs = o }
 }

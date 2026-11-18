@@ -114,7 +114,8 @@ func collectMetrics(t *testing.T, r *sdkmetric.ManualReader) []metricdata.Metric
 	return out
 }
 
-// recordingObserver 捕获全部观测事件（实现完整 ObserverV2）。
+// recordingObserver 捕获全部观测事件（实现完整 ObserverV4，含 V3 的
+// 管理面事件——V4 经嵌入链要求全部方法）。
 type recordingObserver struct {
 	mu     sync.Mutex
 	pubs   []event.PublishEvent
@@ -122,6 +123,8 @@ type recordingObserver struct {
 	wakes  []event.WakeEvent
 	leases []event.LeaseEvent
 	stops  []event.StopEvent
+	replay []event.AdminReplayEvent
+	claims []event.ClaimEvent
 }
 
 func (o *recordingObserver) OnPublish(e event.PublishEvent) {
@@ -152,6 +155,18 @@ func (o *recordingObserver) OnRunnerStopped(e event.StopEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.stops = append(o.stops, e)
+}
+
+func (o *recordingObserver) OnAdminReplay(e event.AdminReplayEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.replay = append(o.replay, e)
+}
+
+func (o *recordingObserver) OnClaim(e event.ClaimEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.claims = append(o.claims, e)
 }
 
 func (o *recordingObserver) snapshot() (pubs []event.PublishEvent,
@@ -516,6 +531,99 @@ func TestStopTimedOut_Stop_ReturnsCtxErrAndObserverTimedOut(t *testing.T) {
 	if len(stops) != 1 || !stops[0].TimedOut {
 		t.Fatalf("stop events = %+v, want exactly one TimedOut=true", stops)
 	}
+}
+
+// 接管与终态计数随 ClaimResult 计量：claim.takeover / claim.terminal_failed
+// 与落库事实一致（design.md §9.2、ADR 0008），ObserverV4 收到同口径事件；
+// 无接管的发放轮次不产生接管数据点。
+func TestClaimTakeover_Claim_CountsTakeoverAndTerminalFailed(t *testing.T) {
+	t.Run("TakeoverAndTerminal_CountedWithIdentityAttrs", func(t *testing.T) {
+		mp, reader := newManualProvider(t)
+		obs := &recordingObserver{}
+		d := newClaimProbeDriver()
+		d.enqueueResult(event.ClaimResult{
+			Leases:         []event.Lease{prefetchLease("to-1")},
+			Takeovers:      1,
+			TerminalFailed: 1,
+		})
+		claimEv := event.Declare[runPayload](prefetchType)
+		run := event.NewRunner(d, event.WithPollInterval(time.Millisecond),
+			event.WithLogger(quietLogger()), event.WithObserver(obs), event.WithMeterProvider(mp))
+		ctx := context.Background()
+		if err := claimEv.SubscribeClaim(run, func(context.Context, event.Envelope[runPayload]) error {
+			return nil
+		}, event.WithConsumerType(prefetchConsumer)); err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		if err := run.Start(ctx); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+		waitForUnit(t, 2*time.Second, "claim.takeover datapoint", func() bool {
+			return counterTotal(counterDatapointsOrEmpty(reader, "go_event.claim.takeover")) >= 1
+		})
+		takeoverDps := counterDatapoints(t, reader, "go_event.claim.takeover")
+		if got := counterTotal(takeoverDps); got != 1 {
+			t.Fatalf("claim.takeover total = %d, want 1", got)
+		}
+		for _, dp := range takeoverDps {
+			if v, ok := dp.Attributes.Value("event"); !ok || v.AsString() != prefetchType {
+				t.Fatalf("claim.takeover attrs = %v, want event=%q", dp.Attributes, prefetchType)
+			}
+			if v, ok := dp.Attributes.Value("identity"); !ok || v.AsString() != prefetchConsumer {
+				t.Fatalf("claim.takeover attrs = %v, want identity=%q", dp.Attributes, prefetchConsumer)
+			}
+		}
+		if got := counterTotal(counterDatapoints(t, reader, "go_event.claim.terminal_failed")); got != 1 {
+			t.Fatalf("claim.terminal_failed total = %d, want 1", got)
+		}
+		waitForUnit(t, 2*time.Second, "observer claim event", func() bool {
+			obs.mu.Lock()
+			defer obs.mu.Unlock()
+			return len(obs.claims) >= 1
+		})
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		var found bool
+		for _, e := range obs.claims {
+			if e.Takeovers == 1 && e.TerminalFailed == 1 && e.Leases == 1 &&
+				e.Event == prefetchType && e.Identity == prefetchConsumer {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("observer claim events = %+v, want takeover=1 terminal_failed=1 leases=1", obs.claims)
+		}
+	})
+
+	t.Run("FreshGrantOnly_Claim_NoTakeoverDatapoint", func(t *testing.T) {
+		mp, reader := newManualProvider(t)
+		d := newClaimProbeDriver()
+		d.enqueueBatch(prefetchLease("to-2"))
+		claimEv := event.Declare[runPayload](prefetchType)
+		run := event.NewRunner(d, event.WithPollInterval(time.Millisecond),
+			event.WithLogger(quietLogger()), event.WithMeterProvider(mp))
+		ctx := context.Background()
+		if err := claimEv.SubscribeClaim(run, func(context.Context, event.Envelope[runPayload]) error {
+			return nil
+		}, event.WithConsumerType(prefetchConsumer)); err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+		if err := run.Start(ctx); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
+
+		waitForUnit(t, 2*time.Second, "claim.granted datapoint", func() bool {
+			return counterTotal(counterDatapointsOrEmpty(reader, "go_event.claim.granted")) >= 1
+		})
+		for _, m := range collectMetrics(t, reader) {
+			if m.Name == "go_event.claim.takeover" || m.Name == "go_event.claim.terminal_failed" {
+				t.Fatalf("fresh grant must not record %s", m.Name)
+			}
+		}
+	})
 }
 
 func TestAbandonedLease_OnStop_CountsMetricAndObserverEvent(t *testing.T) {

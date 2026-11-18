@@ -364,7 +364,10 @@ func (r *Runner) runBroadcast(ctx context.Context, s *subscription) {
 
 func (r *Runner) pollBroadcast(ctx context.Context, s *subscription) {
 	start := time.Now()
-	batch, err := r.drv.Fetch(ctx, FetchQuery{Type: s.typ, After: s.watermark, Limit: s.fetchLimit})
+	batch, err := r.drv.Fetch(ctx, FetchQuery{
+		Type: s.typ, After: s.watermark, Limit: s.fetchLimit,
+		Now: time.Now(), // 延迟事件到期判据时钟下推（ADR 0013）
+	})
 	res := pollResult(err)
 	attrs := resultAttrs(res)
 	r.metrics.fetch.Add(ctx, 1, attrs)
@@ -458,7 +461,7 @@ func (r *Runner) pollClaim(ctx context.Context, s *subscription) {
 		limit = free
 	}
 	start := time.Now()
-	leases, err := r.drv.Claim(ctx, ClaimQuery{
+	result, err := r.drv.Claim(ctx, ClaimQuery{
 		Type:         s.typ,
 		ConsumerType: s.consumerType,
 		Lease:        s.lease,
@@ -477,13 +480,32 @@ func (r *Runner) pollClaim(ctx context.Context, s *subscription) {
 		}
 		return
 	}
-	for _, lease := range leases {
+	// 接管与终态计数随 ClaimResult 返回，与落库事实一致（design.md §9.2）；
+	// 各自条件打点（仅计数非零），不产生空轮次的零值数据点。接管可见性
+	// 补齐 ADR 0008 的已知口径限制（此前 Attempts 混合 Fail 重试与过期接管）。
+	if result.Takeovers > 0 || result.TerminalFailed > 0 {
+		cAttrs := metric.WithAttributes(
+			attribute.String(attrEvent, s.typ),
+			attribute.String(attrIdentity, s.consumerType))
+		if result.Takeovers > 0 {
+			r.metrics.claimTakeover.Add(ctx, int64(result.Takeovers), cAttrs)
+		}
+		if result.TerminalFailed > 0 {
+			r.metrics.claimTerminalFailed.Add(ctx, int64(result.TerminalFailed), cAttrs)
+		}
+	}
+	for _, lease := range result.Leases {
 		gAttrs := metric.WithAttributes(
 			attribute.String(attrEvent, s.typ),
 			attribute.String(attrIdentity, s.consumerType))
 		r.metrics.claimGranted.Add(ctx, 1, gAttrs)
 		r.dispatchClaim(ctx, s, lease)
 	}
+	r.hub.claim(ClaimEvent{
+		Event: s.typ, Identity: s.consumerType,
+		Leases: len(result.Leases), Takeovers: result.Takeovers,
+		TerminalFailed: result.TerminalFailed,
+	})
 }
 
 func (r *Runner) dispatchClaim(ctx context.Context, s *subscription, lease Lease) {
@@ -562,9 +584,12 @@ func (r *Runner) processClaim(ctx context.Context, s *subscription, lease Lease)
 			EventID:      lease.Envelope.ID,
 			ConsumerType: lease.ConsumerType,
 			LeaseToken:   lease.LeaseToken,
-			RetryLimit:   s.retryLimit,
-			Backoff:      s.backoff,
-			Now:          time.Now(),
+			// handler 错误文本下推为终态摘要：后端清洗后仅在 failed 终态
+			// 落库（不落堆栈——堆栈由 handler 侧观测承担）。
+			Error:      err.Error(),
+			RetryLimit: s.retryLimit,
+			Backoff:    s.backoff,
+			Now:        time.Now(),
 		}); ferr != nil {
 			r.metrics.fail.Add(tctx, 1, resultAttrs(resultError))
 			r.logger.Error("event: fail recording failed",

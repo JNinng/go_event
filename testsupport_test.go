@@ -109,8 +109,8 @@ func (s *stubDriver) Fetch(_ context.Context, q event.FetchQuery) ([]event.RawEn
 	return out, nil
 }
 
-func (s *stubDriver) Claim(context.Context, event.ClaimQuery) ([]event.Lease, error) {
-	return nil, nil
+func (s *stubDriver) Claim(context.Context, event.ClaimQuery) (event.ClaimResult, error) {
+	return event.ClaimResult{}, nil
 }
 
 func (s *stubDriver) Heartbeat(context.Context, event.HeartbeatRequest) error { return nil }
