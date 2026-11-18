@@ -4,7 +4,8 @@
 // NewInspector 构造或对 Driver 类型断言探测）：查询口径与 Postgres
 // 后端一致，返回落库事实、不做租约过期推断。认领随 ClaimResult 返回
 // 接管与终态计数（内存计数，口径与 Postgres 后端一致、与落库状态可
-// 对账，ADR 0011）。管理写路径由独立 Admin
+// 对账，ADR 0011）。延迟事件（DeliverAt）在内存模拟同一到期判据
+// （deliver_at <= now，ADR 0013）。管理写路径由独立 Admin
 // 承载（NewAdmin，与 Driver 共享同一份内存状态，不挂 Driver 类型）：
 // failed 事件手工重放，语义与 Postgres 后端一致——写路径持与迁移执行
 // 等价的进程内互斥锁（本进程无迁移执行，契约等价形态）并发射类型化
@@ -14,7 +15,8 @@
 // 应用、Rollback 丢弃，position 分配即消耗（与 Postgres 序列对齐，
 // ADR 0012）。NewStore 提供组合对象
 // （便利构造，非能力面）：一个对象持有 Driver / Inspector / Admin /
-// TransactionalAppender，各面共享同一份内存状态与互斥锁。
+// TransactionalAppender，各面共享同一份内存状态与互斥锁。就近唤醒为
+// 同进程 LocalWake 语义（无跨实例面）。
 package inmem
 
 import (
@@ -126,7 +128,9 @@ func (d *Driver) Append(_ context.Context, e event.RawEnvelope) error {
 	return nil
 }
 
-// Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；Limit<=0 返回 nil。
+// Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；
+// 延迟事件以 q.Now 判定到期，未到期行在单次读取内过滤（ADR 0013 §1）。
+// Limit<=0 返回 nil。
 func (d *Driver) Fetch(_ context.Context, q event.FetchQuery) ([]event.RawEnvelope, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -143,6 +147,9 @@ func (d *Driver) Fetch(_ context.Context, q event.FetchQuery) ([]event.RawEnvelo
 	var out []event.RawEnvelope
 	for _, ev := range d.events {
 		if ev.env.Type != q.Type || ev.position <= after {
+			continue
+		}
+		if !deliverableAt(ev.env, q.Now) {
 			continue
 		}
 		out = append(out, ev.env)
@@ -181,7 +188,8 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) (event.ClaimResult
 		return event.ClaimResult{}, nil
 	}
 
-	// 候选：无主、租约过期、或退避期满（过滤在认领时原子完成，ADR 0004）。
+	// 候选：无主、租约过期、退避期满、且延迟投递已到期（过滤在认领时
+	// 原子完成，ADR 0004；deliver_at <= now 判据见 ADR 0013 §1）。
 	type candidate struct {
 		ev    *storedEvent
 		claim *storedClaim // 可为 nil（无主）
@@ -189,6 +197,9 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) (event.ClaimResult
 	var candidates []candidate
 	for _, ev := range d.events {
 		if ev.env.Type != q.Type {
+			continue
+		}
+		if !deliverableAt(ev.env, q.Now) {
 			continue
 		}
 		key := claimKey{ev.env.ID, q.ConsumerType}
@@ -351,7 +362,10 @@ func (d *Driver) ReadClaimState(_ *testing.T, eventID, consumerType string) (eve
 }
 
 // cleanupLocked 惰性清理：超保留窗口且无活跃租约的行（无论终态与否）
-// 均可清理；认领记录随事件一并清理。内部簿记用墙钟，不参与契约语义。
+// 均可清理；认领记录随事件一并清理。保留窗口自「可投递时刻」起算
+// （DeliverAt 非零以其为起点，零值行以 OccurredAt 判定——延迟行不因
+// 「等待投递」被清理，口径与 Postgres 后端一致，ADR 0013 §1）。
+// 内部簿记用墙钟，不参与契约语义。
 func (d *Driver) cleanupLocked(now time.Time) {
 	if d.retention <= 0 {
 		return
@@ -362,7 +376,11 @@ func (d *Driver) cleanupLocked(now time.Time) {
 	d.lastCleanup = now
 	cutoff := now.Add(-d.retention)
 	for id, ev := range d.events {
-		if !ev.env.OccurredAt.Before(cutoff) {
+		effective := ev.env.OccurredAt
+		if !ev.env.DeliverAt.IsZero() {
+			effective = ev.env.DeliverAt
+		}
+		if !effective.Before(cutoff) {
 			continue
 		}
 		hasActive := false
@@ -385,6 +403,12 @@ func (d *Driver) cleanupLocked(now time.Time) {
 			}
 		}
 	}
+}
+
+// deliverableAt 判定信封在 now 时是否可投递：DeliverAt 零值立即；非零
+// 按 deliver_at <= now（含到期时刻本身，与 SQL 下推条件一致）。
+func deliverableAt(e event.RawEnvelope, now time.Time) bool {
+	return e.DeliverAt.IsZero() || !e.DeliverAt.After(now)
 }
 
 func parsePosition(s string) uint64 {

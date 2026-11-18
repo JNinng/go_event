@@ -52,6 +52,12 @@ type Envelope[T any] struct {
 	Payload    T
 	Metadata   map[string]string // 透传元数据，如 trace_id（design.md §4）
 	OccurredAt time.Time
+	// DeliverAt 是发布侧声明的最早投递时刻（WithDeliverAt 设置）；零值
+	// 表示立即可投递。仅声明「不早于」语义：到期先后由 Fetch/Claim 按后端
+	// 时钟判定，投递本身不保证恰在该时刻发生（最坏等于轮询间隔）。广播
+	// 消费下延迟行可能被水位越过而不再投递（ADR 0013 §1 的边界），需要
+	// 定时必达用认领消费。
+	DeliverAt time.Time
 
 	// Attempts 是本次投递的尝试序号（含本次）：新认领为「已失败次数 + 1」，
 	// 接管认领在先前基础上递增。仅认领消费有意义，广播消费恒为 0。
@@ -71,6 +77,11 @@ type RawEnvelope struct {
 	Payload    []byte
 	Metadata   map[string]string
 	OccurredAt time.Time
+	// DeliverAt 是最早投递时刻（零值 = 立即可投递）：后端原样落库（零值
+	// 存 NULL），Fetch / Claim 以 q.Now 下推判定 deliver_at <= now，未到期
+	// 行在单条操作内被过滤（ADR 0004 过滤发生在读取/认领时）。过去时刻
+	// 等价立即可投递，不报错。
+	DeliverAt time.Time
 	// Position 是后端定义的全序位置（如 Postgres bigserial），仅用于
 	// 广播消费的已读水位条件（ADR 0004）：core 内存按订阅类型维护、
 	// 只进不退，Fetch 时原样回传。Append 输入侧忽略此字段。
@@ -102,6 +113,7 @@ func wrapHandler[T any](r *Runner, h Handler[T]) func(context.Context, RawEnvelo
 			Payload:     payload,
 			Metadata:    raw.Metadata,
 			OccurredAt:  raw.OccurredAt,
+			DeliverAt:   raw.DeliverAt,
 			Attempts:    raw.Attempts,
 			LastAttempt: raw.LastAttempt,
 		})

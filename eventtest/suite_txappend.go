@@ -66,6 +66,9 @@ func RunTransactionalAppendSuite(t *testing.T, d event.Driver,
 
 	// ---- 广播位置语义乱序边界（ADR 0012）----
 	t.Run("OutOfOrderCommit_LaterPositionRow_BroadcastSkippedClaimVisible", func(t *testing.T) { testTxOutOfOrderCommit(t, d, beginTx) })
+
+	// ---- 延迟事件（AppendTx 可设置 DeliverAt，ADR 0013）----
+	t.Run("DelayedDeliverAt_AppendTx_FilteredUntilDue", func(t *testing.T) { testTxDelayedDelivery(t, d, beginTx) })
 }
 
 // txPayload 事务套件载荷编码。
@@ -388,5 +391,30 @@ func testTxOutOfOrderCommit(t *testing.T, d event.Driver, beginTx func(*testing.
 	}
 	if len(res.Leases) != 1 || res.Leases[0].Envelope.ID != "tx-ooo-1" {
 		t.Fatalf("claim after out-of-order commit = %+v, want exactly tx-ooo-1 (claim path unaffected by watermark)", res.Leases)
+	}
+}
+
+// 延迟事件经事务性入队可设置（ADR 0013 §1）：提交后到期前 Fetch / Claim
+// 均不可见，到期后照常可见/可认领——AppendTx 与普通 Append 同一下推
+// 口径，deliver_at 不影响提交原子性与可见性判定。
+func testTxDelayedDelivery(t *testing.T, d event.Driver, beginTx func(*testing.T) TxSession) {
+	typ := t.Name()
+	now := microNow()
+	due := now.Add(time.Minute)
+
+	tx := beginTx(t)
+	tx.AppendTx(t, event.RawEnvelope{ID: "tx-delay-1", Type: typ,
+		Payload: txPayload(t, "later"), OccurredAt: now, DeliverAt: due})
+	tx.Commit(t)
+
+	requireAbsent(t, fetchAt(t, d, typ, now), "tx-delay-1")
+	res := claimResult(t, d, typ, "txdelay", time.Minute, now)
+	if len(res.Leases) != 0 {
+		t.Fatalf("claim before due = %+v, want no leases", res.Leases)
+	}
+	requireVisible(t, fetchAt(t, d, typ, due), "tx-delay-1")
+	res = claimResult(t, d, typ, "txdelay", time.Minute, due)
+	if len(res.Leases) != 1 || res.Leases[0].Envelope.ID != "tx-delay-1" {
+		t.Fatalf("claim at due = %+v, want exactly tx-delay-1", res.Leases)
 	}
 }

@@ -41,6 +41,20 @@ func fetchIDs(t *testing.T, d event.Driver, typ string) map[string]bool {
 	return ids
 }
 
+// fetchIDsAt 以指定判据时钟取回现存行 ID 集合（延迟行按到期口径过滤）。
+func fetchIDsAt(t *testing.T, d event.Driver, typ string, now time.Time) map[string]bool {
+	t.Helper()
+	batch, err := d.Fetch(t.Context(), event.FetchQuery{Type: typ, Limit: 10, Now: now})
+	if err != nil {
+		t.Fatalf("fetch at %v: %v", now, err)
+	}
+	ids := make(map[string]bool, len(batch))
+	for _, e := range batch {
+		ids[e.ID] = true
+	}
+	return ids
+}
+
 // 超窗且无活跃租约的行被清理，不可再被认领。
 func testRetentionExpiredDeleted(t *testing.T, newDriver func(*testing.T) event.Driver) {
 	typ := t.Name()
@@ -122,5 +136,42 @@ func testRetentionWithinWindowRetained(t *testing.T, newDriver func(*testing.T) 
 
 	if ids := fetchIDs(t, d, typ); len(ids) != n+1 {
 		t.Fatalf("within-window rows must be retained, want %d got %d", n+1, len(ids))
+	}
+}
+
+// 超窗但未到投递时刻的延迟行不被清理：保留窗口自可投递时刻起算
+// （ADR 0013 §1）——延迟行不因「等待投递」被清理；到期后仍在保留窗口内。
+func testRetentionDelayedUndeliveredRetained(t *testing.T, newDriver func(*testing.T) event.Driver) {
+	typ := t.Name()
+	d := newDriver(t)
+	now := time.Now().UTC()
+	due := now.Add(time.Hour)
+	appendOccurredAt(t, d, "fresh-"+typ, typ, now) // 首轮清理：无可清理
+	appendDelayed(t, d, "old-delayed-"+typ, typ,
+		now.Add(-2*time.Hour), due) // occurred_at 已超窗、deliver_at 未到
+
+	retentionSettle()
+	appendOccurredAt(t, d, "trigger-"+typ, typ, now)
+
+	if ids := fetchIDsAt(t, d, typ, due); !ids["old-delayed-"+typ] {
+		t.Fatal("undelivered delayed row beyond occurred_at must be retained (retention starts at deliver_at)")
+	}
+}
+
+// 可投递时刻已超窗的延迟行照常清理：判据是可投递时刻（deliver_at），
+// 与即时行以 occurred_at 判定同口径。
+func testRetentionDelayedOverdueDeleted(t *testing.T, newDriver func(*testing.T) event.Driver) {
+	typ := t.Name()
+	d := newDriver(t)
+	now := time.Now().UTC()
+	appendOccurredAt(t, d, "fresh-"+typ, typ, now)
+	appendDelayed(t, d, "old-overdue-"+typ, typ,
+		now.Add(-3*time.Hour), now.Add(-2*time.Hour)) // 可投递时刻已超窗
+
+	retentionSettle()
+	appendOccurredAt(t, d, "trigger-"+typ, typ, now)
+
+	if ids := fetchIDsAt(t, d, typ, now); ids["old-overdue-"+typ] {
+		t.Fatal("delayed row with deliver_at beyond the window must be cleaned")
 	}
 }

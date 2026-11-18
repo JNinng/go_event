@@ -84,3 +84,43 @@ func TestNotifyOtherType_Isolated(t *testing.T) {
 	default:
 	}
 }
+
+// NotifyAll 扇出：全部已订阅类型各收到一次信号（跨实例唤醒桥接入口，
+// ADR 0013）。
+func TestNotifyAll_MultipleTypes_EachSubscriberReceives(t *testing.T) {
+	w := NewLocalWake()
+	chA := w.subscribe("a")
+	chB := w.subscribe("b")
+
+	notified, dropped := w.NotifyAll()
+
+	if notified != 2 || dropped != 0 {
+		t.Fatalf("NotifyAll = (%d, %d), want (2, 0)", notified, dropped)
+	}
+	for i, ch := range []chan struct{}{chA, chB} {
+		select {
+		case <-ch:
+		default:
+			t.Fatalf("subscriber %d must receive signal", i+1)
+		}
+	}
+}
+
+// NotifyAll 对无订阅者的总线是空操作，并发安全。
+func TestNotifyAll_NoSubscribers_IsNoop(t *testing.T) {
+	w := NewLocalWake()
+	notified, dropped := w.NotifyAll()
+	if notified != 0 || dropped != 0 {
+		t.Fatalf("NotifyAll = (%d, %d), want (0, 0)", notified, dropped)
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100 {
+				w.NotifyAll()
+			}
+		})
+	}
+	wg.Wait()
+}

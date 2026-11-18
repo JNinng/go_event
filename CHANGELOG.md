@@ -6,6 +6,9 @@
 
 ### 新特性
 
+- **延迟事件（deliver\_at 定时投递）**：事件信封新增可选投递时刻字段 `DeliverAt`（`RawEnvelope` / `Envelope`，零值 = 立即可投递）；发布侧经新选项 `WithDeliverAt(t)` 设置，事务性入队复用 `RawEnvelope.DeliverAt`（Publish 与 AppendTx 均可设置）。未到期行不满足 Fetch / Claim 的下推条件（`deliver_at <= now`，判据时钟由 core 下推——`FetchQuery` 新增 `Now` 字段，Claim 沿用 `ClaimQuery.Now`；过滤在单条操作内完成）；过去时刻等价立即，不报错。**保留窗口自可投递时刻起算**（清理判据 `COALESCE(deliver_at, occurred_at)`）：延迟行不因「等待投递」被清理，零值行语义不变、无需数据回填。**广播组合边界（写死）**：延迟行可被内存水位越过而到期后不再广播投递（与 ADR 0012 乱序边界同源），需要定时必达用认领消费。Postgres 后端由版本计划 v3 自动加列（`event.deliver_at timestamptz` 可空，升级随部署隐式发生）；inmem 同形模拟。HeadPosition / position 语义不变。决策记录见 [ADR 0013](docs/adr/0013-delayed-delivery-and-cross-instance-wakeup.md)。
+  - `eventtest` 新增 `RunDelayedDeliverySuite` 契约套件（零值/过去时刻立即、到期边界含到时刻、Fetch / Claim 到期前过滤、信封透传、水位边界用例），`RunRetentionSuite` 增保留期组合用例，`RunTransactionalAppendSuite` 增 AppendTx 延迟用例，`RunSuite` 增 Publish 路径用例。
+- **跨实例低延迟唤醒（pgxc LISTEN/NOTIFY）**：pgxc 新增 `Wake`（`NewWake` 构造即后台监听、`Bind(*event.LocalWake)` 桥接、`Close()` 释放）：发布侧事件 INSERT 经 CTE 发 `pg_notify`（通道 `go_event_wake_<schema>`，通道与 payload 只带 schema 名、不带事件内容；仅实际插入行时发出，幂等冲突不重发；`pg_notify` 随事务提交可见——AppendTx 的信号在提交时刻发出）；订阅侧专用连接 LISTEN（经连接池 Acquire 持有一条不归还），断线按有界退避重连（100ms 起、封顶 30s）并重新 LISTEN。收到通知后向绑定的 `LocalWake` 注入 `NotifyAll` 信号（core 新增导出桥接方法，向本实例全部已订阅类型发信号）——跨实例信号触发本地已挂起的 Fetch / 唤醒等待立即拉取/认领，读取与认领仍走后端存储；**仅信号、不承载投递保证**（ADR 0003 边界不变），错过的信号（断连窗口、通道满、无订阅）由周期 poll 兜底。延迟行的信号在插入时发出、不判断 deliver\_at（消费侧空拉一趟由轮询兜底）。非法 schema / 通道名超 63 字节 / 连接池为 nil 时监听不启动（信号退化由轮询兜底）。**观测保持最小**：无新指标（效果由既有 fetch / claim 轮次指标承载），连接生命周期走 `WithLogger` 日志。postgrec 不做实现、退化轮询（database/sql 无驱动无关的 LISTEN 接入，ADR 0013 §4）；inmem 无跨实例面（同进程 LocalWake 已覆盖）。决策记录见 [ADR 0013](docs/adr/0013-delayed-delivery-and-cross-instance-wakeup.md)。
 - **outbox 事务性入队 `TransactionalAppender`（可选面，不进 `Driver` 契约）**：调用方在自己的业务事务内追加事件，事件 INSERT 与业务写共享同一事务，随事务原子提交/回滚；事务回滚不产生事件行，提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行），提交后经轮询/认领可见。**core 不定义接口**——事务载体是后端具体类型（pgxc 为 `pgx.Tx`、postgrec 为 `*sql.Tx`、inmem 为最小缓冲事务模拟），各后端提供 `NewTransactionalAppender` 构造（与 `Driver` 共享连接与命名空间选项）或经组合对象 `Store` 聚合（`Store.TransactionalAppender`），不经运行面类型获得。语义边界（ADR 0012）：幂等与普通 Append 同口径（同 ID 首写为准）；提交与回滚归调用方（库不 begin/commit）；不触发惰性清理（清理 DELETE 不落入调用方事务）；不发射观测（库侧发射点在提交前，与回滚后的落库事实可能矛盾）；position 同事务内按追加序分配、不承诺跨事务连续，回滚不回收（Postgres 序列不回收，缺口不进消费契约）。
   - **广播位置语义重审（ADR 0006 定稿修订，ADR 0012）**：事务内发布不发就近唤醒信号（提交后由轮询兜底）；并发提交的更大 position 会把广播实例的内存水位推过晚提交的行，该行对在途广播实例**可能永久漏投**——「Start 后发布的事件必然可投递」收窄为普通 Publish 路径（单语句独立提交，理论残余窗口可忽略、非绝对保证）；认领消费不受影响（Claim 直接查库）。已否决的修复备选（已广播集合/缺口水位重排、同事务 NOTIFY）与理由见 ADR 0012。
   - `eventtest` 新增 `RunTransactionalAppendSuite` 契约套件（经 `TxSession` 适配注入事务载体，三后端统一跑、无门控）：回滚零事件、中途回滚连带先前 Append 一起丢弃、提交前对外不可见、提交后广播/认领可见、同事务多事件原子可见、事务内与跨事务幂等（首写为准）、回滚 position 缺口不破坏消费、乱序边界（并发业务事务交错提交下广播漏投、认领可见）。
@@ -30,9 +33,11 @@
 - **`Driver.Claim` 返回类型由 `[]Lease` 变更为 `ClaimResult`**（v0.x 允许破坏性变更）：调用方取 `ClaimResult.Leases` 承载原返回形态；全部后端（pgxc / postgrec）、`eventtest`、`eventtest/inmem` 与 `eventtest/simmigrate` 已同步。`Lease` 结构不变、不承载接管标记——接管与终态计数随 `ClaimResult` 按轮汇总（[ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)）。
 - `postgresschema.Diff` 对缺失基线列的报告类别由 `missing` 改为 `outdated`（迁移不修改既有表，须人工处置）；版本加列缺失仍为 `missing`，可由迁移自动补齐。计划升级至 v2（`event_claim` 加 `last_error` / `failed_at`）。
 - `eventtest.RunSuite` 要求 Driver 实现 `eventtest.ClaimStateReader`（套件据它断言错误摘要落库事实）；`eventtest/inmem` 已原生实现。
+- **`FetchQuery` 新增 `Now` 字段**（v0.x 允许）：延迟事件到期判据的时钟，由 core 下推；直接构造 `FetchQuery` 的调用方未设置 `Now`（零值）时，非零 `DeliverAt` 的行不可见（判据时钟未推进），零值 `DeliverAt` 行不受影响。`eventtest` 全部套件与三后端已同步。
 
 ### 文档
 
+- 新增 [ADR 0013](docs/adr/0013-delayed-delivery-and-cross-instance-wakeup.md)：延迟事件（信封字段、下推判据、保留期自可投递时刻起算、广播水位边界）与跨实例低延迟唤醒（pgxc LISTEN/NOTIFY 形态、专用连接生命周期、payload 边界、postgrec 退化口径、观测保持最小）的决策记录。
 - 新增 [ADR 0009](docs/adr/0009-error-summary-persistence.md)：错误摘要落库口径与 `Fail` 接口扩展的决策记录。
 - 新增 [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)：管理面写操作的承载形态（独立 `Admin`、不经 `Driver` 类型暴露）与 failed 手工重放语义的决策记录，含加固口径（与迁移的命名空间互斥、操作来源观测、错误分类）。
 - 新增 [ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)：`Claim` 返回认领轮事实（`ClaimResult`）与接管/终态计数口径的决策记录；[ADR 0008](docs/adr/0008-observability.md) 补充接管指标与 `ObserverV4`（解除「无接管专属指标」的已知口径限制）。

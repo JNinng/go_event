@@ -292,7 +292,18 @@ err = pub.PublishNoPayload(ctx, cacheFlush)
   ID 是事件主键、**全局唯一**；重复发布同一 ID 首写为准，不校验 payload，新 payload 被丢弃（Metadata 与 OccurredAt 同样保留首写）。**跨事件类型复用同一 ID 不会报错**，而是静默视为同一事件、丢弃第二个 payload，因此业务键必须按类型加前缀（或与类型绑定）后才能当 ID 用。空串返回 `event.ErrEmptyEventID`；进程内锁不能跨实例去重，不要用它替代 ID 去重。
 - **幂等 Append**：重复发布同一 ID 视为成功，首写为准，不覆盖既有行、不触发重投。若需要“业务键去重”，应使用 `WithEventID` 传入按类型加前缀的稳定业务键。
 - **元数据透传**：`WithMetadata` 合并进事件元数据，后端原样存取。
-- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）见 [§4.4](#44-事务内发布outbox)。
+- **延迟投递（`WithDeliverAt`）**：声明最早投递时刻（ADR 0013）——到期前行不满足 Fetch / Claim 的下推条件，到期后照常可投递；零值（缺省）= 立即，过去时刻等价立即不报错：
+
+  ```go
+  // 30 分钟后提醒（定时副作用）
+  err := reminderDue.Publish(ctx, pub, ReminderDue{UserID: u.ID},
+      event.WithEventID("reminder_due:"+reminderID),
+      event.WithDeliverAt(time.Now().Add(30*time.Minute)),
+  )
+  ```
+
+  仅声明「不早于」语义：投递仍经轮询/认领路径，最坏延迟等于轮询间隔，不保证恰在该时刻发生。**保留窗口自可投递时刻起算**（延迟行不因「等待投递」被清理，[§8.5](#85-保留窗口与惰性清理)）。**广播消费组合边界**：延迟行可能被内存水位越过而不再投递（[§5.2](#52-语义)）——需要定时必达用认领消费。
+- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）见 [§4.4](#44-事务内发布outbox)（`AppendTx` 同样可经 `RawEnvelope.DeliverAt` 设置延迟投递，语义与普通发布一致）。
 - 发布成功后若注入了 `LocalWake`，会向本进程对应类型的订阅发一次非阻塞唤醒信号。
 
 ### 4.4 事务内发布（outbox）
@@ -373,6 +384,7 @@ err := docUploaded.SubscribeBroadcast(run,
 - **存储侧无簿记**：已读水位保存在实例内存中，按订阅在 `Fetch` 时下推，只进不退。
 - **起点在 `Start`**：`Runner.Start` 内对每个广播订阅调用 `Driver.HeadPosition`，把水位锚定到该类型当前最大位置。**Start 返回之后发布的事件才会被投递**；停机期间与 Start 之前发布的事件不补投。锚点只锚已提交行（[§4.4](#44-事务内发布outbox) 未提交事务内的事件不进基线）。
 - **事务内发布可能漏投（outbox 边界，ADR 0012）**：position 分配序与提交可见序在事务内发布下可能乱序——并发提交的更大 position 会把内存水位推过晚提交的行，该行对所有在途广播实例**永久不可见**（重启实例的基线锚定同样不含）。「Start 后发布的事件必然可投递」仅对普通发布路径成立（单语句独立提交，理论残余窗口可忽略——Postgres 无提交序全局串行化，幂等 Append 同 ID 冲突会等待在途事务，窗口非绝对为零、非绝对保证）；需要可靠投递的业务事件用认领消费（Claim 直接查库，不受水位影响）。
+- **延迟事件可能被水位越过（延迟 + 广播组合边界，ADR 0013）**：延迟行占用 position；到期前被下推条件过滤、不推进水位，但其后发布的即时行会把水位推过延迟行——该行到期后**不再有广播可见性**（与上一条同源：水位只进不退）。「延迟事件 + 广播消费者」只适用于漏掉可容忍的通知类事件；需要定时必达用认领消费（Claim 无水位条件，到期后最迟下一认领轮次可见）。
 - **多实例各自全收**：每个活跃实例独立拉取并处理全部事件，实例间互不感知；实例数不影响语义。
 - **只接受通用选项**：广播订阅只允许 `WithConcurrency` 与 `WithFetchLimit`；传入认领专属选项返回 `event.ErrNotClaimSubscription`。
 - **基线失败不启动**：任一广播订阅的 `HeadPosition` 查询失败，`Start` 返回错误且整体不启动，修复后可重试。
@@ -580,7 +592,7 @@ drv := postgrec.NewDriver(db,
 
 两个 Postgres 后端的表结构一致：
 
-- `event`：`id` 主键、`type`、`payload bytea`、`metadata jsonb`、`occurred_at`、`position bigserial`，并有 `(type, id)` 唯一约束与 `(type, position)` 索引。
+- `event`：`id` 主键、`type`、`payload bytea`、`metadata jsonb`、`occurred_at`、`position bigserial`，以及版本计划 v3 加列 `deliver_at`（最早投递时刻，可空 timestamptz——NULL 即零值 = 立即可投递，延迟事件 ADR 0013），并有 `(type, id)` 唯一约束与 `(type, position)` 索引。
 - `event_claim`：主键 `(event_id, consumer_type)`，含 `lease_token`、`lease_until`、`claim_count`、`status`、`next_eligible_at`，以及版本计划 v2 加列 `last_error`（错误摘要，可空 text）与 `failed_at`（进入 `failed` 终态的时刻，可空 timestamptz）；`event_id` 外键级联删除。摘要与终态时刻仅终态写入：`failed_at` 非空 ⟺ 行当前处于 `failed` 终态；`last_error` 是最近一次终态失败的清洗后摘要（截断 4 KiB、去控制字符、不含堆栈，空错误文本落 NULL）。
 
 DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语句、期望对象与共享执行器，无驱动依赖），两个后端使用同一份计划。首次操作是否建表、建到什么程度由迁移模式决定，见 [§8.4](#84-迁移模式与权限)。缺省模式 `Create` 会在首次操作时以构造 Driver 的连接（通常是运行账号）幂等应用版本计划全量语句。
@@ -615,7 +627,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
 
 ### 8.5 保留窗口与惰性清理
 
-- `WithRetention` 缺省 7 天。清理资格统一为：**超过保留窗口且无活跃租约的行，无论终态与否**；窗口以事件的 `OccurredAt` 判定。
+- `WithRetention` 缺省 7 天。清理资格统一为：**超过保留窗口且无活跃租约的行，无论终态与否**；窗口以事件的「可投递时刻」判定（`COALESCE(deliver_at, occurred_at)`，ADR 0013）——零值 `deliver_at` 行（含全部存量行）以 `occurred_at` 判定，语义与历史完全一致；延迟行不因「等待投递」被清理（保留期从可投递时刻起算），`deliver_at` 晚于保留窗口是合法用法、不截断不报错。
 - 清理是机会性的：随 `Append` 触发，并按 `max(retention/4, 50ms)` 做墙钟节流；清理失败静默，不影响主流程。
 - 对认领消费，保留窗口是语义硬边界：`done` 行过窗即删，“完成状态可查”只在窗口内成立；窗口必须覆盖最坏重试路径，建议：
 
@@ -623,6 +635,7 @@ DDL 定义在共享的 `postgresschema` 方言包中（版本计划与派生语�
   保留窗口 ≥ 重试上限 × (最大退避 + 最大处理时长) + 心跳间隔 + 时钟偏差余量
   ```
 
+  使用延迟投递时窗口另需覆盖投递后的消费路径（自可投递时刻起算）。
 - 对广播消费，保留窗口仅是存储清理边界，没有额外投递语义。
 
 ### 8.6 inmem
@@ -752,6 +765,8 @@ func TestMyBackendRetention(t *testing.T) {
 
 提供事务性入队（outbox）的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunTransactionalAppendSuite(t, d, beginTx)`：套件不绑定后端事务载体（pgxc 为 `pgx.Tx`、postgrec 为 `*sql.Tx`、inmem 为缓冲模拟），由测试装配把「事务内 Append / 提交 / 回滚」打包成 `eventtest.TxSession` 传入。覆盖回滚零事件、中途回滚连带先前 Append 一起丢弃（钉住「不逐条自治提交」）、提交前对外不可见（隔离性与 HeadPosition 锚点）、提交后广播/认领可见、事务内幂等（首写为准）、回滚 position 缺口不破坏消费、乱序边界（并发业务事务交错提交下广播漏投、认领不受影响，ADR 0012）。
 
+延迟事件（信封字段，全后端同形）加跑 `eventtest.RunDelayedDeliverySuite(t, drv)`：零值/过去时刻立即可投递、到期前 Fetch / Claim 不可见、恰好到期边界（时钟注入，含到时刻本身）、信封 `DeliverAt` 原样透传、延迟行与广播水位的组合边界（水位越过即不再广播、认领不受影响，ADR 0013）。
+
 迁移面另行通过 `eventtest.RunMigrationSuite` 验证，后端提供 `MigrationBackend` 适配实现（`NewDriver`/`Migrate`/`Verify`/`Statements`/`SQL`/`Capabilities`/`Prepare`/`Reset`/`InjectFault`/`Cleanup`）。进程内模拟 backend（`eventtest/simmigrate`）常驻，可在语句边界注入故障；真实数据库集成由 `TEST_POSTGRES_DSN` 门控。`InjectFault` 不支持某故障点时返回 `eventtest.ErrUnsupportedByBackend`。
 
 ### 9.3 Postgres 集成测试
@@ -775,6 +790,7 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithEventID(id)`（发布级） | 显式指定事件 ID，优先于生成器；空串返回 `ErrEmptyEventID` | 使用生成器 |
 | `WithPublisherCodec(c)` | payload 编码 | JSON |
 | `WithLocalWake(w)` | 发布成功后的同进程唤醒 | 无 |
+| `WithDeliverAt(t)`（发布级） | 延迟投递：最早投递时刻，零值 = 立即；过去时刻等价立即（ADR 0013） | 立即可投递 |
 | `WithMetadata(m)`（发布级） | 合并元数据 | 无 |
 | `WithMeterProvider(mp)` | 指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
 | `WithScopeName(s)` | 指标 scope 与名前缀 | `go_event` |
@@ -827,6 +843,7 @@ func TestMyBackendRetention(t *testing.T) {
 
 - **选型**：通知类用广播；需要补投、失败重试、完成追踪的任务用认领。
 - **广播不补投**：Start 之前与停机期间发布的事件不会投递；重启从当前头部开始。关键业务不要依赖广播保证送达。
+- **延迟事件投递是「不早于」**：`WithDeliverAt`（[§4.3](#43-发布语义)）保证到期前不被 Fetch / Claim 拾取，但不保证恰在该时刻投递——最坏延迟等于轮询间隔（需要更低延迟可调小 `WithPollInterval` 或用 pgxc `Wake` 的发布信号）。延迟事件与广播消费的组合有**水位越过边界**（[§5.2](#52-语义)）：延迟行可能被其后发布的即时行推过水位而永久漏广播——定时必达的延迟事件（提醒、定时任务类）用认领消费。保留窗口自可投递时刻起算（[§8.5](#85-保留窗口与惰性清理)），投递后的消费路径仍需窗口覆盖。
 - **outbox 事件与广播的组合边界**：事务内发布（[§4.4](#44-事务内发布outbox)）的事件可能被并发提交的更大 position 越过广播水位而**永久漏投**（ADR 0012）；outbox 模式下承载业务事实的事件应走认领消费，广播订阅只接受「漏掉可容忍」的通知类事件。`AppendTx` 不发射库侧观测（发射点在提交前，与回滚后的事实可能矛盾）——业务事务的成败指标在调用方自己的提交点计量；惰性清理不落入调用方事务，事件行仍受保留窗口约束。
 - **幂等**：认领消费一定按 at-least-once 设计 handler，以事件 ID 为幂等键。
 - **显式 ID 去重是全局的**：ID 全局唯一，不同事件类型必须使用带类型前缀的业务键；跨类型复用同一 ID 会静默丢弃第二个 payload。去重边界由存储保证，进程内锁不能跨实例去重。
@@ -836,7 +853,7 @@ func TestMyBackendRetention(t *testing.T) {
 - **数据库权限**：自动迁移（`Create`）与显式 `Migrate` 同义，都需要 DDL 权限，且 `ensure` 在运行期以构造 Driver 的连接执行 DDL。**无 DDL 权限的运行连接不能自动迁移**：在部署期用高权限连接调用 `Migrate`（或执行 `SQL` 脚本）建表，运行期用 `WithMigrateMode(event.MigrateVerify)` 做启动自检，或 `None` 完全交给部署流程。
 - **升级随部署隐式发生**：新二进制包含新版本语句时，`Create` 的首次操作（或显式 `Migrate`、重放 `SQL` 脚本）会幂等补齐缺失对象，没有独立的升级命令与停服窗口控制；升级语义要求每个版本的语句向后兼容，或停服迁移。
 - **停机**：`Stop` 等待在途 handler；handler 本身过长会拖住停机，给 `Stop` 传超时 ctx 作为兜底。
-- **轮询开销**：默认 5s 轮询一次；低频场景可调大，需要低延迟时注入 `LocalWake`（仅同进程）或后续使用 LISTEN/NOTIFY（P1）。
+- **轮询开销**：默认 5s 轮询一次；低频场景可调大。需要低延迟时：同进程注入 `LocalWake`；跨实例用 pgxc 的 `Wake`（LISTEN/NOTIFY 推送唤醒，ADR 0013）——`wk.Bind(wake)` 桥接后，同 schema 任一实例发布即触发本实例立即拉取/认领；postgrec 无此面（退化轮询）。跨实例信号仅加速，不承载投递保证：`Wake` 的监听连接断开期间信号丢失由轮询兜底，且它长持一条池连接（连接池容量配置需留意）。延迟行（`WithDeliverAt`）的 NOTIFY 在插入时发出、不判断到期——消费侧可能空拉一趟，到期后由轮询照常拾取。
 - **消费者身份变更**：新增身份会重放窗口内全部历史事件；改名等同于新身份，不是断点续跑。
 - **failed 事件查询（Inspector）**：只读查询面 `event.Inspector` 已提供三类查询，按能力探测接入（对 Driver 做 `event.Inspector` 类型断言，或经后端 `NewInspector` 显式构造，与 Driver 共享连接与命名空间选项）：
   - 某（事件 × 消费者身份）的当前状态与重试计数：无认领行即「待处理」（ok=false），其余按落库 `status` 报 processing / retrying / done / failed（不做租约过期推断）；
@@ -881,7 +898,7 @@ func TestMyBackendRetention(t *testing.T) {
 1. 事件是否在 `Runner.Start` 返回之后发布？Start 之前的事件按设计跳过。
 2. 发布与订阅的 `Event.Name` 是否完全一致？
 3. 发布与消费是否指向同一个数据库/schema？
-4. 跨实例场景是否只依赖 `LocalWake`？唤醒仅限同进程，跨实例依赖轮询，检查 `WithPollInterval`。
+4. 跨实例场景是否只依赖 `LocalWake`？唤醒仅限同进程；跨实例低延迟唤醒用 pgxc 的 `Wake`（LISTEN/NOTIFY，[§11](#11-运维注意事项)「轮询开销」），postgrec 依赖轮询——检查 `WithPollInterval`。
 
 **认领订阅不处理事件**
 

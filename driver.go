@@ -23,6 +23,8 @@ type Driver interface {
 	// Fetch 广播消费读取：Type 匹配且 Position 严格大于 q.After 的行，
 	// 按 Position 升序返回至多 q.Limit 条。只读，不产生任何簿记。
 	// q.After 为空串表示从头；非空但无法解析为 Position 时返回错误。
+	// 延迟事件（DeliverAt 非零）在到期前不满足下推条件：以 q.Now 判定
+	// deliver_at <= now，过滤在单条读取内完成（ADR 0004）。
 	Fetch(ctx context.Context, q FetchQuery) ([]RawEnvelope, error)
 
 	// HeadPosition 返回该类型当前已提交事件的最大 Position，作为广播
@@ -30,13 +32,13 @@ type Driver interface {
 	// 快照，Start 返回即基线确立（ADR 0006）。该类型无事件时返回空串。
 	HeadPosition(ctx context.Context, typ string) (string, error)
 
-	// Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、或退避
-	// 期满」的行（Postgres 实现为 FOR UPDATE SKIP LOCKED）。已 done /
-	// failed 的行不可认领；接管（租约过期）认领递增重试计数（ADR 0006），
-	// 达 q.RetryLimit 的行置 failed 终态、不再认领（详见 ClaimQuery）。
-	// 返回 ClaimResult 汇总本轮落库事实：发放的租约与接管/终态计数——
-	// 计数必须与落库状态一致，供观测面计量（design.md §9.2）。错误时返回
-	// 零值 ClaimResult。
+	// Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、退避期满，
+	// 且 DeliverAt 已到期」的行（Postgres 实现为 FOR UPDATE SKIP LOCKED）。
+	// 已 done / failed 的行不可认领；接管（租约过期）认领递增重试计数
+	// （ADR 0006），达 q.RetryLimit 的行置 failed 终态、不再认领（详见
+	// ClaimQuery）。返回 ClaimResult 汇总本轮落库事实：发放的租约与
+	// 接管/终态计数——计数必须与落库状态一致，供观测面计量（design.md
+	// §9.2）。错误时返回零值 ClaimResult。
 	Claim(ctx context.Context, q ClaimQuery) (ClaimResult, error)
 
 	// Heartbeat 续租：仅当属主凭证匹配时生效；租约过期或已被接管后
@@ -63,6 +65,10 @@ type FetchQuery struct {
 	Type  string // 单类型单次取数：编排按类型轮询限额，防单类型洪泛（ADR 0004）
 	After string // 已读水位（Position），首次为空串；core 内存维护，只进不退
 	Limit int
+	// Now 是延迟事件（DeliverAt）到期判据的时钟，由 core 下推。零值时
+	// 任何非零 DeliverAt 的行均不满足 deliver_at <= now（延迟行不可见，
+	// 与 ClaimQuery.Now 的判据口径一致）。
+	Now time.Time
 }
 
 // ClaimQuery 认领条件。
@@ -77,7 +83,7 @@ type ClaimQuery struct {
 	Lease        time.Duration // 本次认领的租约有效期
 	Limit        int
 	RetryLimit   int
-	Now          time.Time // 租约过期与退避判据的时钟，由 core 下推
+	Now          time.Time // 租约过期、退避与延迟投递（deliver_at）判据的时钟，由 core 下推
 }
 
 // ClaimResult 一次认领轮的结果与落库事实汇总（design.md §9.2）。三类

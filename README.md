@@ -18,7 +18,8 @@
 - **管理面（可选）**：`Admin` 写操作与运行面分离、不进 `Driver`——`ReplayFailed` 把（事件 × 消费者身份）的 `failed` 终态行重置为可认领（仅 failed 可重放，`done` 不可逆；重试计数归零、清租约、立即可认领；`last_error` 保留、`failed_at` 清空）；经后端 `NewAdmin` 构造，重放窗口 = 保留窗口。写路径加固：持与迁移执行共用的命名空间互斥锁（等待有界）、行归属校验即 CAS、操作来源观测（指标 / 日志 / Observer 事件）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接故障）。
 - **组合对象（可选便利）**：后端 `NewStore` 一个对象同时持有 `Driver` / `Inspector` / `Admin` 三面（组合而非合并接口，核心仍保持独立能力）；选项解析一次、三面共享同一连接与命名空间、观测口径一致，各面行为与独立构造等价。
 - **多身份**：一个进程可承载多个消费者身份，各身份独立认领；同一 `Runner` 可混合承载广播与认领订阅。
-- **就近唤醒**：同进程发布触发本实例 poller 立即拉取；仅信号，不跳过存储，跨实例与信号丢失由轮询兜底。
+- **延迟投递**：`WithDeliverAt` 声明最早投递时刻（零值 = 立即），到期前行不满足 Fetch / Claim 下推条件；保留窗口自可投递时刻起算（延迟行不因等待投递被清理）；与广播消费组合有水位越过边界，定时必达用认领消费（ADR 0013）。
+- **就近唤醒**：同进程发布触发本实例 poller 立即拉取；仅信号，不跳过存储，跨实例与信号丢失由轮询兜底。pgxc 另提供跨实例推送唤醒（LISTEN/NOTIFY，`Wake.Bind` 桥接，仅信号、断连重连；postgrec 退化轮询）——同样仅信号不承载投递保证（ADR 0013）。
 - **幂等发布**：发布侧生成或通过 `WithEventID` 显式指定唯一事件 ID，重复 `Append` 同 ID 幂等（首写为准）；元数据块原样透传（如 `trace_id`）。
 - **可观测**：otel 指标 + slog 日志 + 类型化 Observer，默认跟随全局装配（未配置即 noop 静默）；core 计量发布/消费/终态操作，后端计量迁移生命周期（见 usage.md §13、ADR 0008）。
 - **迁移模式**：`Create`（缺省，首次操作持迁移锁幂等应用版本计划全量语句；升级随部署隐式发生）/ `Verify`（只读自检）/ `None`；运行账号只有 DML 权限时用后两者，部署期由高权限连接建表。
@@ -142,7 +143,7 @@ module path 为 `github.com/jninng/go_event`，子 module 独立发版（如 `pg
 - [使用指南](usage.md)：从安装到广播/认领消费、后端配置、测试与常见问题。
 - [设计文档](docs/design.md)：能力面与语义的单一事实源。
 - [API 签名](docs/api.md)：接口、结构体、选项与错误。
-- [架构决策记录](docs/adr/)：多 module 布局、两种消费方式、就近唤醒、需求驱动拉取、后端能力边界、广播/认领语义、迁移模式与迁移协议、错误摘要落库（0009）、管理面写面与重放（0010）、outbox 事务性入队与广播位置语义重审（0012）。
+- [架构决策记录](docs/adr/)：多 module 布局、两种消费方式、就近唤醒、需求驱动拉取、后端能力边界、广播/认领语义、迁移模式与迁移协议、错误摘要落库（0009）、管理面写面与重放（0010）、outbox 事务性入队与广播位置语义重审（0012）、延迟事件与跨实例低延迟唤醒（0013）。
 
 ## 开发与测试
 
@@ -169,7 +170,8 @@ TEST_POSTGRES_DSN='postgres://user:pass@localhost:5432/postgres' go test ./...
 ## 状态与路线
 
 - **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`；失败错误摘要落库（`Fail` 扩展，ADR 0009）；`Inspector` 只读查询面（状态 / 分档计数 / failed 分页列表，按能力探测接入）；`Admin` 管理面 failed 手工重放与加固（持迁移互斥锁、CAS 行归属校验、操作来源观测、错误可判别，ADR 0010）；otel 指标 + slog + 类型化 Observer 观测面（ADR 0008）；接管计数（`Claim` 返回 `ClaimResult{Leases, Takeovers, TerminalFailed}`，ADR 0011）；后端组合对象 `Store`（三面同源便利构造，各面与独立构造等价）。
-- **P1（已落地：outbox）**：事务性入队 `TransactionalAppender`（业务事务与事件入队原子提交/回滚；core 不定义接口，pgxc / postgrec / inmem 各提供构造或经组合对象 Store 聚合，ADR 0012——广播位置语义随本项重审定稿：事务内发布下广播投递为尽力而为，认领消费不受影响）。**P1（规划）**：延迟事件、LISTEN/NOTIFY 推送唤醒。
+- **P1（已落地：outbox）**：事务性入队 `TransactionalAppender`（业务事务与事件入队原子提交/回滚；core 不定义接口，pgxc / postgrec / inmem 各提供构造或经组合对象 Store 聚合，ADR 0012——广播位置语义随本项重审定稿：事务内发布下广播投递为尽力而为，认领消费不受影响）。
+- **P1（已落地：延迟事件与跨实例唤醒）**：`WithDeliverAt` / `RawEnvelope.DeliverAt` 延迟投递（Fetch / Claim 下推 `deliver_at <= now`；保留窗口自可投递时刻起算；广播组合的水位越过边界写进文档，ADR 0013）；跨实例推送唤醒由 pgxc `Wake`（LISTEN/NOTIFY，专用连接 + 断线重连，payload 只带 schema 名）桥接 `LocalWake.NotifyAll`，postgrec 退化轮询（ADR 0013）。**P1（规划）**：无——生产化缺口收尾完成。
 - **P2（规划）**：NATS JetStream / RocketMQ / Redis Stream / RabbitMQ 后端、事件链、批量认领、限流背压。
 
 详见 [docs/design.md §9](docs/design.md)。

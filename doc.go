@@ -10,7 +10,8 @@
 // 对后端 Driver 类型断言探测，Admin 不经任何运行面类型获得——经后端
 // NewAdmin 构造或经组合对象 Store 聚合（同一内部构造路径）；事务性入队
 // （outbox）同为可选面但本包不定义接口——事务载体是后端具体类型，各后
-// 端提供 TransactionalAppender（构造或经 Store 聚合，ADR 0012）；
+// 端提供 TransactionalAppender（构造或经 Store 聚合，ADR 0012）；延迟
+// 投递为信封内可选字段（DeliverAt，WithDeliverAt 设置，ADR 0013）；
 // Publisher 与 Runner 为具体类型，依赖经构造函数显式注入，无包级可变
 // 状态。
 package event

@@ -3,20 +3,81 @@ package pgxc
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jninng/go_event"
 )
 
+// wakeChannelPrefix 是跨实例唤醒 NOTIFY 通道前缀，通道名 = 前缀 + schema
+// （ADR 0013 §2）。Postgres 通道标识上限 63 字节，超限的 schema 不适配
+// 唤醒通道——写路径退化为无信号 INSERT，跨实例唤醒由轮询兜底。
+const wakeChannelPrefix = "go_event_wake_"
+
 // appendInsertSQL 是事件 INSERT 的单一语句定义：普通 Append（自管连接，
 // 独立提交）与事务性 AppendTx（加入调用方业务事务）共用同一份，避免第
 // 二份拷贝漂移（幂等语义一致：同 ID 首写为准，design.md §4）。
+//
+// 跨实例唤醒信号经 CTE 挂在插入事实之后：仅实际插入行时 NOTIFY（幂等
+// 冲突不重发信号）；通道与 payload 只带 schema 名，不带事件内容（ADR 0013
+// §2）。pg_notify 随所在事务提交才可见——事务性入队的信号在提交时刻发出，
+// 与「提交前发信号只会让消费者空拉一趟」的边界（ADR 0012 §2）天然相容；
+// 延迟行的信号同样在插入（事务提交）时发出，不判断 deliver_at——推送只
+// 回答「有新行」，不回答「有可投递行」，消费侧空拉一趟由轮询兜底。
 const appendInsertSQL = `
-INSERT INTO %s.event (id, type, payload, metadata, occurred_at)
-VALUES ($1, $2, $3, $4::jsonb, $5)
+WITH ins AS (
+	INSERT INTO %s.event (id, type, payload, metadata, occurred_at, deliver_at)
+	VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+	ON CONFLICT (id) DO NOTHING
+	RETURNING 1
+)
+SELECT pg_notify($7, $8) FROM ins`
+
+// appendInsertSQLNoWake 是无唤醒信号的 INSERT 变体：唤醒通道名超 Postgres
+// 标识上限时使用（信号路径退化，写路径语义与主变体完全一致，ADR 0013 §3）。
+const appendInsertSQLNoWake = `
+INSERT INTO %s.event (id, type, payload, metadata, occurred_at, deliver_at)
+VALUES ($1, $2, $3, $4::jsonb, $5, $6)
 ON CONFLICT (id) DO NOTHING`
+
+// wakeChannel 返回 schema 的唤醒通道名；超 Postgres 通道标识上限（63
+// 字节）返回空串（不适配，信号退化由轮询兜底）。
+func wakeChannel(schema string) string {
+	ch := wakeChannelPrefix + schema
+	if len(ch) > 63 {
+		return ""
+	}
+	return ch
+}
+
+// deliverAtArg 把信封的 DeliverAt 归一为落库参数：零值存 NULL（立即可
+// 投递），非零原样写入 deliver_at。
+func deliverAtArg(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
+// execAppend 执行事件 INSERT（普通 Append 与事务性 AppendTx 共用同一执行
+// 路径）：唤醒通道可用时走带 NOTIFY 的主变体，通道不可用时退化为无信号
+// 变体（写路径语义一致，仅跨实例信号缺位——由轮询兜底，ADR 0013 §3）。
+func (d *Driver) execAppend(ctx context.Context,
+	exec func(context.Context, string, ...any) (pgconn.CommandTag, error),
+	e event.RawEnvelope, meta string) error {
+	if d.wakeChannel != "" {
+		_, err := exec(ctx, fmt.Sprintf(appendInsertSQL, d.schema),
+			e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt),
+			d.wakeChannel, d.schema)
+		return err
+	}
+	_, err := exec(ctx, fmt.Sprintf(appendInsertSQLNoWake, d.schema),
+		e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt))
+	return err
+}
 
 // TransactionalAppender 事务性事件入队（outbox 可选面，不进 Driver 契约，
 // ADR 0012）：调用方在自己的业务事务（pgx.Tx）内调用 AppendTx，事件
@@ -74,8 +135,7 @@ func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx pgx.Tx, e even
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(appendInsertSQL, ta.d.schema),
-		e.ID, e.Type, e.Payload, meta, e.OccurredAt); err != nil {
+	if err := ta.d.execAppend(ctx, tx.Exec, e, meta); err != nil {
 		return fmt.Errorf("pgxc: append tx: %w", err)
 	}
 	return nil

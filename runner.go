@@ -364,7 +364,10 @@ func (r *Runner) runBroadcast(ctx context.Context, s *subscription) {
 
 func (r *Runner) pollBroadcast(ctx context.Context, s *subscription) {
 	start := time.Now()
-	batch, err := r.drv.Fetch(ctx, FetchQuery{Type: s.typ, After: s.watermark, Limit: s.fetchLimit})
+	batch, err := r.drv.Fetch(ctx, FetchQuery{
+		Type: s.typ, After: s.watermark, Limit: s.fetchLimit,
+		Now: time.Now(), // 延迟事件到期判据时钟下推（ADR 0013）
+	})
 	res := pollResult(err)
 	attrs := resultAttrs(res)
 	r.metrics.fetch.Add(ctx, 1, attrs)

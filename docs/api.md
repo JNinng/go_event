@@ -82,6 +82,10 @@ type Envelope[T any] struct {
     Payload    T
     Metadata   map[string]string // 透传元数据，如 trace_id（design.md §4）
     OccurredAt time.Time
+    // DeliverAt 是发布侧声明的最早投递时刻（WithDeliverAt 设置）；零值
+    // 表示立即可投递。广播消费下延迟行可能被水位越过而不再投递
+    // （ADR 0013），需要定时必达用认领消费。
+    DeliverAt time.Time
     // Attempts 是本次投递的尝试序号（含本次）：新认领为「已失败次数 + 1」，
     // 接管认领在先前基础上递增。仅认领消费有意义，广播消费恒为 0。
     Attempts    int
@@ -100,6 +104,10 @@ type RawEnvelope struct {
     Payload    []byte
     Metadata   map[string]string
     OccurredAt time.Time
+    // DeliverAt 是最早投递时刻（零值 = 立即可投递）：后端原样落库（零值
+    // 存 NULL），Fetch / Claim 以 q.Now 下推判定 deliver_at <= now，未到期
+    // 行在单条操作内被过滤（ADR 0013）。过去时刻等价立即可投递，不报错。
+    DeliverAt time.Time
     // Position 是后端定义的全序位置（如 Postgres bigserial），仅用于
     // 广播消费的已读水位条件（ADR 0004）：core 内存按订阅类型维护、
     // 只进不退，Fetch 时原样回传。
@@ -149,6 +157,13 @@ func (p *Publisher) PublishNoPayload(ctx context.Context, ev Event[NoPayload],
 
 func WithMetadata(meta map[string]string) PublishOption // 合并进缺省元数据
 
+// WithDeliverAt 声明最早投递时刻（延迟事件，ADR 0013）：到期前行不满足
+// Fetch / Claim 的下推条件，到期后照常可投递。零值（选项缺省）= 立即
+// 可投递；过去时刻等价立即，不报错。仅声明「不早于」语义：投递本身仍
+// 经轮询/认领路径，不保证恰在该时刻发生。广播消费下延迟行可能被内存
+// 水位越过而不再投递（ADR 0013），需要定时必达用认领消费。
+func WithDeliverAt(t time.Time) PublishOption
+
 // WithEventID 显式指定事件 ID，优先于 IDGenerator；空串非法，Publish
 // 返回 ErrEmptyEventID（不静默回退到生成器）。
 func WithEventID(id string) PublishOption
@@ -174,6 +189,8 @@ type Driver interface {
     // Fetch 广播消费读取：Type 匹配且 Position 严格大于 q.After 的行，
     // 按 Position 升序返回至多 q.Limit 条。只读，不产生任何簿记。
     // q.After 为空串表示从头；非空但无法解析为 Position 时返回错误。
+    // 延迟事件（DeliverAt 非零）在到期前不满足下推条件：以 q.Now 判定
+    // deliver_at <= now，过滤在单条读取内完成（ADR 0013）。
     Fetch(ctx context.Context, q FetchQuery) ([]RawEnvelope, error)
 
     // HeadPosition 广播基线锚点：返回该类型当前已提交事件的最大
@@ -181,9 +198,9 @@ type Driver interface {
     // 订阅调用一次，水位锚定到该快照，Start 返回即基线确立（ADR 0006）。
     HeadPosition(ctx context.Context, typ string) (string, error)
 
-    // Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、或退避
-    // 期满」的行（Postgres 实现为 FOR UPDATE SKIP LOCKED）。已 done /
-    // failed 的行不可认领；接管（租约过期）认领递增 claim_count
+    // Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、退避期满，
+    // 且 DeliverAt 已到期」的行（Postgres 实现为 FOR UPDATE SKIP LOCKED）。
+    // 已 done / failed 的行不可认领；接管（租约过期）认领递增 claim_count
     // （ADR 0006）；达 q.RetryLimit 的接管认领置 failed 终态、不再认领
     // （终态判定需认领侧获知上限，故由 core 随条件下推）。批次内顺序
     // 不承诺（契约仅约束 Fetch 升序）。返回 ClaimResult 汇总本轮落库
@@ -219,6 +236,9 @@ type FetchQuery struct {
     After string // 已读水位（Position），首次为空串；core 内存维护，只进不退；
             // 非空且无法解析为 Position 时 Fetch 返回错误
     Limit int
+    // Now 是延迟事件（DeliverAt）到期判据的时钟，由 core 下推。零值时
+    // 任何非零 DeliverAt 的行均不可见（判据时钟未推进）。
+    Now time.Time
 }
 
 type ClaimQuery struct {
@@ -228,7 +248,7 @@ type ClaimQuery struct {
     Limit        int
     RetryLimit   int           // 重试上限：达此值的接管认领直接置 failed
                                // （与 FailRequest.RetryLimit 同源，订阅级配置下推）
-    Now          time.Time     // 租约过期与退避判据的时钟，由 core 下推
+    Now          time.Time     // 租约过期、退避与延迟投递（deliver_at）判据的时钟，由 core 下推
 }
 
 // ClaimResult 一次认领轮的结果与落库事实汇总（design.md §9.2、ADR 0011）。
@@ -305,7 +325,10 @@ func SanitizeErrorSummary(text string) string
 语义备注：
 
 - Now 显式入参：判据时钟一律由 core 下推——契约测试可控时钟，后端
-  判据不依赖宿主时钟。
+  判据不依赖宿主时钟。延迟投递同口径：Fetch 以 `FetchQuery.Now`、
+  Claim 以 `ClaimQuery.Now` 判定 `deliver_at <= now`（含到时刻本身），
+  未到期行不进结果集/拾取窗口（ADR 0013）；保留窗口自可投递时刻起算
+  （`COALESCE(deliver_at, occurred_at)`）。
 - Complete/Fail/Heartbeat 的 CAS 不命中（租约过期、已被接管）**返回 nil
   而非错误**——「不生效」是接管场景的正常结果，是否记日志由 core 决定。
 - Fail 错误摘要仅终态写入：`last_error` 为最近一次终态失败的摘要（清洗
@@ -412,6 +435,13 @@ func (r *Runner) Run(ctx context.Context) error
 // 仅信号，不是投递（ADR 0003）；同一 LocalWake 可同时注入 Publisher
 // 与多个 Runner。
 func NewLocalWake() *LocalWake
+
+// NotifyAll 向本实例全部已订阅类型发唤醒信号（非阻塞；跨实例唤醒的
+// 桥接入口，ADR 0013）：支持原生推送的后端（pgxc Wake，§3）收到 NOTIFY
+// 后经此注入信号，语义与发布侧内部信号一致——仅信号、不承载投递保证，
+// 丢弃与错过的信号由周期 poll 兜底（ADR 0003 边界不变）。返回送达与
+// 丢弃的订阅通道数。并发安全。
+func (w *LocalWake) NotifyAll() (notified, dropped int)
 ```
 
 ### 2.7 哨兵错误
@@ -1047,6 +1077,31 @@ type Store struct {
 // NewStore 构造组合对象 Store。
 func NewStore(pool *pgxpool.Pool, opts ...Option) *Store
 
+// Wake 跨实例唤醒总线（可选面，仅 pgxc 提供，ADR 0013）：专用连接
+// LISTEN go_event_wake_<schema>。同 schema 任一实例经 Append / AppendTx
+// 实际插入事件行即 NOTIFY（INSERT 经 CTE 挂在插入事实之后，仅实际插入
+// 时发出——幂等冲突不重发；通道与 payload 只带 schema 名，不带事件内容；
+// pg_notify 随事务提交可见，AppendTx 的信号在提交时刻发出）。收到通知
+// 后向 Bind 注入的 LocalWake 注入 NotifyAll 信号——仅触发本实例已挂起的
+// Fetch / 唤醒等待，读取与认领仍走后端存储（ADR 0003 边界不变），错过
+// 的信号由周期 poll 兜底。LISTEN 需专用连接（经连接池 Acquire 持有一条
+// 不归还）；断开按有界退避重连（100ms 起、封顶 30s）并重新 LISTEN。
+// 构造即后台监听；非法 schema、通道名超 63 字节或连接池为 nil 时监听
+// 不启动（信号退化由轮询兜底）。延迟行的信号在插入时发出、不判断
+// deliver_at（推送只回答「有新行」，消费侧空拉一趟由轮询兜底）。
+type Wake struct{ /* 不透明 */ }
+
+// NewWake 构造跨实例唤醒总线并开始后台监听。选项与 NewDriver 共享
+// （本面消费 schema 与 logger）。
+func NewWake(pool *pgxpool.Pool, opts ...Option) *Wake
+
+// Bind 桥接本实例就近唤醒总线：通知到达即向 lw 注入 NotifyAll 信号。
+// 可重复调用（后一次生效）；未桥接时信号静默丢弃（轮询兜底）。
+func (w *Wake) Bind(lw *event.LocalWake)
+
+// Close 停止监听并释放专用连接（幂等）：阻塞至监听循环退出。
+func (w *Wake) Close()
+
 // Migrate 幂等应用版本计划（Create 语义），与 postgrec.Migrate 相同的
 // 接管校验、整版单事务与失败回滚语义。
 func Migrate(ctx context.Context, pool *pgxpool.Pool, opts ...Option) error
@@ -1109,7 +1164,8 @@ func WithObserver(o event.Observer) Option
   （矩阵见 design.md §8）。
 
 两者均须通过 eventtest 全套契约测试并各自给出能力边界表（ADR 0005）；
-pgxc 可原生实现 P1 的 LISTEN/NOTIFY 推送唤醒，postgrec 退化回轮询。
+跨实例推送唤醒由 pgxc 原生提供（`Wake`，ADR 0013），postgrec 退化回
+轮询（database/sql 无驱动无关的 LISTEN 接入，不做实现）。
 
 ## 4. eventtest 签名
 
@@ -1138,10 +1194,18 @@ type ClaimStateReader interface {
     ReadClaimState(t *testing.T, eventID, consumerType string) (ClaimState, bool)
 }
 
-// RunRetentionSuite 运行保留窗口惰性清理契约（design.md §5.2）。
+// RunRetentionSuite 运行保留窗口惰性清理契约（design.md §5.2；保留窗口
+// 自可投递时刻起算，ADR 0013）。
 // newDriver 须为每个用例返回配置了保留窗口（≤ 2s，推荐 2s）的
 // 全新 Driver 实例（清理簿记按 Driver 实例记忆，共享实例会被节流跳过）。
 func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver)
+
+// RunDelayedDeliverySuite 运行延迟事件契约（deliver_at 定时投递，
+// design.md §9.2、ADR 0013）：零值立即可投递（既有行为回归）、过去时刻
+// 等价立即、未到期行不满足 Fetch / Claim 下推条件、恰好到期边界（时钟
+// 注入，含到时刻本身）、信封 DeliverAt 原样透传、延迟行与广播水位的
+// 组合边界（水位越过即不再广播、认领不受影响）。
+func RunDelayedDeliverySuite(t *testing.T, d event.Driver)
 
 // RunInspectorSuite 运行只读查询面 event.Inspector 的契约测试
 // （design.md §6/§9.2）：三类查询与 Claim/Fail/Complete 落库事实比对。
@@ -1178,7 +1242,8 @@ func RunStoreSuite(t *testing.T, d event.Driver, insp event.Inspector, admin eve
 // 中途回滚连带先前 Append 一起丢弃（钉住「不逐条自治提交」）、提交前
 // 对外不可见（隔离性与 HeadPosition 锚点）、提交后广播/认领可见、事务
 // 内幂等（首写为准）、回滚 position 缺口不破坏消费、乱序边界（并发业务
-// 事务交错提交下广播漏投、认领不受影响）。d 与 beginTx 须同源（同一
+// 事务交错提交下广播漏投、认领不受影响）、延迟事件经 AppendTx 可设置
+// （提交后到期前不可见、到期后可见，ADR 0013）。d 与 beginTx 须同源（同一
 // 后端、同一命名空间）；beginTx 为 nil Fatal 终止——提供事务性入队的
 // 后端必须全过本套件。套件不绑定后端事务载体（pgxc 为 pgx.Tx、postgrec
 // 为 *sql.Tx、inmem 为缓冲模拟），由装配函数打包成 TxSession。

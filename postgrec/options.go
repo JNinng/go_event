@@ -12,7 +12,11 @@
 // 选项）：只读查询面 Inspector（NewInspector 或对 Driver 类型断言探测）、
 // 管理面 Admin（NewAdmin，写路径不挂 Driver 类型，ADR 0010）、事务性
 // 入队 TransactionalAppender（NewTransactionalAppender，调用方在自己的
-// *sql.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）。
+// *sql.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）。延迟
+// 投递（event.deliver_at，WithDeliverAt / RawEnvelope.DeliverAt）为
+// Driver 语义内字段，未到期行不满足 Fetch / Claim 下推条件。跨实例
+// 推送唤醒不做实现——database/sql 无驱动无关的 LISTEN 接入，退化轮询
+// （ADR 0013 §4；需要跨实例唤醒用 pgxc 的 Wake）。
 //
 // 连接由使用方建立并注册驱动（如 pgx/v5/stdlib），本包不携带任何
 // 数据库驱动。

@@ -123,6 +123,13 @@ func TestPostgrecInspectorSuite(t *testing.T) {
 	eventtest.RunInspectorSuite(t, drv)
 }
 
+// 延迟事件契约（deliver_at 定时投递，ADR 0013 §1）：零值立即、到期边界、
+// 水位组合边界与信封透传。
+func TestPostgrecDelayedDeliverySuite(t *testing.T) {
+	_, drv, _ := testDB(t)
+	eventtest.RunDelayedDeliverySuite(t, drv)
+}
+
 // Admin 管理面重放契约（写路径由独立 Admin 承载：postgrec.NewAdmin 构造，
 // 与 Driver 共享连接与命名空间选项，不挂 Driver 类型）。重放事实经
 // ClaimStateReader 装配（SQL 适配 event_claim 行）断言；互斥与操作来源

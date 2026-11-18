@@ -67,6 +67,12 @@ func TestInmemContractSuite(t *testing.T) {
 	eventtest.RunSuite(t, inmem.New())
 }
 
+// 延迟事件契约（deliver_at 定时投递，ADR 0013 §1）：inmem 在内存模拟同一
+// 到期判据，契约套件全过。
+func TestInmemDelayedDeliverySuite(t *testing.T) {
+	eventtest.RunDelayedDeliverySuite(t, inmem.New())
+}
+
 // Inspector 查询面契约：inmem 原生实现（可选能力按类型断言探测，ADR 0005）。
 func TestInmemInspectorSuite(t *testing.T) {
 	eventtest.RunInspectorSuite(t, inmem.New())

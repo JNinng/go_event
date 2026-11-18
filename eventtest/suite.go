@@ -1,7 +1,9 @@
 // Package eventtest 契约测试套件：接口的语义就是这套测试，新后端必须
 // 全过（design.md §1、§9.1）。RunSuite 覆盖公共、广播读取、认领消费与
 // core 编排语义；RunRetentionSuite 覆盖保留窗口惰性清理资格（design.md
-// §5.2）；RunMigrationSuite 经 MigrationBackend 适配接口覆盖初始化面
+// §5.2；保留窗口自可投递时刻起算，ADR 0013）；RunDelayedDeliverySuite
+// 覆盖延迟事件（deliver_at 定时投递、到期边界、水位组合边界，ADR 0013）；
+// RunMigrationSuite 经 MigrationBackend 适配接口覆盖初始化面
 // （Migrate/Verify、三种迁移模式、导出物、并发首启与锁语义、Lock=none
 // 变体、语句边界故障注入）；RunInspectorSuite 覆盖只读查询面
 // event.Inspector（可选能力，按类型断言探测，ADR 0005）；RunStoreSuite
@@ -109,13 +111,15 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("InFlightHandler_Stop_WaitsUntilCompletion", func(t *testing.T) { testGracefulStop(t, d) })
 	t.Run("AfterStop_Claim_NotResumed", func(t *testing.T) { testClaimNotResumedAfterStop(t, d) })
 	t.Run("LocalWakePublish_Runner_ImmediateDelivery", func(t *testing.T) { testLocalWake(t, d) })
+	t.Run("PublishWithDeliverAt_FetchAndClaim_FilteredUntilDue", func(t *testing.T) { testPublishWithDeliverAt(t, d) })
 	t.Run("ClaimOnlyOption_BroadcastSubscribe_Rejected", func(t *testing.T) { testGuardClaimOnlyOnBroadcast(t, d) })
 	t.Run("MissingIdentity_ClaimSubscribe_Rejected", func(t *testing.T) { testGuardMissingIdentity(t, d) })
 	t.Run("PostStartSubscribe_RejectedErrRunnerStarted", func(t *testing.T) { testGuardSubscribeAfterStart(t, d) })
 }
 
 // RunRetentionSuite 运行保留窗口惰性清理契约（design.md §5.2：清理资格
-// 为「超窗且无活跃租约，无论终态与否」）。newDriver 须为每个用例返回
+// 为「超窗且无活跃租约，无论终态与否」；保留窗口自可投递时刻起算——
+// deliver_at 非零以其为判据，ADR 0013 §1）。newDriver 须为每个用例返回
 // **已配置保留窗口**的全新 Driver 实例（清理簿记按 Driver 实例记忆，
 // 共享实例会因节流跳过清理；窗口时长由构造方决定，用例以足够久远的
 // OccurredAt 构造超窗行）。
@@ -124,6 +128,8 @@ func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver) {
 	t.Run("ExpiredActiveLease_Cleanup_Retained", func(t *testing.T) { testRetentionActiveLeaseRetained(t, newDriver) })
 	t.Run("ExpiredTerminal_Cleanup_Deleted", func(t *testing.T) { testRetentionTerminalDeleted(t, newDriver) })
 	t.Run("WithinWindow_Cleanup_Retained", func(t *testing.T) { testRetentionWithinWindowRetained(t, newDriver) })
+	t.Run("UndeliveredDelayedBeyondOccurredAt_Cleanup_RetainedUntilDue", func(t *testing.T) { testRetentionDelayedUndeliveredRetained(t, newDriver) })
+	t.Run("OverdueDeliverAtBeyondWindow_Cleanup_Deleted", func(t *testing.T) { testRetentionDelayedOverdueDeleted(t, newDriver) })
 }
 
 // ---- 公共测试设施 ----

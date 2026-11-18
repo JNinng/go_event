@@ -1147,3 +1147,57 @@ func TestMigrateUpgradesV1Baseline(t *testing.T) {
 		}
 	})
 }
+
+// 旧二进制（v2）升级：Migrate 幂等补齐 v3 加列（event.deliver_at，延迟
+// 事件 ADR 0013），升级随部署隐式发生（ADR 0007）；Verify 对 v2 基线
+// 报告缺失列（待升级）。
+func TestMigrateUpgradesV2Baseline(t *testing.T) {
+	pool := migrationPool(t)
+	ctx := context.Background()
+
+	t.Run("V2Baseline_Migrate_AddsDeliverAtColumn", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate over v2 baseline: %v", err)
+		}
+		if !columnExists(t, pool, schema, "event", "deliver_at") {
+			t.Fatal("v3 column deliver_at not added to event")
+		}
+	})
+	t.Run("V2Baseline_MigrateTwice_Idempotent", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 1: %v", err)
+		}
+		if err := pgxc.Migrate(ctx, pool, pgxc.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 2: %v", err)
+		}
+	})
+	t.Run("V2Baseline_Verify_ReportsMissingDeliverAt", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		report, err := pgxc.Verify(ctx, pool, pgxc.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify on v2 baseline = %v, want *VerifyError (missing column)", err)
+		}
+		requireIssue(t, report,
+			postgresschema.Qualified(schema, "event")+".deliver_at",
+			event.KindColumn, event.ProblemMissing)
+	})
+	t.Run("V2Baseline_DriverFirstAppend_UpgradeConverges", func(t *testing.T) {
+		schema := newMigrationSchema(t, pool)
+		provisionVersion(t, pool, schema, 1)
+		provisionVersion(t, pool, schema, 2)
+		drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema))
+		exerciseDML(t, drv, "t.upgrade3", "up3")
+		if !columnExists(t, pool, schema, "event", "deliver_at") {
+			t.Fatal("create-mode first use must upgrade v2 baseline with deliver_at")
+		}
+	})
+}

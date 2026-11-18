@@ -6,7 +6,11 @@
 // 选项）：只读查询面 Inspector（NewInspector 或对 Driver 类型断言探测）、
 // 管理面 Admin（NewAdmin，写路径不挂 Driver 类型，ADR 0010）、事务性
 // 入队 TransactionalAppender（NewTransactionalAppender，调用方在自己的
-// pgx.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）。
+// pgx.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）、跨实例
+// 唤醒 Wake（NewWake 构造、Bind 桥接 LocalWake，LISTEN/NOTIFY 仅信号、
+// 不承载投递保证，ADR 0013）。延迟投递（event.deliver_at，WithDeliverAt /
+// RawEnvelope.DeliverAt）为 Driver 语义内字段，未到期行不满足 Fetch /
+// Claim 下推条件。
 //
 // 持久结构按 NewDriver 的迁移模式处理：缺省 Create 在首次使用时持迁移锁
 // 幂等应用版本计划全量语句（基线与各版本，升级随部署隐式发生，协议见

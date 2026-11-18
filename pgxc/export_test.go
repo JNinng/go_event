@@ -29,3 +29,7 @@ func SetAdminLockWaitForTest(d time.Duration) func() {
 	adminLockWait = d
 	return func() { adminLockWait = old }
 }
+
+// NotifyForTest 模拟一次 NOTIFY 到达（仅测试编译单元可见）：绕过 LISTEN
+// 连接，直接驱动分发路径（桥接 → NotifyAll）。
+func NotifyForTest(w *Wake, payload string) { w.dispatch(payload) }

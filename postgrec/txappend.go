@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/jninng/go_event"
 )
@@ -11,10 +12,22 @@ import (
 // appendInsertSQL 是事件 INSERT 的单一语句定义：普通 Append（自管连接，
 // 独立提交）与事务性 AppendTx（加入调用方业务事务）共用同一份，避免第
 // 二份拷贝漂移（幂等语义一致：同 ID 首写为准，design.md §4）。
+//
+// 本后端不承载跨实例唤醒信号（database/sql 无驱动无关的 LISTEN 接入，
+// 退化轮询，ADR 0013 §4）；唤醒信号的 pg_notify 变体仅 pgxc 提供。
 const appendInsertSQL = `
-INSERT INTO %s.event (id, type, payload, metadata, occurred_at)
-VALUES ($1, $2, $3, $4::jsonb, $5)
+INSERT INTO %s.event (id, type, payload, metadata, occurred_at, deliver_at)
+VALUES ($1, $2, $3, $4::jsonb, $5, $6)
 ON CONFLICT (id) DO NOTHING`
+
+// deliverAtArg 把信封的 DeliverAt 归一为落库参数：零值存 NULL（立即可
+// 投递），非零原样写入 deliver_at。
+func deliverAtArg(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
 
 // TransactionalAppender 事务性事件入队（outbox 可选面，不进 Driver 契约，
 // ADR 0012）：调用方在自己的业务事务（*sql.Tx）内调用 AppendTx，事件
@@ -73,7 +86,7 @@ func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *sql.Tx, e eve
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(appendInsertSQL, ta.d.schema),
-		e.ID, e.Type, e.Payload, meta, e.OccurredAt); err != nil {
+		e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt)); err != nil {
 		return fmt.Errorf("postgrec: append tx: %w", err)
 	}
 	return nil

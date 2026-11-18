@@ -71,8 +71,8 @@ func TestPlan(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PlannedStatements: %v", err)
 		}
-		if len(paired) != 11 {
-			t.Fatalf("plan statements = %d, want 11 (baseline v1: 9 + v2 add-column: 2)", len(paired))
+		if len(paired) != 12 {
+			t.Fatalf("plan statements = %d, want 12 (baseline v1: 9 + v2 add-column: 2 + v3 add-column: 1)", len(paired))
 		}
 		objs := postgresschema.ExpectedObjects("public")
 		if len(objs) != len(paired) {
@@ -102,8 +102,8 @@ func TestPlan(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Plan: %v", err)
 		}
-		if len(plan) != 2 {
-			t.Fatalf("plan versions = %d, want 2", len(plan))
+		if len(plan) != 3 {
+			t.Fatalf("plan versions = %d, want 3", len(plan))
 		}
 		v2 := plan[1]
 		if v2.Number != 2 || len(v2.Statements) != 2 {
@@ -146,6 +146,43 @@ func TestPlan(t *testing.T) {
 			if !strings.Contains(stmt, "ADD COLUMN IF NOT EXISTS") {
 				t.Fatalf("v2 statement must be idempotent ADD COLUMN IF NOT EXISTS: %s", stmt)
 			}
+		}
+	})
+	t.Run("VersionThree_Statement_AddsEventDeliverAtIdempotent", func(t *testing.T) {
+		plan, err := postgresschema.Plan("tenant")
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		v3 := plan[2]
+		if v3.Number != 3 || len(v3.Statements) != 1 {
+			t.Fatalf("v3 = %+v, want exactly 1 add-column statement", v3)
+		}
+		// 一条 ALTER ... ADD COLUMN IF NOT EXISTS 恰好对应一个列对象。
+		paired, err := postgresschema.PlannedStatements("tenant")
+		if err != nil {
+			t.Fatalf("PlannedStatements: %v", err)
+		}
+		ps := paired[11]
+		if ps.SQL != "ALTER TABLE tenant.event ADD COLUMN IF NOT EXISTS deliver_at timestamptz;" {
+			t.Fatalf("v3 statement = %q", ps.SQL)
+		}
+		if ps.Object.Kind != event.KindColumn || ps.Object.Name != "tenant.event.deliver_at" {
+			t.Fatalf("v3 statement pairs with %+v, want column object tenant.event.deliver_at", ps.Object)
+		}
+		if ps.Object.Table != "event" {
+			t.Fatalf("v3 column owning table = %q, want event", ps.Object.Table)
+		}
+		if len(ps.Object.Columns) != 1 || ps.Object.Columns[0].Name != "deliver_at" {
+			t.Fatalf("column object must declare exactly deliver_at: %+v", ps.Object.Columns)
+		}
+		if ps.Object.Columns[0].NotNull {
+			t.Fatal("deliver_at must be nullable (expand-compatible, zero value = immediate)")
+		}
+		if ps.Object.Columns[0].DataType != "timestamp with time zone" {
+			t.Fatalf("deliver_at type = %q, want format_type form", ps.Object.Columns[0].DataType)
+		}
+		if !strings.Contains(v3.Statements[0], "ADD COLUMN IF NOT EXISTS") {
+			t.Fatalf("v3 statement must be idempotent ADD COLUMN IF NOT EXISTS: %s", v3.Statements[0])
 		}
 	})
 }
@@ -274,6 +311,7 @@ func TestExpectedObjects(t *testing.T) {
 			event.KindIndex,
 			event.KindColumn,
 			event.KindColumn,
+			event.KindColumn,
 		}
 		if len(objs) != len(wantKinds) {
 			t.Fatalf("ExpectedObjects = %d, want %d", len(objs), len(wantKinds))
@@ -305,7 +343,7 @@ func TestExpectedObjects(t *testing.T) {
 		if objs[7].ForeignKey == nil || objs[7].ForeignKey.RefTable != "event" {
 			t.Fatalf("foreign key object = %+v", objs[7])
 		}
-		// 版本加列对象：限定名含列、归属表为 event_claim、单列可空定义。
+		// v2 版本加列对象：限定名含列、归属表为 event_claim、单列可空定义。
 		wantCols := []string{"public.event_claim.last_error", "public.event_claim.failed_at"}
 		for i, name := range wantCols {
 			obj := objs[9+i]
@@ -320,6 +358,15 @@ func TestExpectedObjects(t *testing.T) {
 			objs[10].Columns[0].DataType != "timestamp with time zone" {
 			t.Fatalf("version column types = %q / %q, want text / timestamp with time zone",
 				objs[9].Columns[0].DataType, objs[10].Columns[0].DataType)
+		}
+		// v3 版本加列对象：event.deliver_at，单列可空定义（零值 = 立即）。
+		obj := objs[11]
+		if obj.Name != "public.event.deliver_at" || obj.Table != "event" {
+			t.Fatalf("v3 column object = %+v, want public.event.deliver_at on event", obj)
+		}
+		if len(obj.Columns) != 1 || obj.Columns[0].NotNull ||
+			obj.Columns[0].DataType != "timestamp with time zone" {
+			t.Fatalf("v3 column object must carry a single nullable timestamptz: %+v", obj.Columns)
 		}
 	})
 }
@@ -540,8 +587,8 @@ func TestDiff(t *testing.T) {
 }
 
 func fullSnapshot() postgresschema.Snapshot {
-	eventCols := make([]postgresschema.ColumnState, 0, 6)
-	for _, col := range postgresschema.EventColumns() {
+	eventCols := make([]postgresschema.ColumnState, 0, 7)
+	for _, col := range append(postgresschema.EventColumns(), postgresschema.EventVersionColumns()...) {
 		eventCols = append(eventCols, postgresschema.ColumnState{
 			Name: col.Name, DataType: col.DataType, NotNull: col.NotNull,
 			HasSequenceDefault: col.Sequence,

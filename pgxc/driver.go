@@ -29,6 +29,9 @@ type Driver struct {
 	retention time.Duration
 	mode      event.MigrateMode
 	manager   schemaManager
+	// wakeChannel 是跨实例唤醒 NOTIFY 通道（前缀 + schema）；空串表示
+	// 通道不适配（超 Postgres 标识上限），写路径走无信号 INSERT 变体。
+	wakeChannel string
 
 	ensureMu     sync.Mutex
 	ensured      bool
@@ -63,10 +66,11 @@ func newDriver(pool *pgxpool.Pool, opts ...Option) *Driver {
 // 构造三面，保证选项口径一致（不重复解析）。
 func newDriverConfig(pool *pgxpool.Pool, cfg *config) *Driver {
 	d := &Driver{
-		pool:      pool,
-		schema:    cfg.schema,
-		retention: cfg.retention,
-		mode:      cfg.mode,
+		pool:        pool,
+		schema:      cfg.schema,
+		retention:   cfg.retention,
+		mode:        cfg.mode,
+		wakeChannel: wakeChannel(cfg.schema),
 		manager: &pgSchemaManager{pool: pool, schema: cfg.schema,
 			logger: cfg.logger, mp: cfg.mp, scope: cfg.scope},
 		now: time.Now,
@@ -197,7 +201,8 @@ func (d *Driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 }
 
 // Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）。INSERT 语句与
-// 事务性 AppendTx 共用同一份定义（appendInsertSQL，ADR 0012）。
+// 事务性 AppendTx 共用同一份定义与执行路径（appendInsertSQL / execAppend，
+// ADR 0012）；实际插入行时发跨实例唤醒 NOTIFY（ADR 0013）。
 func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 	if err := d.ensure(ctx); err != nil {
 		return err
@@ -207,16 +212,16 @@ func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 		return err
 	}
 	// 幂等 Append：同 ID 首写为准，不覆盖、不重投（design.md §4）。
-	_, err = d.pool.Exec(ctx, fmt.Sprintf(appendInsertSQL, d.schema),
-		e.ID, e.Type, e.Payload, meta, e.OccurredAt)
-	if err != nil {
+	if err := d.execAppend(ctx, d.pool.Exec, e, meta); err != nil {
 		return fmt.Errorf("pgxc: append: %w", err)
 	}
 	d.lazyCleanup(ctx, time.Now())
 	return nil
 }
 
-// Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；Limit<=0 返回 nil。
+// Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；
+// 延迟事件以 q.Now 判定到期，未到期行在单条读取内过滤（ADR 0013 §1）。
+// Limit<=0 返回 nil。
 func (d *Driver) Fetch(ctx context.Context, q event.FetchQuery) ([]event.RawEnvelope, error) {
 	if err := d.ensure(ctx); err != nil {
 		return nil, err
@@ -232,11 +237,12 @@ func (d *Driver) Fetch(ctx context.Context, q event.FetchQuery) ([]event.RawEnve
 		}
 	}
 	rows, err := d.pool.Query(ctx, fmt.Sprintf(`
-SELECT id, type, payload, metadata, occurred_at, position
+SELECT id, type, payload, metadata, occurred_at, position, deliver_at
 FROM %s.event
 WHERE type = $1 AND position > $2
+  AND (deliver_at IS NULL OR deliver_at <= $3)
 ORDER BY position ASC
-LIMIT $3`, d.schema), q.Type, after, q.Limit)
+LIMIT $4`, d.schema), q.Type, after, q.Now, q.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("pgxc: fetch: %w", err)
 	}
@@ -292,15 +298,16 @@ WHERE c.event_id = e.id AND e.type = $1 AND c.consumer_type = $2
 
 	// 2) 原子认领（单语句两个数据修改 CTE 共享同一拾取窗口）：picked 按
 	//    position 升序拾取至多 Limit 条可认领行并锁定事件行（SKIP LOCKED
-	//    降低并发争用，design.md §5.3）；无主与 retrying 重认领走 INSERT
-	//    （接管不计入——Fail 时已计入，ADR 0006），active 过期租约走
-	//    UPDATE 接管（计入重试）。takeover 标记来自拾取快照的旧行状态，
-	//    RETURNING 随行带回，供接管计数汇总。过滤在认领时单条操作内下推
-	//    （ADR 0004）。已知边界：快照路由为 active（只走 takeover）的行
-	//    若在 UPDATE 执行时被旧属主迟到 Fail 翻成 retrying 且退避未期满，
-	//    guard 重查不命中则本轮不发放、下轮再认领——与旧单语句实现非逐点
-	//    等价（旧实现在零退避下当轮按 retrying 发放），语义更安全，
-	//    at-least-once 不破坏（ADR 0011）。
+	//    降低并发争用，design.md §5.3）；延迟事件以 q.Now 判定到期
+	//    （deliver_at <= now，ADR 0013 §1），未到期行不进拾取窗口。无主与
+	//    retrying 重认领走 INSERT（接管不计入——Fail 时已计入，ADR 0006），
+	//    active 过期租约走 UPDATE 接管（计入重试）。takeover 标记来自
+	//    拾取快照的旧行状态，RETURNING 随行带回，供接管计数汇总。过滤在
+	//    认领时单条操作内下推（ADR 0004）。已知边界：快照路由为 active
+	//    （只走 takeover）的行若在 UPDATE 执行时被旧属主迟到 Fail 翻成
+	//    retrying 且退避未期满，guard 重查不命中则本轮不发放、下轮再认领
+	//    ——与旧单语句实现非逐点等价（旧实现在零退避下当轮按 retrying
+	//    发放），语义更安全，at-least-once 不破坏（ADR 0011）。
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 WITH picked AS (
 	SELECT e.id, c.status
@@ -308,6 +315,7 @@ WITH picked AS (
 	LEFT JOIN %s.event_claim c
 	       ON c.event_id = e.id AND c.consumer_type = $2
 	WHERE e.type = $1
+	  AND (e.deliver_at IS NULL OR e.deliver_at <= $3)
 	  AND (
 	        c.event_id IS NULL
 	     OR (c.status = 'active' AND c.lease_until <= $3 AND c.next_eligible_at <= $3)
@@ -376,7 +384,7 @@ SELECT event_id, claim_count, takeover FROM reclaim
 			ids[i] = c.eventID
 		}
 		rows, err = tx.Query(ctx, fmt.Sprintf(`
-SELECT id, type, payload, metadata, occurred_at, position
+SELECT id, type, payload, metadata, occurred_at, position, deliver_at
 FROM %s.event WHERE id = ANY($1) ORDER BY position ASC`, d.schema), ids)
 		if err != nil {
 			return event.ClaimResult{}, fmt.Errorf("pgxc: claim fetch: %w", err)
@@ -515,6 +523,8 @@ WHERE event_id = $1 AND consumer_type = $2 AND lease_token = $3`, d.schema),
 
 // lazyCleanup 惰性清理：超保留窗口且无活跃租约的行（无论终态与否）均可
 // 清理；认领记录经 FK ON DELETE CASCADE 一并清理（design.md §5.2）。
+// 保留窗口自「可投递时刻」起算（COALESCE(deliver_at, occurred_at)，
+// ADR 0013 §1）——延迟行不因「等待投递」被清理，零值行口径不变。
 // 内部簿记用墙钟，不参与契约语义。
 func (d *Driver) lazyCleanup(ctx context.Context, now time.Time) {
 	d.cleanupMu.Lock()
@@ -526,7 +536,7 @@ func (d *Driver) lazyCleanup(ctx context.Context, now time.Time) {
 	cutoff := now.Add(-d.retention)
 	_, _ = d.pool.Exec(ctx, fmt.Sprintf(`
 DELETE FROM %s.event e
-WHERE e.occurred_at < $1
+WHERE COALESCE(e.deliver_at, e.occurred_at) < $1
   AND NOT EXISTS (
 	SELECT 1 FROM %s.event_claim c
 	WHERE c.event_id = e.id AND c.status = 'active' AND c.lease_until > $2
@@ -552,10 +562,14 @@ func collectEnvelopes(rows pgx.Rows) ([]event.RawEnvelope, error) {
 		var e event.RawEnvelope
 		var meta []byte
 		var pos int64
-		if err := rows.Scan(&e.ID, &e.Type, &e.Payload, &meta, &e.OccurredAt, &pos); err != nil {
+		var deliverAt *time.Time // NULL = 立即可投递（零值）
+		if err := rows.Scan(&e.ID, &e.Type, &e.Payload, &meta, &e.OccurredAt, &pos, &deliverAt); err != nil {
 			return nil, fmt.Errorf("pgxc: scan envelope: %w", err)
 		}
 		e.Position = strconv.FormatInt(pos, 10)
+		if deliverAt != nil {
+			e.DeliverAt = *deliverAt
+		}
 		if len(meta) > 0 {
 			if err := json.Unmarshal(meta, &e.Metadata); err != nil {
 				return nil, fmt.Errorf("pgxc: unmarshal metadata: %w", err)

@@ -90,6 +90,8 @@ type publishConfig struct {
 	// 非 nil 即显式指定，其值为空串时非法。nil 与指向空串必须可区分，
 	// 不能以字符串零值判断「是否设置」。
 	eventID *string
+	// deliverAt 是延迟投递声明（WithDeliverAt）；零值 = 立即可投递。
+	deliverAt time.Time
 }
 
 // WithEventID 显式指定事件 ID，优先于 IDGenerator；空串非法，
@@ -113,6 +115,16 @@ func WithMetadata(meta map[string]string) PublishOption {
 			c.metadata[k] = v
 		}
 	}
+}
+
+// WithDeliverAt 声明最早投递时刻（延迟事件，ADR 0013）：到期前行不满足
+// Fetch / Claim 的下推条件，到期后照常可投递。零值（选项缺省）= 立即
+// 可投递；过去时刻等价立即，不报错。仅声明「不早于」语义：投递本身仍
+// 经轮询/认领路径，不保证恰在该时刻发生。广播消费下延迟行可能被内存
+// 水位越过而不再投递（ADR 0012 同源的乱序边界），需要定时必达用认领
+// 消费。
+func WithDeliverAt(t time.Time) PublishOption {
+	return func(c *publishConfig) { c.deliverAt = t }
 }
 
 // Publish 发布实现：ID 与 OccurredAt 缺省自动填充（design.md §6）。
@@ -147,6 +159,7 @@ func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
 		Payload:    encoded,
 		Metadata:   cfg.metadata,
 		OccurredAt: time.Now().UTC(),
+		DeliverAt:  cfg.deliverAt, // 零值 = 立即可投递（WithDeliverAt 缺省）
 	}
 	start := time.Now()
 	err = p.drv.Append(ctx, raw)

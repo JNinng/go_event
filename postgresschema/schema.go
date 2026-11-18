@@ -25,7 +25,9 @@ const (
 	TableEventClaim = "event_claim"
 )
 
-// EventColumns 返回 event 表的期望列（顺序即建表顺序）。
+// EventColumns 返回 event 表的期望列（顺序即建表顺序）。仅含基线 v1 建表
+// 列；基线之后以 ADD COLUMN IF NOT EXISTS 追加的列见 EventVersionColumns
+// （独立列对象参与期望对象集合，不进本表定义）。
 func EventColumns() []Column {
 	return []Column{
 		{Name: "id", DataType: "text", NotNull: true},
@@ -34,6 +36,15 @@ func EventColumns() []Column {
 		{Name: "metadata", DataType: "jsonb", NotNull: true},
 		{Name: "occurred_at", DataType: "timestamp with time zone", NotNull: true},
 		{Name: "position", DataType: "bigint", NotNull: true, Sequence: true},
+	}
+}
+
+// EventVersionColumns 返回 event 表基线之后以 ALTER TABLE ... ADD COLUMN
+// IF NOT EXISTS 追加的列（顺序即版本计划 v3 语句顺序）：投递时刻
+// deliver_at，可空、无默认值（NULL = 立即可投递，延迟事件 ADR 0013）。
+func EventVersionColumns() []Column {
+	return []Column{
+		{Name: "deliver_at", DataType: "timestamp with time zone"},
 	}
 }
 
@@ -167,6 +178,15 @@ func ExpectedObjects(schema string) []Object {
 			Kind:    event.KindColumn,
 			Name:    Qualified(schema, TableEventClaim) + "." + col.Name,
 			Table:   TableEventClaim,
+			Columns: []Column{col},
+		})
+	}
+	// v3 加列版本：同款独立列对象（event.deliver_at，延迟事件 ADR 0013）。
+	for _, col := range EventVersionColumns() {
+		objs = append(objs, Object{
+			Kind:    event.KindColumn,
+			Name:    Qualified(schema, TableEvent) + "." + col.Name,
+			Table:   TableEvent,
 			Columns: []Column{col},
 		})
 	}
