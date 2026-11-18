@@ -731,7 +731,9 @@ func WithObserver(o Observer) Option            // 缺省无观察者（当前�
 // permanent/transient 与 schema；Migrate 成功打 Info 日志「migration applied」
 //（schema、mode、duration_seconds）。
 //
-// 管理面指标：<scope>.admin.replay（Counter），属性 result=ok/no_effect/
+// 管理面指标：<scope>.admin.replay（Counter）+ <scope>.admin.replay.duration
+// （Histogram，result 维度；操作入口到返回全程耗时——含 ensure、锁等待与
+// 事务执行），Counter 属性 result=ok/no_effect/
 // canceled/lock_timeout/error 与 schema；每次重放打一行 slog 审计日志
 // 「admin replay」（op、schema、event_id、consumer_type、result；失败加
 // error.type + error）并发 AdminReplayEvent（ObserverV3 分发）。
@@ -846,21 +848,26 @@ type FailedEvent struct {
 - **持锁**：写操作在事务内持有与迁移执行相同的命名空间互斥锁
   （`postgresschema.LockKey(schema)` 的 advisory 键，键含 schema——不同
   命名空间互不阻塞），与迁移执行串行化；等待有界（try-lock + 退避，与
-  迁移执行器同一实现），超时返回 `ErrAdminLockTimeout`（瞬时错误）。
+  迁移执行器同一实现），等待上限经后端选项 `WithAdminLockWait` 按实例
+  配置（缺省同迁移锁 `postgresschema.LockWaitTimeout`），超时返回
+  `ErrAdminLockTimeout`（瞬时错误）。
 - **校验对象/行归属**：归属校验即单条条件更新（CAS）本身——以（事件 ×
   消费者身份）主键定位唯一认领行、以 `status='failed'` 限定可改写集合，
   命名空间由构造期固定并校验的 schema 限定；不满足即不归属（不命中、
   `ok=false`），不产生跨行 / 跨命名空间改写。
-- **记录操作来源**：每次调用发射 otel 指标 `<scope>.admin.replay`
-  （§2.9）、slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与
-  last_error 摘要，失败结果附 error.type / error 分类属性）与类型化
-  Observer 事件 `AdminReplayEvent`（经 `WithObserver` 注入、`ObserverV3`
-  分发）。观测均为旁路，失败不影响业务结果。
-- **错误可判别**：`ErrAdminLockTimeout`（锁等待超时，瞬时）；
-  迁移面哨兵（`ErrInvalidSchema`、`ErrMigrationPermissionDenied`、
-  `*VerifyError` 等，经首次操作的迁移模式处理产生，原样上抛）；
-  连接 / 驱动故障（原样包装，以 `error.type` / SQLSTATE 判别）。
-  执行故障一律经 error 返回，不得折叠为 `ok=false`。
+- **记录操作来源**：每次调用发射 otel 指标 `<scope>.admin.replay` 与
+  `<scope>.admin.replay.duration`（§2.9）、slog 审计日志（操作、事件 ×
+  身份、结果；不含事件 payload 与 last_error 摘要，失败结果附
+  error.type / error 分类属性）与类型化 Observer 事件 `AdminReplayEvent`
+  （经 `WithObserver` 注入、`ObserverV3` 分发）。观测均为旁路，失败不
+  影响业务结果。
+- **错误可判别**：`ErrAdminLockTimeout`（锁等待超时，瞬时）——管理写
+  路径的同键锁等待覆盖两处、同判本哨兵：写事务内的互斥锁等待，与未预热
+  实例首次操作时 ensure 撞上的迁移锁等待（统一改判，不留迁移面哨兵
+  泄漏口）；其余迁移面哨兵（`ErrInvalidSchema`、
+  `ErrMigrationPermissionDenied`、`*VerifyError` 等，经首次操作的迁移
+  模式处理产生，原样上抛）；连接 / 驱动故障（原样包装，以 `error.type` /
+  SQLSTATE 判别）。执行故障一律经 error 返回，不得折叠为 `ok=false`。
 - **无自动 down、迁移侧无台账**：管理面只提供上行写操作，不提供任何
   down / 回滚入口；迁移侧无执行台账，无需 reset / stamp 入口，schema
   异常经迁移重跑或人工修复（ADR 0007）。
@@ -925,6 +932,10 @@ postgrec 为 `*sql.Tx`、inmem 为包内缓冲事务——core 接口只能以 `
   消费不受影响（Claim 直接查库）。
 - **不触发惰性清理**：清理 DELETE 不落入调用方事务（不扩大其锁面），
   机会性清理由普通 Append / Claim 等路径照常承担。
+- **隔离级别沿用调用方事务**：`AppendTx` 仅执行单条幂等 INSERT（无读
+  改写 CAS），不设置也不改变事务隔离级别——可重复读下 INSERT 语义不变
+  （新行对同事务后续语句可见、对其他事务提交后可见），无需为入队提升
+  隔离级别。
 - **不发射观测**：库侧任何发射点都在提交前，而提交归调用方——「AppendTx
   成功」与「事务最终提交」可能被回滚打断，提交前发射会与落库事实矛盾
   （既有观测契约以与落库事实一致为准）；业务事务成败由调用方在自己的
@@ -1078,7 +1089,10 @@ type Store struct {
 func NewStore(pool *pgxpool.Pool, opts ...Option) *Store
 
 // Wake 跨实例唤醒总线（可选面，仅 pgxc 提供，ADR 0013）：专用连接
-// LISTEN go_event_wake_<schema>。同 schema 任一实例经 Append / AppendTx
+// LISTEN go_event_wake_<schema>（短 schema 直用前缀 + 全名；前缀 + 全名
+// 超 Postgres 标识上限 63 字节的 schema 走确定性哈希通道名——前缀 +
+// schema 前 32 字节 + 全名哈希，恰 63 字节，两侧同源派生必然一致，任意
+// 合法 schema 都有通道）。同 schema 任一实例经 Append / AppendTx
 // 实际插入事件行即 NOTIFY（INSERT 经 CTE 挂在插入事实之后，仅实际插入
 // 时发出——幂等冲突不重发；通道与 payload 只带 schema 名，不带事件内容；
 // pg_notify 随事务提交可见，AppendTx 的信号在提交时刻发出）。收到通知
@@ -1086,7 +1100,7 @@ func NewStore(pool *pgxpool.Pool, opts ...Option) *Store
 // Fetch / 唤醒等待，读取与认领仍走后端存储（ADR 0003 边界不变），错过
 // 的信号由周期 poll 兜底。LISTEN 需专用连接（经连接池 Acquire 持有一条
 // 不归还）；断开按有界退避重连（100ms 起、封顶 30s）并重新 LISTEN。
-// 构造即后台监听；非法 schema、通道名超 63 字节或连接池为 nil 时监听
+// 构造即后台监听；非法 schema 或连接池为 nil 时监听
 // 不启动（信号退化由轮询兜底）。延迟行的信号在插入时发出、不判断
 // deliver_at（推送只回答「有新行」，消费侧空拉一趟由轮询兜底）。
 type Wake struct{ /* 不透明 */ }
@@ -1138,6 +1152,12 @@ func WithMigrateMode(m event.MigrateMode) Option
 // WithObserver 注入类型化观测旁路（缺省无观察者）：当前仅管理面 Admin
 // 发射观测事件（AdminReplayEvent，经 ObserverV3 分发）。
 func WithObserver(o event.Observer) Option
+
+// WithAdminLockWait 覆盖管理写互斥锁的有界等待上限（缺省同迁移锁
+// postgresschema.LockWaitTimeout，仅 Admin 写路径生效）：运维按实例的
+// 锁等待预算配置。非正值不阻塞——保留一次 try-lock 后立即返回
+// ErrAdminLockTimeout（瞬时）。
+func WithAdminLockWait(d time.Duration) Option
 ```
 
 迁移相关语义：

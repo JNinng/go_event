@@ -27,6 +27,8 @@
   - **新增公开 API**：`postgresschema.AcquireExclusiveLock`（命名空间互斥锁的有界等待实现，迁移执行器与管理面写操作共用）；core Admin 重放结果枚举常量 `AdminReplayOK` / `AdminReplayNoEffect` / `AdminReplayCanceled` / `AdminReplayLockTimeout` / `AdminReplayError`（`AdminReplayEvent.Result` 与指标 result 属性取值）；inmem Admin 构造选项 `AdminOption` / `WithAdminObserver` / `WithAdminLockWait`。
   - **操作来源记录**：每次重放发射 otel 指标 `<scope>.admin.replay`（`result`=ok/no_effect/canceled/lock_timeout/error 与 `schema` 属性）、slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附 error.type / error 分类属性）与类型化 Observer 事件 `AdminReplayEvent`（新增 `ObserverV3` 扩展接口，非破坏性演进；后端选项新增 `WithObserver`）。
   - `eventtest` 新增 `RunAdminReplaySuite` 契约套件（端到端重放、计数归零与循环重放、非 failed 行无效果判别统一、摘要保留事实、并发恰好一次生效、被接管后迟到重放不污染新属主；互斥经 `AdminExclusionLock` 注入断言——锁占用期间锁超时且行不变、释放后重放生效；操作来源经 `AdminObserverSetter` 注入断言——ok/no_effect/lock_timeout 结果与事件 × 身份一致）。
+- **Admin 加固续作（P1.5 收尾）**：pgxc / postgrec 新增公开选项 `WithAdminLockWait(d)`——管理写互斥锁的有界等待上限按实例配置（缺省同迁移锁 `postgresschema.LockWaitTimeout`，原测试钩子 `SetAdminLockWaitForTest` 移除、集成测试改用本选项）；未预热 Admin 实例在迁移持锁期间**首次**调用时，`ensure` 撞上的迁移锁超时与写事务内的锁等待同键同判，统一改判 `ErrAdminLockTimeout`（此前该窗口先收到 `ErrMigrationLockTimeout`，ADR 0010 后果口径收窄）；管理面观测补 `<scope>.admin.replay.duration` 直方图（`result` 维度，操作入口到返回全程耗时——含 ensure、锁等待与事务执行）。
+- **跨实例唤醒通道名适配超长 schema（pgxc，ADR 0013 §2 修订）**：前缀 + 全名超 Postgres 标识上限 63 字节的 schema 不再退化轮询——以确定性哈希通道名适配（前缀 + schema 前 32 字节 + 全名 FNV-1a 64 位哈希十六进制，恰 63 字节；LISTEN 与 NOTIFY 两侧经同一函数派生必然一致），任意合法 schema 都有唤醒通道；短 schema 通道名不变，无信号 INSERT 变体移除。
 
 ### 破坏性变更与兼容期
 
@@ -37,6 +39,7 @@
 
 ### 文档
 
+- usage.md §13.2 补充显式说明：`lease.abandoned`（停机放弃意图）与 `claim.takeover`（接管完成事实）事件源不同，不可相加对账；api.md §2.12 补充提示：`AppendTx` 仅执行单条幂等 INSERT、沿用调用方事务隔离级别（可重复读下 INSERT 语义不变，无需提升隔离级别）。
 - 新增 [ADR 0013](docs/adr/0013-delayed-delivery-and-cross-instance-wakeup.md)：延迟事件（信封字段、下推判据、保留期自可投递时刻起算、广播水位边界）与跨实例低延迟唤醒（pgxc LISTEN/NOTIFY 形态、专用连接生命周期、payload 边界、postgrec 退化口径、观测保持最小）的决策记录。
 - 新增 [ADR 0009](docs/adr/0009-error-summary-persistence.md)：错误摘要落库口径与 `Fail` 接口扩展的决策记录。
 - 新增 [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)：管理面写操作的承载形态（独立 `Admin`、不经 `Driver` 类型暴露）与 failed 手工重放语义的决策记录，含加固口径（与迁移的命名空间互斥、操作来源观测、错误分类）。

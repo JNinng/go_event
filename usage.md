@@ -835,6 +835,7 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithMeterProvider(mp)` | 迁移与管理面指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
 | `WithScopeName(s)` | 迁移与管理面指标 scope 与名前缀 | 模块名（`pgxc` / `postgrec`） |
 | `WithObserver(o)` | 类型化观测旁路（当前仅 Admin 发射 `AdminReplayEvent`） | 无 |
+| `WithAdminLockWait(d)` | Admin 写互斥锁有界等待上限（仅管理写路径生效） | 同迁移锁 `postgresschema.LockWaitTimeout`（5s） |
 
 以上选项同样适用于 `NewStore`（[§8.7](#87-组合对象-store)）：解析一次、
 经同一份配置传导三面。
@@ -866,8 +867,8 @@ func TestMyBackendRetention(t *testing.T) {
   - 仅 `status='failed'` 的行可重放：`done` 幂等不可逆、不重放；`active`（租约活跃）与 `retrying`（自动重试退避中）拒绝且不改动；行不存在（事件未知、超保留窗口被清理、该身份尚无认领行）与非 failed 行判别统一——返回 `ok=false` 且无错误，需要区分原因先经 `Inspector.ClaimState` 查询；执行故障经 `error` 返回。
   - 重放写入：置 `retrying`、`claim_count=0`（此后 Fail 的重试计数从合法范围重新开始）、清 `lease_token`、`lease_until` 置为重放时刻（原租约凭证失效）、`next_eligible_at=now`（立即可认领、不做退避）、`failed_at=NULL`、`last_error` 保留（排障历史，直到下一次终态失败覆盖）。
   - 并发防护是单条条件更新（CAS，仅命中 `status='failed'`）：并发重放恰好一次生效；已被重新认领（接管）或已完成的行不受迟到重放影响。**行归属校验即 CAS 本身**：以（事件 × 消费者身份）主键定位唯一认领行、以 `status='failed'` 限定可改写集合，命名空间由构造期固定并校验的 schema 限定——不满足即不归属（不命中、`ok=false`），不产生跨行 / 跨命名空间改写。
-  - **与迁移互斥**：重放在事务内持与迁移执行相同的命名空间互斥锁（键含 schema，不同 schema 互不阻塞）——迁移执行期间发起的重放有界等待，超时返回 `event.ErrAdminLockTimeout`（瞬时错误，退避后重试）；互斥是串行化而非拒绝，锁释放后重放照常生效。
-  - **操作来源记录**：每次重放发射 otel 指标 `<scope>.admin.replay`（`result` 属性，见 [§13.2](#132-指标口径)）、一行 slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附 error.type / error 分类属性）与 `event.AdminReplayEvent` 观测事件（`WithObserver` 注入、`ObserverV3` 分发）。观测均为旁路，失败不影响业务结果。
+  - **与迁移互斥**：重放在事务内持与迁移执行相同的命名空间互斥锁（键含 schema，不同 schema 互不阻塞）——迁移执行期间发起的重放有界等待，超时返回 `event.ErrAdminLockTimeout`（瞬时错误，退避后重试）；等待上限经 `WithAdminLockWait` 按实例配置（缺省同迁移锁）。未预热 Admin 实例在迁移持锁期间的**首次**调用，`ensure`（Create 模式持迁移锁建结构）撞上的是同一把锁——锁超时同样改判 `ErrAdminLockTimeout`，调用方无需区分首调与预热后的锁超时。互斥是串行化而非拒绝，锁释放后重放照常生效。
+  - **操作来源记录**：每次重放发射 otel 指标 `<scope>.admin.replay` 与 `<scope>.admin.replay.duration`（`result` 属性，见 [§13.2](#132-指标口径)）、一行 slog 审计日志（操作、事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附 error.type / error 分类属性）与 `event.AdminReplayEvent` 观测事件（`WithObserver` 注入、`ObserverV3` 分发）。观测均为旁路，失败不影响业务结果。
   - **错误分类与排查入口**：`event.ErrAdminLockTimeout`（锁等待超时，瞬时——检查是否有迁移执行或长事务持锁）；迁移面哨兵（`ErrInvalidSchema` / `ErrMigrationPermissionDenied` / `*event.VerifyError` 等，经首次操作的迁移模式处理产生，处置见 [§8.4](#84-迁移模式与权限)）；连接 / 驱动故障（原样包装，以 `error.type` / SQLSTATE 判别后按驱动语义处置）。执行故障一律 `error` 返回，不会折叠为 `ok=false`。
   - **重放窗口 = 保留窗口**：超窗行已被惰性清理删除，重放该键即 `ok=false`——发现 failed 后应在保留窗口内处置；窗口配置见 [§8.5](#85-保留窗口与惰性清理)。
   - 鉴权与操作审计由使用方负责：管理面对象只应授予运维角色。管理面只提供上行写操作，**不提供自动 down**；迁移侧无台账，无需 reset/stamp 入口，schema 异常经迁移重跑或人工修复（[§8.4](#84-迁移模式与权限)、[ADR 0007](docs/adr/0007-migration-mode-and-protocol.md)）。
@@ -887,7 +888,7 @@ func TestMyBackendRetention(t *testing.T) {
 | `event.ErrMigrationUnsupported` | 锁能力为无（`LockNone`），`Create` 不支持自动迁移 | 改用 `Verify`/`None`，由部署流程建表 |
 | `event.ErrMigrateModeUnsupported` | `WithMigrateMode` 传给 `Migrate`，或模式取值非法 | 该选项只传给 `NewDriver`；检查模式取值 |
 | `event.ErrInvalidSchema` | schema 名非法（只允许 `^[A-Za-z_][A-Za-z0-9_]*$`） | 修正 schema 名；非法名不会进入任何 DML/DDL |
-| `event.ErrAdminLockTimeout` | Admin 写操作等待命名空间互斥锁超时（瞬时错误；锁与迁移执行共用） | 退避后重试；检查是否有迁移执行或其他管理写操作持锁（不同 schema 互不阻塞） |
+| `event.ErrAdminLockTimeout` | Admin 写操作等待命名空间互斥锁超时（瞬时错误；锁与迁移执行共用——含未预热 Admin 首次操作时 `ensure` 撞上的迁移锁等待，同键同判） | 退避后重试；检查是否有迁移执行或其他管理写操作持锁（不同 schema 互不阻塞） |
 
 `Verify` 发现问题时返回类型化错误 `*event.VerifyError`，可用 `errors.As` 取回后读取 `Report`；它不是哨兵错误。
 
@@ -976,7 +977,10 @@ runner := event.NewRunner(drv,
   同源、与落库事实一致）、`claim.terminal_failed`（认领侧直接置 failed 数）、
   `lease.abandoned`、`consume` / `handle.duration`、`wake`——全部在 core
   调用边界计量，后端不重复埋同口径操作指标。接管与终态计数只在发生时
-  打点（无零值数据点）。
+  打点（无零值数据点）。注意 `lease.abandoned`（停机放弃：本实例主动
+  放弃租约的前兆观测）与 `claim.takeover`（接管事实：其他实例认领侧的
+  落库事实计数）事件源不同——前者是放弃意图、后者是接管完成，两者
+  不可相加对账。
 - **后端**（scope 缺省模块名）：迁移生命周期 `migrate` /
   `migrate.duration`，发射点在包级 `Migrate` / `Verify`（driver ensure 同
   路径，无重复计量）；`result` 区分
@@ -984,7 +988,9 @@ runner := event.NewRunner(drv,
   `permanent` / `transient`。管理面写操作 `admin.replay`（Counter），发射点
   在 Admin 写方法；`result` 区分
   `ok` / `no_effect` / `canceled` / `lock_timeout` / `error`（与
-  `event.AdminReplayEvent.Result` 同枚举），另带 `schema` 属性。
+  `event.AdminReplayEvent.Result` 同枚举），另带 `schema` 属性；
+  `admin.replay.duration` 直方图（`result` 维度）计量操作入口到返回的
+  全程耗时（含 ensure、锁等待与事务执行）。
 - 属性只含枚举与标识符（`event` / `mode` / `result` / `identity` /
   `schema`），事件 ID 与错误原文不入属性（管理面 slog 审计日志可含
   `event_id` / `consumer_type` 标识——标识符允许入日志；不含事件 payload

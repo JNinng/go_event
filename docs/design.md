@@ -202,10 +202,13 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
   不进 Driver、不挂后端 Driver 类型，不经运行面类型获得——经后端
   `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径）。写路径
   加固（ADR 0010）：**持锁**——重放在事务内持有与迁移执行相同的命名
-  空间互斥锁（键含 schema，与迁移串行化，等待有界，超时返回
-  `ErrAdminLockTimeout`）；**行归属校验即 CAS 本身**——（事件 × 身份）
+  空间互斥锁（键含 schema，与迁移串行化，等待有界且上限经后端选项
+  `WithAdminLockWait` 配置，超时返回 `ErrAdminLockTimeout`——未预热实例
+  首次操作时 ensure 撞上的迁移锁等待与写事务内的锁等待同键同判）；**行
+  归属校验即 CAS 本身**——（事件 × 身份）
   主键 + status 条件 + 构造期固定的命名空间，不命中即不归属；**记录操作
-  来源**——otel 指标（`<scope>.admin.replay`）+ slog 审计日志 + 类型化
+  来源**——otel 指标（`<scope>.admin.replay` 与
+  `<scope>.admin.replay.duration`）+ slog 审计日志 + 类型化
   Observer 事件（`ObserverV3.OnAdminReplay`），均为旁路；**错误可判别**
   ——锁超时（瞬时）、迁移面哨兵（ensure 原样上抛）与连接故障分列，执行
   故障不折叠为 ok=false。
@@ -259,7 +262,7 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 事务入队（可选） | TransactionalAppender    | outbox（[ADR 0012](adr/0012-outbox-transactional-append-and-broadcast-ordering.md)）：调用方在自己的业务事务内追加事件并随事务原子提交/回滚；core 不定义接口——事务载体是后端具体类型（pgxc 为 pgx.Tx、postgrec 为 *sql.Tx、inmem 为缓冲事务模拟），各后端提供 `NewTransactionalAppender` 构造（与 Driver 共享连接与命名空间选项）或经组合对象 Store 聚合，不经运行面类型获得。语义边界：提交与回滚归调用方（库不 begin/commit）；幂等与普通 Append 同口径（同 ID 首写为准）；提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；就近唤醒信号不覆盖事务内发布，广播消费下可能被并发提交的更大 position 越过水位而漏投（§5.2），认领消费不受影响；不触发惰性清理（清理 DELETE 不落入调用方事务）；不发射观测（库侧发射点在提交前，与回滚后的落库事实可能矛盾）；position 同事务内按 INSERT 序分配、不承诺跨事务连续，回滚不回收（Postgres 序列不回收，缺口不进消费契约） |
 | 可观测    | otel 指标 + slog + Observer     | 跟随全局装配（未配置 noop 静默，热路径只打点不打日志）；core 计量 driver 操作与消费编排，后端计量迁移生命周期与管理面写操作（`<scope>.migrate` 与 `<scope>.admin.replay`，发射点各自单一，无重复计量）；类型化 Observer 纯旁路（同步回调、库内 recover）；见 ADR 0008 与 api.md §2.9 |
 | 延迟投递    | RawEnvelope.DeliverAt          | 定时投递（[ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)）：最早投递时刻随信封落库（零值=立即），Fetch / Claim 下推 `deliver_at <= now`（判据时钟由 core 随 FetchQuery.Now / ClaimQuery.Now 下推，过滤在单条操作内完成，ADR 0004）；保留窗口自可投递时刻起算（COALESCE(deliver_at, occurred_at)）——延迟行不因「等待投递」被清理；HeadPosition / position 语义不变；**广播组合边界**：延迟行可被水位越过而不再投递（§5.2），需要定时必达用认领消费；经 Publish 的 `WithDeliverAt` 与事务性入队的 `RawEnvelope.DeliverAt` 均可设置 |
-| 跨实例唤醒（可选） | pgxc Wake                    | 低延迟唤醒（[ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)）：仅信号、不承载投递保证（ADR 0003 边界不变，错过的信号由周期 poll 兜底）。pgxc 原生 LISTEN/NOTIFY——发布侧 INSERT 经 CTE 发 `pg_notify`（仅实际插入行时；通道与 payload 只带 schema 名，不带事件内容；随事务提交可见，事务性入队的信号在提交时刻发出），订阅侧 `Wake` 专用连接 LISTEN `go_event_wake_<schema>`、断线有界退避重连，`Bind(*event.LocalWake)` 桥接为 `NotifyAll` 信号（跨实例信号触发本地已挂起的 Fetch/唤醒等待）；postgrec 退化轮询（database/sql 无驱动无关的 LISTEN 接入）；inmem 无跨实例面（同进程 LocalWake 已覆盖） |
+| 跨实例唤醒（可选） | pgxc Wake                    | 低延迟唤醒（[ADR 0013](adr/0013-delayed-delivery-and-cross-instance-wakeup.md)）：仅信号、不承载投递保证（ADR 0003 边界不变，错过的信号由周期 poll 兜底）。pgxc 原生 LISTEN/NOTIFY——发布侧 INSERT 经 CTE 发 `pg_notify`（仅实际插入行时；通道与 payload 只带 schema 名，不带事件内容；随事务提交可见，事务性入队的信号在提交时刻发出），订阅侧 `Wake` 专用连接 LISTEN `go_event_wake_<schema>`（前缀 + 全名超 63 字节的 schema 走确定性哈希通道名，两侧同源派生必然一致，任意合法 schema 都有通道）、断线有界退避重连，`Bind(*event.LocalWake)` 桥接为 `NotifyAll` 信号（跨实例信号触发本地已挂起的 Fetch/唤醒等待）；postgrec 退化轮询（database/sql 无驱动无关的 LISTEN 接入）；inmem 无跨实例面（同进程 LocalWake 已覆盖） |
 
 ## 7. 仓库布局
 
@@ -476,8 +479,10 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
   ——经后端 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径）；
   `ReplayFailed` 仅对 `failed` 终态重新置为可认领（`done` 不可逆、
   不重放），语义与并发防护见 §5.3；加固约束（ADR 0010）：写路径持与
-  迁移执行共用的命名空间互斥锁（等待有界）、行归属校验即 CAS、操作
-  来源观测（`<scope>.admin.replay` 指标 + slog 审计日志 + Observer 事件，
+  迁移执行共用的命名空间互斥锁（等待有界，上限经后端选项
+  `WithAdminLockWait` 配置）、行归属校验即 CAS、操作
+  来源观测（`<scope>.admin.replay` 与 `<scope>.admin.replay.duration`
+  指标 + slog 审计日志 + Observer 事件，
   均为旁路）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接
   故障分列，执行故障不折叠为 ok=false）。剩余项仍在规划：dead-letter
   处置钩子、存量消费者身份的重命名迁移（§5.1）。失败信息留存
