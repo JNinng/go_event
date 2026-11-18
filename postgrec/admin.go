@@ -12,15 +12,15 @@ import (
 	"github.com/jninng/go_event/postgresschema"
 )
 
-// adminLockWait 是管理写互斥锁的有界等待上限（与迁移锁同一把锁，语义见
-// postgresschema.AcquireExclusiveLock）；测试可通过 export_test.go 缩短。
-var adminLockWait = postgresschema.LockWaitTimeout
-
 // admin 管理面写操作载体（独立类型，不挂在 Driver 上）：复用 Driver 的
 // 连接、命名空间与迁移模式语义（ensure），管理写路径不经 Driver 类型
 // 暴露（design.md §6 三面分离）。
 type admin struct {
 	d *Driver
+
+	// lockWait 是管理写互斥锁的有界等待上限（WithAdminLockWait，缺省同
+	// postgresschema.LockWaitTimeout，语义见 postgresschema.AcquireExclusiveLock）。
+	lockWait time.Duration
 
 	// 观测注入（操作来源记录，ADR 0010）：指标走 otel、日志走 slog、
 	// 类型化 Observer 经 ObserverV3 分发，均为旁路。
@@ -42,11 +42,12 @@ func NewAdmin(db *sql.DB, opts ...Option) event.Admin {
 // Driver 实例（共享 ensure 状态与失败负缓存），NewAdmin 自建实例。
 func newAdminOn(d *Driver, cfg *config) *admin {
 	return &admin{
-		d:      d,
-		logger: cfg.logger,
-		am:     newAdminMetrics(cfg.mp, cfg.scope),
-		obs:    cfg.obs,
-		schema: cfg.schema,
+		d:        d,
+		lockWait: cfg.adminLockWait,
+		logger:   cfg.logger,
+		am:       newAdminMetrics(cfg.mp, cfg.scope),
+		obs:      cfg.obs,
+		schema:   cfg.schema,
 	}
 }
 
@@ -62,11 +63,15 @@ func newAdminOn(d *Driver, cfg *config) *admin {
 // （done / active / retrying）：ok=false、无错误，判别方式统一——需要区分
 // 原因时先经 Inspector.ClaimState 查询。
 //
-// 错误可判别：锁等待超时映射 ErrAdminLockTimeout（瞬时）；迁移面哨兵经
-// ensure 原样上抛；连接 / 驱动故障原样包装。执行故障不得折叠为 ok=false。
+// 错误可判别：锁等待超时映射 ErrAdminLockTimeout（瞬时）——管理写路径的
+// 锁等待覆盖两处，同一把锁同判：写事务内的互斥锁等待，与未预热实例首次
+// 操作时 ensure（Create 模式持迁移锁建结构）撞上的迁移锁等待（同键瞬时，
+// 统一改判管理面哨兵，ADR 0010）；其余迁移面哨兵（权限、定义冲突）与
+// 连接 / 驱动故障经 ensure 原样上抛。执行故障不得折叠为 ok=false。
 func (a *admin) ReplayFailed(ctx context.Context, eventID, consumerType string, now time.Time) (bool, error) {
+	start := time.Now()
 	ok, err := a.replayFailed(ctx, eventID, consumerType, now)
-	a.record(ctx, eventID, consumerType, ok, err)
+	a.record(ctx, eventID, consumerType, ok, err, time.Since(start))
 	return ok, err
 }
 
@@ -77,6 +82,12 @@ func (a *admin) replayFailed(ctx context.Context, eventID, consumerType string, 
 		return false, err
 	}
 	if err := a.d.ensure(ctx); err != nil {
+		// ensure 撞上的迁移锁超时与管理写锁超时是同一把锁的同键瞬时
+		// （未预热实例在迁移持锁期间首调），统一改判管理面哨兵（ADR 0010）；
+		// 其余迁移面哨兵（权限、定义冲突）原样上抛。
+		if errors.Is(err, event.ErrMigrationLockTimeout) {
+			return false, fmt.Errorf("postgrec: admin replay: %w", event.ErrAdminLockTimeout)
+		}
 		return false, err
 	}
 	// 重放事务以 Read Committed 开始（比照迁移事务先例）：避免连接串默认
@@ -90,8 +101,8 @@ func (a *admin) replayFailed(ctx context.Context, eventID, consumerType string, 
 
 	// 命名空间互斥锁：与迁移执行共用同一把 advisory 锁（迁移在整版事务
 	// 内持锁执行 DDL），管理写必须等迁移提交/回滚后才改行——DDL 加列与
-	// 行更新不再竞争表锁，双方等待均有界。
-	if err := postgresschema.AcquireExclusiveLock(ctx, sqlMigrationTx{tx: tx}, a.d.schema, adminLockWait); err != nil {
+	// 行更新不再竞争表锁，双方等待均有界（WithAdminLockWait 配置等待上限）。
+	if err := postgresschema.AcquireExclusiveLock(ctx, sqlMigrationTx{tx: tx}, a.d.schema, a.lockWait); err != nil {
 		if errors.Is(err, event.ErrMigrationLockTimeout) {
 			return false, fmt.Errorf("postgrec: admin replay: %w", event.ErrAdminLockTimeout)
 		}
@@ -117,13 +128,13 @@ WHERE event_id = $1 AND consumer_type = $2 AND status = 'failed'`, a.d.schema),
 	return rows > 0, nil
 }
 
-// record 记录操作来源（观测均为旁路，失败不影响业务结果）：otel 计数 +
-// slog 审计行（操作、事件 × 身份、结果；不含事件 payload 与 last_error
-// 摘要，失败结果附 error.type / error 分类属性）+ 类型化 Observer 事件
-// （ObserverV3 分发）。
-func (a *admin) record(ctx context.Context, eventID, consumerType string, ok bool, err error) {
+// record 记录操作来源（观测均为旁路，失败不影响业务结果）：otel 计数与
+// 耗时（入口到返回全程，含 ensure、锁等待与事务执行）+ slog 审计行（操作、
+// 事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附
+// error.type / error 分类属性）+ 类型化 Observer 事件（ObserverV3 分发）。
+func (a *admin) record(ctx context.Context, eventID, consumerType string, ok bool, err error, elapsed time.Duration) {
 	res := adminResult(ok, err)
-	a.am.record(ctx, a.schema, ok, err)
+	a.am.record(ctx, a.schema, ok, err, elapsed)
 
 	attrs := []any{
 		"op", "replay_failed",

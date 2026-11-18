@@ -78,10 +78,9 @@ func holdMigrationKey(t *testing.T, db *sql.DB, schema string) (release func()) 
 
 // 真实竞争：持锁连接占用命名空间互斥键后，Admin 写与迁移各自有界等待并
 // 返回各自的瞬时锁超时错误（同一把锁串行化双方）；释放后双方恢复成功。
+// Admin 的等待上限经公开选项 WithAdminLockWait 按实例配置。
 func TestAdminReplayMutualExclusionWithMigration(t *testing.T) {
 	db := migrationDB(t)
-	restoreAdmin := postgrec.SetAdminLockWaitForTest(300 * time.Millisecond)
-	defer restoreAdmin()
 	restoreMigrate := postgrec.SetLockWaitTimeoutForTest(300 * time.Millisecond)
 	defer restoreMigrate()
 
@@ -91,7 +90,8 @@ func TestAdminReplayMutualExclusionWithMigration(t *testing.T) {
 		t.Fatalf("provision schema: %v", err)
 	}
 	drv := postgrec.NewDriver(db, postgrec.WithSchema(schema))
-	admin := postgrec.NewAdmin(db, postgrec.WithSchema(schema))
+	admin := postgrec.NewAdmin(db, postgrec.WithSchema(schema),
+		postgrec.WithAdminLockWait(300*time.Millisecond))
 	// 预热 admin 的 ensure（首次操作按迁移模式处理持久结构）：互斥断言
 	// 针对管理写路径的锁等待，而非 ensure 内迁移的锁等待。
 	if ok, err := admin.ReplayFailed(ctx, "mx-1", "mx", time.Now()); ok || err != nil {
@@ -140,6 +140,62 @@ func TestAdminReplayMutualExclusionWithMigration(t *testing.T) {
 			t.Fatalf("migrate after release: %v", err)
 		}
 	})
+}
+
+// 未预热 Admin 在迁移持锁期间首次调用：ensure（Create 模式持迁移锁建
+// 结构）撞上的是迁移锁等待——与管理写锁超时同键瞬时，统一改判管理面
+// 哨兵 ErrAdminLockTimeout（ADR 0010），调用方无需区分首调与预热后的
+// 锁超时。表已就位时（预热路径）互斥断言见 TestAdminReplayMutualExclusionWithMigration。
+func TestAdminReplayUnwarmed_LockHeldByMigration_AdminLockTimeout(t *testing.T) {
+	db := migrationDB(t)
+	restoreMigrate := postgrec.SetLockWaitTimeoutForTest(300 * time.Millisecond)
+	defer restoreMigrate()
+
+	ctx := context.Background()
+	schema := newMigrationSchema(t, db)
+	if err := postgrec.Migrate(ctx, db, postgrec.WithSchema(schema)); err != nil {
+		t.Fatalf("provision schema: %v", err)
+	}
+	// 不预热：fresh Admin 的首次 ReplayFailed 即在持锁窗口内发起。
+	admin := postgrec.NewAdmin(db, postgrec.WithSchema(schema),
+		postgrec.WithAdminLockWait(300*time.Millisecond))
+
+	release := holdMigrationKey(t, db, schema)
+	t.Cleanup(release)
+
+	start := time.Now()
+	ok, err := admin.ReplayFailed(ctx, "uw-1", "uw", time.Now())
+	if ok {
+		t.Fatal("unwarmed replay while migration lock held must not take effect, got ok=true")
+	}
+	if !errors.Is(err, event.ErrAdminLockTimeout) {
+		t.Fatalf("unwarmed replay while lock held = %v, want ErrAdminLockTimeout (remapped from ensure)", err)
+	}
+	if errors.Is(err, event.ErrMigrationLockTimeout) {
+		t.Fatal("ensure lock timeout must not leak as ErrMigrationLockTimeout on the admin surface")
+	}
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Fatalf("lock wait = %v, want bounded under 2s", elapsed)
+	}
+
+	release()
+	// 释放后重放恢复（false, nil）：ensure 对首调的迁移锁超时有 100ms 负
+	// 缓存窗口（瞬时错误指数退避，重映射同样适用于窗口内的缓存错误），
+	// 有界轮询等窗口过期后断言恢复。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ok, err := admin.ReplayFailed(ctx, "uw-1", "uw", time.Now())
+		if err == nil {
+			if ok {
+				t.Fatal("replay after release = ok=true, want no-effect (no failed row)")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replay after release = (%v, %v), want (false, nil) once the ensure retry window expires", ok, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // 并发正向：迁移与 Admin 写同时在同一 schema 上发起，经同一把锁串行化，
@@ -319,6 +375,34 @@ func adminReplayDatapoint(t *testing.T, reader *sdkmetric.ManualReader, scope, r
 	return total
 }
 
+// adminReplayDurationDatapoint 收集 result 属性匹配的
+// <scope>.admin.replay.duration 直方图数据点计数（指标未出现返回 0）。
+func adminReplayDurationDatapoint(t *testing.T, reader *sdkmetric.ManualReader, scope, result string) uint64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	var total uint64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != scope+".admin.replay.duration" {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric %s.admin.replay.duration type %T, want Histogram[float64]", scope, m.Data)
+			}
+			for _, dp := range hist.DataPoints {
+				if v, ok := dp.Attributes.Value("result"); ok && v.AsString() == result {
+					total += dp.Count
+				}
+			}
+		}
+	}
+	return total
+}
+
 // 观测面集成（操作来源记录）：重放结果逐次发射指标 / 日志 / Observer
 // 事件，结果枚举与返回值一致；日志含操作与事件 × 身份。
 func TestAdminReplayObservability(t *testing.T) {
@@ -363,6 +447,9 @@ func TestAdminReplayObservability(t *testing.T) {
 			events[0].EventID != "ob-1" || events[0].ConsumerType != "ob" || events[0].Err != nil {
 			t.Fatalf("observer events = %+v, want one ok event for (ob-1, ob)", events)
 		}
+		if got := adminReplayDurationDatapoint(t, reader, "postgrec", "ok"); got != 1 {
+			t.Fatalf("admin.replay.duration ok count = %d, want 1", got)
+		}
 	})
 
 	t.Run("RepeatedReplay_CountsNoEffect", func(t *testing.T) {
@@ -381,9 +468,9 @@ func TestAdminReplayObservability(t *testing.T) {
 	})
 
 	t.Run("LockTimeout_CountsLockTimeoutAndObservesError", func(t *testing.T) {
-		defer postgrec.SetAdminLockWaitForTest(200 * time.Millisecond)()
 		obs2 := &adminObserverCollector{}
 		locked := postgrec.NewAdmin(db, postgrec.WithSchema(schema),
+			postgrec.WithAdminLockWait(200*time.Millisecond),
 			postgrec.WithMeterProvider(mp), postgrec.WithObserver(obs2))
 		// 预热 ensure（锁占用期间 ensure 的迁移会先撞锁）：预热后互斥
 		// 断言落在管理写路径上。ob-1 已重放为 retrying，无效果。
@@ -399,6 +486,9 @@ func TestAdminReplayObservability(t *testing.T) {
 		}
 		if got := adminReplayDatapoint(t, reader, "postgrec", "lock_timeout"); got != 1 {
 			t.Fatalf("admin.replay lock_timeout count = %d, want 1", got)
+		}
+		if got := adminReplayDurationDatapoint(t, reader, "postgrec", "lock_timeout"); got != 1 {
+			t.Fatalf("admin.replay.duration lock_timeout count = %d, want 1", got)
 		}
 		// 预热重放（无效果）与锁超时重放各发一次事件：取 lock_timeout
 		// 事件断言（恰一次）。

@@ -21,11 +21,3 @@ func SetLockWaitTimeoutForTest(d time.Duration) func() {
 	lockWaitTimeout = d
 	return func() { lockWaitTimeout = old }
 }
-
-// SetAdminLockWaitForTest 缩短管理写互斥锁等待上限（仅测试编译单元可见），
-// 返回恢复函数。
-func SetAdminLockWaitForTest(d time.Duration) func() {
-	old := adminLockWait
-	adminLockWait = d
-	return func() { adminLockWait = old }
-}

@@ -79,8 +79,10 @@
 
 - TODO 契约要求「记录操作来源」。沿 [ADR 0008](0008-observability.md)
   口径补管理面观测：otel 指标 `<scope>.admin.replay`（Counter，`result`=
-  ok/no_effect/canceled/lock_timeout/error 与 `schema` 属性，发射点单一
-  在 Admin 写方法）、slog 审计日志（操作、事件 × 身份、结果；不含事件
+  ok/no_effect/canceled/lock_timeout/error 与 `schema` 属性）与
+  `<scope>.admin.replay.duration`（直方图，`result` 维度，操作入口到返回
+  全程耗时——含 ensure、锁等待与事务执行；发射点单一在 Admin 写方法）、
+  slog 审计日志（操作、事件 × 身份、结果；不含事件
   payload 与 last_error 摘要——标识符 `event_id` / `consumer_type` 允许
   入日志，失败结果附 `error.type` / `error` 分类属性）与类型化 Observer
   事件 `AdminReplayEvent`（新增 `ObserverV3` 扩展接口——嵌入
@@ -95,7 +97,10 @@
 - 执行故障一律经 error 返回，不得折叠为 `ok=false`（既有决策 §3 的边界
   强化）。错误分类与排查入口：
   - `event.ErrAdminLockTimeout`：命名空间互斥锁等待超时，瞬时（退避后
-    重试）；检查是否有迁移执行或其他管理写操作持锁。
+    重试）；检查是否有迁移执行或其他管理写操作持锁。管理写路径的同键
+    锁等待覆盖两处、同判本哨兵：写事务内的互斥锁等待，与未预热实例首次
+    操作时 ensure（Create 模式持迁移锁建结构）撞上的迁移锁等待（统一
+    改判，不留迁移面哨兵泄漏口）。
   - 迁移面哨兵（`ErrInvalidSchema` / `ErrMigrationPermissionDenied` /
     `*event.VerifyError` 等）：经首次操作的迁移模式处理产生，原样上抛，
     处置口径与迁移一致（ADR 0007）。
@@ -151,11 +156,11 @@
   `AdminObserverSetter` 注入）——互斥与操作来源记录是契约约束，注入
   接口缺失即 Fatal。
 - Postgres 后端重放为「事务内取锁 → CAS 更新 → 提交」三步，同一事务
-  保证锁与写原子；管理写锁等待上限独立于迁移锁等待上限
-  （`SetAdminLockWaitForTest` 供测试缩短）。管理写路径的 ensure 先于取锁
-  ——未预热实例在迁移持锁期间的首次调用可能先收到迁移面锁超时
-  （`ErrMigrationLockTimeout`），预热后落在管理面
-  `ErrAdminLockTimeout`；两者均为同键瞬时错误。
+  保证锁与写原子；管理写锁等待上限经公开选项 `WithAdminLockWait` 按实例
+  配置（缺省同迁移锁 `postgresschema.LockWaitTimeout`）。管理写路径的
+  ensure 先于取锁——未预热实例在迁移持锁期间的首次调用，ensure 撞上的
+  迁移锁超时与管理写锁超时是同一把锁的同键瞬时，统一改判管理面哨兵
+  `ErrAdminLockTimeout`：调用方无需区分首调与预热后的锁超时。
 - 加固（§5–§7）随本决策一并落地：互斥经 `postgresschema.
   AcquireExclusiveLock` 与迁移执行器共用实现（单一锁键来源）；观测沿
   ADR 0008 口径扩展（`ObserverV3`、`<scope>.admin.replay`）；哨兵

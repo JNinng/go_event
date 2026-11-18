@@ -138,9 +138,8 @@ func TestPgxcDelayedDeliverySuite(t *testing.T) {
 // 记录由 suiteAdmin 装配（套件注入点），互斥锁等待缩短为 300ms。
 func TestPgxcAdminReplaySuite(t *testing.T) {
 	pool, drv, schema := testPool(t)
-	defer pgxc.SetAdminLockWaitForTest(300 * time.Millisecond)()
 	admin := suiteAdmin{
-		Admin:  pgxc.NewAdmin(pool, pgxc.WithSchema(schema)),
+		Admin:  pgxc.NewAdmin(pool, pgxc.WithSchema(schema), pgxc.WithAdminLockWait(300*time.Millisecond)),
 		pool:   pool,
 		schema: schema,
 	}

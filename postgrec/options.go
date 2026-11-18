@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/jninng/go_event"
+	"github.com/jninng/go_event/postgresschema"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -39,6 +40,10 @@ type config struct {
 	retention time.Duration
 	mode      event.MigrateMode
 	modeSet   bool
+
+	// adminLockWait 是管理写互斥锁的有界等待上限（Admin 写路径专用，
+	// 与迁移锁同一把锁；缺省同 postgresschema.LockWaitTimeout）。
+	adminLockWait time.Duration
 
 	logger *slog.Logger         // 迁移/管理面生命周期日志（缺省构造期快照 slog.Default()）
 	mp     metric.MeterProvider // nil = 未注入（newConfig 快照全局，未装配时即 noop）
@@ -72,12 +77,13 @@ func WithMigrateMode(m event.MigrateMode) Option {
 
 func newConfig(opts []Option) *config {
 	c := &config{
-		schema:    "public",
-		retention: 7 * 24 * time.Hour,
-		mode:      event.MigrateCreate,
-		logger:    slog.Default(),
-		mp:        otel.GetMeterProvider(), // 构造期快照；快照后替换全局不追溯
-		scope:     defaultScope,
+		schema:        "public",
+		retention:     7 * 24 * time.Hour,
+		mode:          event.MigrateCreate,
+		adminLockWait: postgresschema.LockWaitTimeout,
+		logger:        slog.Default(),
+		mp:            otel.GetMeterProvider(), // 构造期快照；快照后替换全局不追溯
+		scope:         defaultScope,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -109,4 +115,12 @@ func WithScopeName(scope string) Option {
 // panic；观测是纯旁路，不改变业务语义。
 func WithObserver(o event.Observer) Option {
 	return func(c *config) { c.obs = o }
+}
+
+// WithAdminLockWait 覆盖管理写互斥锁的有界等待上限（缺省同迁移锁
+// postgresschema.LockWaitTimeout，仅 Admin 写路径生效）：运维按实例的
+// 锁等待预算配置。非正值不阻塞——保留一次 try-lock 后立即返回
+// ErrAdminLockTimeout（瞬时）。
+func WithAdminLockWait(d time.Duration) Option {
+	return func(c *config) { c.adminLockWait = d }
 }

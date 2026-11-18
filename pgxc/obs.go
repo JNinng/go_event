@@ -90,7 +90,8 @@ func (mm *migrationMetrics) record(ctx context.Context, scope, schema string,
 // adminMetrics 是管理面写操作仪表集（发射点单一：admin 写方法）。属性
 // 只有枚举与标识符（result / schema），事件 ID 与错误原文禁入。
 type adminMetrics struct {
-	replay metric.Int64Counter
+	replay         metric.Int64Counter
+	replayDuration metric.Float64Histogram
 }
 
 func newAdminMetrics(mp metric.MeterProvider, scope string) *adminMetrics {
@@ -101,6 +102,8 @@ func newAdminMetrics(mp metric.MeterProvider, scope string) *adminMetrics {
 	am := &adminMetrics{}
 	am.replay, _ = m.Int64Counter(scope+".admin.replay",
 		metric.WithDescription("管理面重放结果计数"), metric.WithUnit("1"))
+	am.replayDuration, _ = m.Float64Histogram(scope+".admin.replay.duration",
+		metric.WithDescription("管理面重放耗时（含 ensure、锁等待与事务执行）"), metric.WithUnit("s"))
 	return am
 }
 
@@ -120,12 +123,16 @@ func adminResult(ok bool, err error) string {
 	}
 }
 
-// record 计量一次管理面重放（ctx 携带 trace 关联）。
-func (am *adminMetrics) record(ctx context.Context, schema string, ok bool, err error) {
+// record 计量一次管理面重放（ctx 携带 trace 关联）：计数带 result 与
+// schema 属性；耗时直方图只带 result（与迁移耗时同口径，schema 不入
+// 耗时维度，控制基数）。
+func (am *adminMetrics) record(ctx context.Context, schema string, ok bool, err error, elapsed time.Duration) {
 	res := adminResult(ok, err)
 	am.replay.Add(ctx, 1, metric.WithAttributes(
 		attribute.String(attrResult, res),
 		attribute.String(attrSchema, schema)))
+	am.replayDuration.Record(ctx, elapsed.Seconds(),
+		metric.WithAttributes(attribute.String(attrResult, res)))
 }
 
 // observeAdminReplay 管理面重放观测旁路分发：经 ObserverV3 类型断言，

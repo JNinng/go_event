@@ -136,9 +136,8 @@ func TestPostgrecDelayedDeliverySuite(t *testing.T) {
 // 记录由 suiteAdmin 装配（套件注入点），互斥锁等待缩短为 300ms。
 func TestPostgrecAdminReplaySuite(t *testing.T) {
 	db, drv, schema := testDB(t)
-	defer postgrec.SetAdminLockWaitForTest(300 * time.Millisecond)()
 	admin := suiteAdmin{
-		Admin:  postgrec.NewAdmin(db, postgrec.WithSchema(schema)),
+		Admin:  postgrec.NewAdmin(db, postgrec.WithSchema(schema), postgrec.WithAdminLockWait(300*time.Millisecond)),
 		db:     db,
 		schema: schema,
 	}
