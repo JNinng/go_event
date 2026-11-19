@@ -17,7 +17,7 @@ import (
 )
 
 // TestMigrationSuite 把 pgxc 接入迁移契约测试载体。TEST_POSTGRES_DSN 未设置
-// 时整体跳过；schema 名带随机后缀，须以 -p 1 串行执行。
+// 时整体跳过；schema 名带随机后缀，并发执行亦不撞名。
 func TestMigrationSuite(t *testing.T) {
 	eventtest.RunMigrationSuite(t, &suiteBackend{pool: migrationPool(t)})
 }

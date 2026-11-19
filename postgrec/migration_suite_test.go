@@ -17,7 +17,7 @@ import (
 )
 
 // TestMigrationSuite 把 postgrec 接入迁移契约测试载体。TEST_POSTGRES_DSN 未
-// 设置时整体跳过；schema 名带随机后缀，须以 -p 1 串行执行。
+// 设置时整体跳过；schema 名带随机后缀，并发执行亦不撞名。
 func TestMigrationSuite(t *testing.T) {
 	eventtest.RunMigrationSuite(t, &suiteBackend{db: migrationDB(t)})
 }
