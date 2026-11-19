@@ -198,8 +198,7 @@ func newFakeBackend(snap Snapshot, tryLocks ...bool) (*fakeConnector, *fakeTx) {
 // planExecs 返回已执行的计划语句（去掉首条 lock_timeout 设置）。
 func planExecs(tx *fakeTx) []string { return tx.execs[1:] }
 
-// consistentSnapshot 构造基线与 v2 对象齐全的快照（不含 v3 的
-// event.deliver_at；仅缺对象不阻断接管校验）。
+// consistentSnapshot 构造与期望对象集完全一致的快照（含基线与 v2/v3 版本列）。
 func consistentSnapshot() Snapshot {
 	toColStates := func(cols []Column) []ColumnState {
 		states := make([]ColumnState, 0, len(cols))
@@ -214,7 +213,7 @@ func consistentSnapshot() Snapshot {
 	return Snapshot{
 		SchemaExists: true,
 		Tables: map[string]TableState{
-			TableEvent:      {RelKind: "r", Columns: toColStates(EventColumns())},
+			TableEvent:      {RelKind: "r", Columns: toColStates(append(EventColumns(), EventVersionColumns()...))},
 			TableEventClaim: {RelKind: "r", Columns: toColStates(append(EventClaimColumns(), EventClaimVersionColumns()...))},
 		},
 		Constraints: map[string]ConstraintState{
@@ -324,6 +323,30 @@ func TestMigrate(t *testing.T) {
 
 	t.Run("ConsistentObjects_Migrate_ReplaysFullPlanAndCommits", func(t *testing.T) {
 		conn, tx := newFakeBackend(consistentSnapshot())
+		if err := Migrate(context.Background(), conn, schema); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		if got := planExecs(tx); !reflect.DeepEqual(got, plan) {
+			t.Fatalf("replayed statements = %d, want full plan (%d) in order", len(got), len(plan))
+		}
+		if !tx.committed {
+			t.Fatal("tx must be committed")
+		}
+	})
+
+	t.Run("MissingVersionColumn_Migrate_ReplaysFullPlanAndCommits", func(t *testing.T) {
+		// 缺版本列属可修复问题，不阻断接管校验：全量幂等计划照常重放并收敛。
+		snap := consistentSnapshot()
+		table := snap.Tables[TableEvent]
+		cols := make([]ColumnState, 0, len(table.Columns))
+		for _, c := range table.Columns {
+			if c.Name != "deliver_at" {
+				cols = append(cols, c)
+			}
+		}
+		table.Columns = cols
+		snap.Tables[TableEvent] = table
+		conn, tx := newFakeBackend(snap)
 		if err := Migrate(context.Background(), conn, schema); err != nil {
 			t.Fatalf("migrate: %v", err)
 		}
