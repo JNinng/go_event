@@ -23,7 +23,8 @@ Redis 等），以及契约测试套件 eventtest。需要决定仓库与依赖�
   （如 `postgrec/v0.1.0`），发布后从 go.work 移除本地引用。
 - module path 为 `github.com/jninng/go_event`；子 module 为
   `github.com/jninng/go_event/postgrec`、`github.com/jninng/go_event/pgxc`、
-  `github.com/jninng/go_event/eventtest`。
+  `github.com/jninng/go_event/eventtest`（`postgresschema` 方言包子 module
+  由 [ADR 0007](0007-migration-mode-and-protocol.md) 后续引入）。
 
 > 注记：观测依赖决策已由 [ADR 0008](0008-observability.md) 取代——core 直接
 > 依赖 otel metric API 并跟随全局装配，不再采用可注入 `Metrics` 接口。

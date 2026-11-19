@@ -34,8 +34,8 @@ st := postgrec.NewStore(db, postgrec.WithRetention(7*24*time.Hour))
 | --- | --- | --- |
 | 幂等 Append（首写为准） | 原生 | `event` 表 PRIMARY KEY (id) + `ON CONFLICT DO NOTHING` |
 | 元数据透传 | 原生 | `jsonb` 列原样存取 |
-| 广播 Fetch（类型过滤 + 水位 + 升序 + 限额） | 原生 | `WHERE type = $1 AND position > $2 ORDER BY position LIMIT $3`（bigserial 全序位置） |
-| 广播基线锚点（HeadPosition） | 原生 | `SELECT COALESCE(MAX(position), 0) WHERE type = $1`（(type, position) 索引即时求值，单条语句快照；无该类型事件时返回空串） |
+| 广播 Fetch（类型过滤 + 水位 + 升序 + 限额） | 原生 | `WHERE type = $1 AND position > $2 AND (deliver_at IS NULL OR deliver_at <= $3) ORDER BY position LIMIT $4`（bigserial 全序位置） |
+| 广播基线锚点（HeadPosition） | 原生 | `SELECT COALESCE(MAX(position), 0) FROM event WHERE type = $1`（(type, position) 索引即时求值，单条语句快照；无该类型事件时返回空串） |
 | 认领互斥 / 接管 / SKIP LOCKED | 原生 | `FOR UPDATE SKIP LOCKED` + `event_claim` 唯一约束 + `ON CONFLICT DO UPDATE`（CAS 谓词） |
 | 接管计入重试、达上限置 failed；接管/终态计数随 ClaimResult 返回 | 原生 | 认领事务内终态标记（影响行数）+ 认领 UPDATE 接管标记（拾取窗口内按旧行状态区分接管与 retrying 重认领）；计数与落库事实一致，可经 Inspector 对账（ADR 0011） |
 | 心跳 / 迟到 Complete / Fail 不生效（CAS） | 原生 | `lease_token` 条件更新，不命中静默返回 |

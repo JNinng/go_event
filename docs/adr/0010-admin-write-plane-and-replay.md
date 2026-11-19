@@ -161,8 +161,9 @@
   ensure 先于取锁——未预热实例在迁移持锁期间的首次调用，ensure 撞上的
   迁移锁超时与管理写锁超时是同一把锁的同键瞬时，统一改判管理面哨兵
   `ErrAdminLockTimeout`：调用方无需区分首调与预热后的锁超时。
-- 加固（§5–§7）随本决策一并落地：互斥经 `postgresschema.
-  AcquireExclusiveLock` 与迁移执行器共用实现（单一锁键来源）；观测沿
+- 加固（§5–§7）随本决策一并落地：互斥经
+  `postgresschema.AcquireExclusiveLock` 与迁移执行器共用实现（单一锁键
+  来源）；观测沿
   ADR 0008 口径扩展（`ObserverV3`、`<scope>.admin.replay`）；哨兵
   `ErrAdminLockTimeout` 进 core errors.go。鉴权仍由使用方负责；无自动
   down；迁移侧无台账、无需 reset/stamp 入口（口径不变）。

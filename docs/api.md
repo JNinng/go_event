@@ -151,7 +151,7 @@ func WithIDGenerator(g IDGenerator) PublisherOption
 func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
     payload T, opts ...PublishOption) error
 
-// PublishNoPayload 无参事件糖，等价 Publish(ctx, ev, NoPayload{})。
+// PublishNoPayload 无参事件糖，等价 Publish(ctx, p, ev, NoPayload{})。
 func (p *Publisher) PublishNoPayload(ctx context.Context, ev Event[NoPayload],
     opts ...PublishOption) error
 
@@ -728,8 +728,9 @@ func WithObserver(o Observer) Option            // 缺省无观察者（当前�
 
 // 迁移指标：<scope>.migrate（Counter）+ <scope>.migrate.duration（Histogram），
 // 属性 result=ok/canceled/lock_timeout/permission_denied/verify_conflict/
-// permanent/transient 与 schema；Migrate 成功打 Info 日志「migration applied」
-//（schema、mode、duration_seconds）。
+// permanent/transient 与 schema；Migrate 成功打 Info 日志
+// 「<pkg>: migration applied」（pkg 为 pgxc / postgrec；属性 schema、mode、
+// duration_seconds）。
 //
 // 管理面指标：<scope>.admin.replay（Counter）+ <scope>.admin.replay.duration
 // （Histogram，result 维度；操作入口到返回全程耗时——含 ensure、锁等待与

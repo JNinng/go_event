@@ -274,11 +274,13 @@ module path 为 `github.com/jninng/go_event`，子 module 为
 go_event/
 ├── doc.go / event.go / publisher.go / runner.go / driver.go /
 │   admin.go / inspector.go / errorsummary.go / codec.go /
-│   errors.go / localwake.go / migrate.go                    # core：契约与编排、迁移契约类型
+│   errors.go / localwake.go / migrate.go / observability.go
+│                                                          # core：契约与编排、迁移契约类型
 ├── postgrec/        # Postgres 后端（标准库）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── pgxc/            # Postgres 后端（pgx v5）：event/event_claim 表、SKIP LOCKED、迁移执行
 ├── postgresschema/  # Postgres 方言 DDL 单一事实源：版本计划、期望对象、共享执行器（无驱动依赖）
-├── eventtest/       # 契约测试套件：inmem Driver + RunSuite/RunRetentionSuite/RunDelayedDeliverySuite/RunMigrationSuite/RunInspectorSuite/RunAdminReplaySuite/RunStoreSuite/RunTransactionalAppendSuite
+├── eventtest/       # 契约测试套件：RunSuite/RunRetentionSuite/RunDelayedDeliverySuite/RunMigrationSuite/RunInspectorSuite/RunAdminReplaySuite/RunStoreSuite/RunTransactionalAppendSuite
+│   ├── inmem/       # 进程内 Driver（契约测试与使用方本地测试）
 │   └── simmigrate/  # 迁移契约测试的进程内模拟 backend（语句边界故障注入）
 └── docs/
     ├── api.md       # API 文档

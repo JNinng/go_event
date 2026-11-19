@@ -34,8 +34,8 @@ st := pgxc.NewStore(pool, pgxc.WithRetention(7*24*time.Hour))
 | --- | --- | --- |
 | 幂等 Append（首写为准） | 原生 | `event` 表 PRIMARY KEY (id) + `ON CONFLICT DO NOTHING` |
 | 元数据透传 | 原生 | `jsonb` 列原样存取 |
-| 广播 Fetch（类型过滤 + 水位 + 升序 + 限额） | 原生 | `WHERE type = $1 AND position > $2 ORDER BY position LIMIT $3`（bigserial 全序位置） |
-| 广播基线锚点（HeadPosition） | 原生 | `SELECT COALESCE(MAX(position), 0) WHERE type = $1`（(type, position) 索引即时求值，单条语句快照；无该类型事件时返回空串） |
+| 广播 Fetch（类型过滤 + 水位 + 升序 + 限额） | 原生 | `WHERE type = $1 AND position > $2 AND (deliver_at IS NULL OR deliver_at <= $3) ORDER BY position LIMIT $4`（bigserial 全序位置） |
+| 广播基线锚点（HeadPosition） | 原生 | `SELECT COALESCE(MAX(position), 0) FROM event WHERE type = $1`（(type, position) 索引即时求值，单条语句快照；无该类型事件时返回空串） |
 | 认领互斥 / 接管 / SKIP LOCKED | 原生 | `FOR UPDATE SKIP LOCKED` + `event_claim` 唯一约束 + `ON CONFLICT DO UPDATE`（CAS 谓词） |
 | 接管计入重试、达上限置 failed；接管/终态计数随 ClaimResult 返回 | 原生 | 认领事务内终态标记（影响行数）+ 认领 UPDATE 接管标记（拾取窗口内按旧行状态区分接管与 retrying 重认领）；计数与落库事实一致，可经 Inspector 对账（ADR 0011） |
 | 心跳 / 迟到 Complete / Fail 不生效（CAS） | 原生 | `lease_token` 条件更新，不命中静默返回 |
@@ -46,7 +46,7 @@ st := pgxc.NewStore(pool, pgxc.WithRetention(7*24*time.Hour))
 | 惰性清理 | 原生 | 超窗且无活跃租约（无论终态）行删除，`event_claim` 经 FK ON DELETE CASCADE 级联；保留窗口自可投递时刻起算（`COALESCE(deliver_at, occurred_at)`，延迟行不因「等待投递」被清理，ADR 0013）；墙钟节流，随 Append 机会性执行 |
 | 延迟投递（deliver\_at） | 原生 | 版本计划 v3 加列 `event.deliver_at timestamptz` 可空（零值/NULL = 立即，ADR 0013）：`WithDeliverAt` / `RawEnvelope.DeliverAt` 落库透传，Fetch / Claim 下推 `deliver_at <= now`（判据时钟由 core 下推，过滤在单条操作内完成）；HeadPosition / position 语义不变；广播组合边界——延迟行可被水位越过而不再投递，需要定时必达用认领消费。契约套件 `eventtest.RunDelayedDeliverySuite` 全过 |
 | 跨实例唤醒（LISTEN/NOTIFY） | 原生 | `NewWake` 构造跨实例唤醒总线（ADR 0013）：发布侧 INSERT 经 CTE 发 `pg_notify`（通道 `go_event_wake_<schema>`——前缀 + 全名超 63 字节的 schema 走确定性哈希通道名，两侧同源派生必然一致，任意合法 schema 都有通道；payload 只带 schema 名，仅实际插入行时发出；`pg_notify` 随事务提交可见，AppendTx 的信号在提交时刻发出）；订阅侧 `Wake` 专用连接 LISTEN、断线有界退避重连（100ms 起、封顶 30s），`Bind(*event.LocalWake)` 桥接为 `NotifyAll` 信号（跨实例信号触发本地已挂起的 Fetch/唤醒等待）。仅信号、不承载投递保证（ADR 0003 边界不变）：错过的信号（断连窗口、通道满、无订阅）由周期 poll 兜底；延迟行的信号在插入时发出、不判断 deliver\_at（消费侧空拉一趟由轮询兜底）。观测保持最小：无新指标，连接生命周期走 `WithLogger` 日志 |
-| 事务性入队 outbox（TransactionalAppender） | 原生 | `NewTransactionalAppender` 构造（与 Driver 共享连接与命名空间选项；不经运行面类型获得，ADR 0012）：`AppendTx(ctx, tx pgx.Tx, e)` 把事件 INSERT 加入调用方业务事务（INSERT 语句与普通 Append 共用同一份定义，同 ID 首写为准），随事务原子提交/回滚——提交与回滚归调用方，事务回滚不产生事件行；提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；不触发惰性清理（清理 DELETE 不落入调用方事务）、不发射观测（库侧发射点在提交前，与回滚后的事实可能矛盾）；就近唤醒信号不覆盖事务内发布，广播消费下可能被并发提交的更大 position 越过水位而漏投（ADR 0006 广播位置语义重审定稿，ADR 0012——认领消费不受影响）；position 回滚不回收，缺口不进消费契约。契约套件 `eventtest.RunTransactionalAppendSuite` 全过 |
+| 事务性入队 outbox（TransactionalAppender） | 原生 | `NewTransactionalAppender` 构造（与 Driver 共享连接与命名空间选项；不经运行面类型获得，ADR 0012）：入口 ensure 在调用方事务外的池连接执行、失败上抛；`AppendTx(ctx, tx pgx.Tx, e)` 把事件 INSERT 加入调用方业务事务（INSERT 语句与普通 Append 共用同一份定义，同 ID 首写为准），随事务原子提交/回滚——提交与回滚归调用方，事务回滚不产生事件行；提交前对外不可见（Fetch / Claim / HeadPosition 只锚已提交行）；不触发惰性清理（清理 DELETE 不落入调用方事务）、不发射观测（库侧发射点在提交前，与回滚后的事实可能矛盾）；就近唤醒信号不覆盖事务内发布，广播消费下可能被并发提交的更大 position 越过水位而漏投（ADR 0006 广播位置语义重审定稿，ADR 0012——认领消费不受影响）；position 回滚不回收，缺口不进消费契约。契约套件 `eventtest.RunTransactionalAppendSuite` 全过 |
 
 ## 迁移能力
 

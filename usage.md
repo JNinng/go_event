@@ -126,7 +126,7 @@ func main() {
 
 | 后端 | 载体 | 参考 |
 | --- | --- | --- |
-| `postgrec` | 标准库 `database/sql`（连接与驱动注册由使用方完成，如 pgx/v5/stdlib） | [§8.2](#82-postgrecdatabase_sql)、[postgrec/README.md](postgrec/README.md) |
+| `postgrec` | 标准库 `database/sql`（连接与驱动注册由使用方完成，如 pgx/v5/stdlib） | [§8.2](#82-postgrecdatabasesql)、[postgrec/README.md](postgrec/README.md) |
 | `inmem` | 进程内实现，不碰真实存储 | [§8.6](#86-inmem)、[§9.1](#91-用-inmem-测试业务逻辑) |
 
 ## 2. 核心模型
@@ -158,6 +158,7 @@ type Envelope[T any] struct {
     Payload    T                 // 强类型载荷
     Metadata   map[string]string // 原样透传，如 trace_id
     OccurredAt time.Time
+    DeliverAt  time.Time // 最早投递时刻（WithDeliverAt 设置），零值 = 立即（见 §4.3）
 
     Attempts    int  // 本次投递的尝试序号（含本次）；广播恒为 0（见 §6.7）
     LastAttempt bool // 本次是否为最后一次尝试；广播恒为 false（见 §6.7）
@@ -195,7 +196,7 @@ type Driver interface {
     Append(ctx context.Context, e RawEnvelope) error
     Fetch(ctx context.Context, q FetchQuery) ([]RawEnvelope, error)
     HeadPosition(ctx context.Context, typ string) (string, error)
-    Claim(ctx context.Context, q ClaimQuery) ([]Lease, error)
+    Claim(ctx context.Context, q ClaimQuery) (ClaimResult, error)
     Heartbeat(ctx context.Context, h HeartbeatRequest) error
     Complete(ctx context.Context, c CompleteRequest) error
     Fail(ctx context.Context, f FailRequest) error
@@ -947,7 +948,7 @@ func TestMyBackendRetention(t *testing.T) {
 ——未配置 otel 时 provider 即 noop，静默零成本；应用侧 `otel.SetMeterProvider`
 后，之后构造的组件自动接上。决策与口径分界见
 [ADR 0008](docs/adr/0008-observability.md)，签名与指标清单见
-[api.md §2.9](docs/api.md#29-可观测otel-指标--slog--observer)。
+[api.md §2.9](docs/api.md#29-可观测otel-指标--slog-日志--observer)。
 
 ### 13.1 装配示例
 
