@@ -4,8 +4,12 @@
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-11-19
+
 ### 新特性
 
+- **版本计划与共享迁移执行器（取代基线步骤模型）**：postgresschema 新增版本计划（`Plan` / `Version` / `PlannedStatements`，迁移语句与期望对象 1:1 配对），pgxc / postgrec 共享同一执行器——迁移锁有界等待 → 接管校验（仅缺对象放行，冲突即拒）→ 整版单事务执行，失败整体回滚、重跑收敛。**无台账模型**：版本号只存在于计划中，升级随部署隐式发生（错误摘要 v2 加列与延迟事件 v3 加列均由此自动补齐）；手工 SQL 脚本改由同一计划派生，整段可重放。决策记录见 [ADR 0007](docs/adr/0007-migration-mode-and-protocol.md)（重写）。
+- **可观测面（otel 指标 + slog + 类型化 Observer）**：core 新增构造选项 `WithMeterProvider` / `WithScopeName` / `WithObserver`（构造期快照；缺省跟随 otel 全局 Provider，未配置即 noop 静默）。运行面指标：publish / fetch / claim / heartbeat / complete / fail 计数与耗时、`claim.granted`、`lease.abandoned`、`consume.duration` / `handle.duration`、wake `sent` / `dropped`（补齐本地唤醒丢弃不可见）；runner 启动/停止生命周期日志；既有日志属性键对齐 OTel（`error.type` + `error`，消息文本不变）。类型化 Observer 旁路非破坏性演进（`Observer` → `ObserverV4` 嵌入链，回调同步执行、库内 recover）；handler panic 类型化为 `handlerPanicError` 供观测分类，业务行为不变。后端（pgxc / postgrec）仅迁移生命周期埋点：result 七档分类（ok / canceled / lock_timeout / permission_denied / verify_conflict / permanent / transient），成功打 Info `migration applied`。core 首次引入 `go.opentelemetry.io/otel` 依赖（未配置即 noop）。决策记录见 [ADR 0008](docs/adr/0008-observability.md)。
 - **延迟事件（deliver\_at 定时投递）**：事件信封新增可选投递时刻字段 `DeliverAt`（`RawEnvelope` / `Envelope`，零值 = 立即可投递）；发布侧经新选项 `WithDeliverAt(t)` 设置，事务性入队复用 `RawEnvelope.DeliverAt`（Publish 与 AppendTx 均可设置）。未到期行不满足 Fetch / Claim 的下推条件（`deliver_at <= now`，判据时钟由 core 下推——`FetchQuery` 新增 `Now` 字段，Claim 沿用 `ClaimQuery.Now`；过滤在单条操作内完成）；过去时刻等价立即，不报错。**保留窗口自可投递时刻起算**（清理判据 `COALESCE(deliver_at, occurred_at)`）：延迟行不因「等待投递」被清理，零值行语义不变、无需数据回填。**广播组合边界（写死）**：延迟行可被内存水位越过而到期后不再广播投递（与 ADR 0012 乱序边界同源），需要定时必达用认领消费。Postgres 后端由版本计划 v3 自动加列（`event.deliver_at timestamptz` 可空，升级随部署隐式发生）；inmem 同形模拟。HeadPosition / position 语义不变。决策记录见 [ADR 0013](docs/adr/0013-delayed-delivery-and-cross-instance-wakeup.md)。
   - `eventtest` 新增 `RunDelayedDeliverySuite` 契约套件（零值/过去时刻立即、到期边界含到时刻、Fetch / Claim 到期前过滤、信封透传、水位边界用例），`RunRetentionSuite` 增保留期组合用例，`RunTransactionalAppendSuite` 增 AppendTx 延迟用例，`RunSuite` 增 Publish 路径用例。
 - **跨实例低延迟唤醒（pgxc LISTEN/NOTIFY）**：pgxc 新增 `Wake`（`NewWake` 构造即后台监听、`Bind(*event.LocalWake)` 桥接、`Close()` 释放）：发布侧事件 INSERT 经 CTE 发 `pg_notify`（通道 `go_event_wake_<schema>`，通道与 payload 只带 schema 名、不带事件内容；仅实际插入行时发出，幂等冲突不重发；`pg_notify` 随事务提交可见——AppendTx 的信号在提交时刻发出）；订阅侧专用连接 LISTEN（经连接池 Acquire 持有一条不归还），断线按有界退避重连（100ms 起、封顶 30s）并重新 LISTEN。收到通知后向绑定的 `LocalWake` 注入 `NotifyAll` 信号（core 新增导出桥接方法，向本实例全部已订阅类型发信号）——跨实例信号触发本地已挂起的 Fetch / 唤醒等待立即拉取/认领，读取与认领仍走后端存储；**仅信号、不承载投递保证**（ADR 0003 边界不变），错过的信号（断连窗口、通道满、无订阅）由周期 poll 兜底。延迟行的信号在插入时发出、不判断 deliver\_at（消费侧空拉一趟由轮询兜底）。非法 schema / 通道名超 63 字节 / 连接池为 nil 时监听不启动（信号退化由轮询兜底）。**观测保持最小**：无新指标（效果由既有 fetch / claim 轮次指标承载），连接生命周期走 `WithLogger` 日志。postgrec 不做实现、退化轮询（database/sql 无驱动无关的 LISTEN 接入，ADR 0013 §4）；inmem 无跨实例面（同进程 LocalWake 已覆盖）。决策记录见 [ADR 0013](docs/adr/0013-delayed-delivery-and-cross-instance-wakeup.md)。
@@ -36,6 +40,7 @@
 - `postgresschema.Diff` 对缺失基线列的报告类别由 `missing` 改为 `outdated`（迁移不修改既有表，须人工处置）；版本加列缺失仍为 `missing`，可由迁移自动补齐。计划升级至 v2（`event_claim` 加 `last_error` / `failed_at`）。
 - `eventtest.RunSuite` 要求 Driver 实现 `eventtest.ClaimStateReader`（套件据它断言错误摘要落库事实）；`eventtest/inmem` 已原生实现。
 - **`FetchQuery` 新增 `Now` 字段**（v0.x 允许）：延迟事件到期判据的时钟，由 core 下推；直接构造 `FetchQuery` 的调用方未设置 `Now`（零值）时，非零 `DeliverAt` 的行不可见（判据时钟未推进），零值 `DeliverAt` 行不受影响。`eventtest` 全部套件与三后端已同步。
+- `postgresschema` 删除 `Baseline` / `Step` / `MigrationPath`（P1 台账与 fast/step 双路径否决），`FaultPoint` 粒度改为语句边界；迁移模型由版本计划与共享执行器取代（上文首条），v0.x 允许破坏性变更。
 
 ### 文档
 
@@ -45,5 +50,8 @@
 - 新增 [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)：管理面写操作的承载形态（独立 `Admin`、不经 `Driver` 类型暴露）与 failed 手工重放语义的决策记录，含加固口径（与迁移的命名空间互斥、操作来源观测、错误分类）。
 - 新增 [ADR 0011](docs/adr/0011-claim-result-and-takeover-counting.md)：`Claim` 返回认领轮事实（`ClaimResult`）与接管/终态计数口径的决策记录；[ADR 0008](docs/adr/0008-observability.md) 补充接管指标与 `ObserverV4`（解除「无接管专属指标」的已知口径限制）。
 - 新增 [ADR 0012](docs/adr/0012-outbox-transactional-append-and-broadcast-ordering.md)：outbox 事务性入队的承载形态（core 不定义接口、各后端 `TransactionalAppender`）与 ADR 0006 广播位置语义重审定稿（事务内发布下广播投递为尽力而为、认领不受影响；观测不发射、清理不落调用方事务、position 回滚不回收）的决策记录。
+- usage.md 新增 §13 可观测（装配示例、指标口径、Observer 旁路、测试断言）与 §10 选项速查行；api.md 新增 §2.9 可观测（选项 / Observer / 指标清单）。
+- 新增 LICENSE（MIT），README 增许可证一节并同步状态与路线。
 
-[Unreleased]: https://github.com/JNinng/go_event/compare/v0.1.1...HEAD
+[v0.2.0]: https://github.com/JNinng/go_event/compare/v0.1.1...v0.2.0
+[Unreleased]: https://github.com/JNinng/go_event/compare/v0.2.0...HEAD
