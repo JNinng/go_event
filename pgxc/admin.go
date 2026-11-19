@@ -54,22 +54,11 @@ func newAdminOn(d *Driver, cfg *config) *admin {
 }
 
 // ReplayFailed 把（事件 × 消费者身份）的 failed 终态认领行重新置为可认领
-// （手工重放，语义见 event.Admin.ReplayFailed）。
-//
-// 执行次序：ensure（迁移模式语义）→ 事务内取命名空间互斥锁（与迁移执行
-// 同一把 advisory 锁，键含 schema——写与迁移互斥、不同 schema 互不阻塞，
-// 有界等待）→ 单条条件更新（CAS，归属校验：事件 × 身份主键 + status=
-// 'failed'）→ 提交（锁随事务释放）。重放置 retrying、claim_count=0、清
-// lease_token、lease_until / next_eligible_at 置为 now、failed_at 清空、
-// last_error 保留（ADR 0009）。命中 0 行即行不存在或非 failed 终态
-// （done / active / retrying）：ok=false、无错误，判别方式统一——需要区分
-// 原因时先经 Inspector.ClaimState 查询。
-//
-// 错误可判别：锁等待超时映射 ErrAdminLockTimeout（瞬时）——管理写路径的
-// 锁等待覆盖两处，同一把锁同判：写事务内的互斥锁等待，与未预热实例首次
-// 操作时 ensure（Create 模式持迁移锁建结构）撞上的迁移锁等待（同键瞬时，
-// 统一改判管理面哨兵，ADR 0010）；其余迁移面哨兵（权限、定义冲突）与
-// 连接 / 驱动故障经 ensure 原样上抛。执行故障不得折叠为 ok=false。
+// （手工重放；完整契约与错误判别见 event.Admin.ReplayFailed，执行次序与
+// 锁语义见 README 能力边界表 Admin 行）：事务内单条 CAS 条件更新
+// （status='failed' 才命中）置 retrying、claim_count=0、清租约、failed_at
+// 清空、last_error 保留（ADR 0009）。锁等待超时——含未预热实例 ensure 撞
+// 上的迁移锁等待，同键同判——映射瞬时 ErrAdminLockTimeout，其余错误原样上抛。
 func (a *admin) ReplayFailed(ctx context.Context, eventID, consumerType string, now time.Time) (bool, error) {
 	start := time.Now()
 	ok, err := a.replayFailed(ctx, eventID, consumerType, now)
@@ -128,8 +117,8 @@ WHERE event_id = $1 AND consumer_type = $2 AND status = 'failed'`, a.d.schema),
 
 // record 记录操作来源（观测均为旁路，失败不影响业务结果）：otel 计数与
 // 耗时（入口到返回全程，含 ensure、锁等待与事务执行）+ slog 审计行（操作、
-// 事件 × 身份、结果；不含事件 payload 与 last_error 摘要，失败结果附
-// error.type / error 分类属性）+ 类型化 Observer 事件（ObserverV3 分发）。
+// 事件 × 身份、结果；不含事件 payload 与 last_error 摘要，锁超时与执行故
+// 障附 error.type / error 属性）+ 类型化 Observer 事件（ObserverV3 分发）。
 func (a *admin) record(ctx context.Context, eventID, consumerType string, ok bool, err error, elapsed time.Duration) {
 	res := adminResult(ok, err)
 	a.am.record(ctx, a.schema, ok, err, elapsed)

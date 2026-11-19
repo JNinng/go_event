@@ -33,12 +33,11 @@ type Driver interface {
 	HeadPosition(ctx context.Context, typ string) (string, error)
 
 	// Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、退避期满，
-	// 且 DeliverAt 已到期」的行（Postgres 实现为 FOR UPDATE SKIP LOCKED）。
-	// 已 done / failed 的行不可认领；接管（租约过期）认领递增重试计数
-	// （ADR 0006），达 q.RetryLimit 的行置 failed 终态、不再认领（详见
-	// ClaimQuery）。返回 ClaimResult 汇总本轮落库事实：发放的租约与
-	// 接管/终态计数——计数必须与落库状态一致，供观测面计量（design.md
-	// §9.2）。错误时返回零值 ClaimResult。
+	// 且 DeliverAt 已到期」的行；已 done / failed 的行不可认领；接管
+	// （租约过期）认领递增重试计数（ADR 0006），达 q.RetryLimit 的行置
+	// failed 终态、不再认领（详见 ClaimQuery）。返回 ClaimResult 汇总
+	// 本轮落库事实：计数与落库状态一致，供观测面计量（design.md §9.2）；
+	// 错误时返回零值 ClaimResult。
 	Claim(ctx context.Context, q ClaimQuery) (ClaimResult, error)
 
 	// Heartbeat 续租：仅当属主凭证匹配时生效；租约过期或已被接管后
@@ -52,11 +51,9 @@ type Driver interface {
 	// Fail 记失败：递增重试计数，按 f.Backoff 递增退避置为再次可认领；
 	// 计数达 f.RetryLimit 时置 failed 终态——递增计数、退避调度与终态
 	// 判定在单次 Fail 内原子完成（ADR 0006）；仅当属主凭证匹配时生效
-	// （CAS），迟到的 Fail 不递增、不污染新属主状态。本次 Fail 使行进入
-	// failed 终态时，后端把清洗后的 f.Error 摘要（SanitizeErrorSummary）
-	// 与时刻写入 last_error / failed_at；重试中（未到终态）与迟到的 Fail
-	// 均不写摘要与时间。认领侧的接管终态（达 RetryLimit 直接置 failed）
-	// 只写 failed_at，不写摘要（无本次处理错误）。
+	// （CAS），迟到的 Fail 不递增、不污染新属主状态。f.Error 摘要
+	// （经 SanitizeErrorSummary 清洗）与 failed_at 仅终态写入，口径见
+	// design.md §5.3：认领侧接管终态只写 failed_at（无本次处理错误）。
 	Fail(ctx context.Context, f FailRequest) error
 }
 
@@ -86,22 +83,16 @@ type ClaimQuery struct {
 	Now          time.Time // 租约过期、退避与延迟投递（deliver_at）判据的时钟，由 core 下推
 }
 
-// ClaimResult 一次认领轮的结果与落库事实汇总（design.md §9.2）。三类
-// 计数语义：
+// ClaimResult 一次认领轮的结果与落库事实汇总（design.md §9.2、ADR 0011）。
 //   - Leases：本次成功发放的租约；
-//   - Takeovers：本次认领中「接管过期租约」而发放的数量，含接管后直接
-//     置 failed 的终态接管；无主首次认领与 Fail 退避期满的重认领
-//     （retrying，Fail 时已计入）不算接管；
-//   - TerminalFailed：本次认领中因 claim_count 达 RetryLimit 被认领动作
-//     直接置 failed 的数量，独立于 Takeovers 统计；一次接管既发放又达
-//     上限置 failed 时同时计入两者。
+//   - Takeovers：本次「接管过期租约」而发放的数量，含接管后直接置
+//     failed 的终态接管；无主首次认领与 Fail 退避期满的重认领不算；
+//   - TerminalFailed：本次认领中因 claim_count 达 RetryLimit 被直接置
+//     failed 的数量，独立于 Takeovers 统计；一次终态接管同时计入两者
+//     （认领侧置 failed 必经接管路径，恒有 TerminalFailed ≤ Takeovers）。
 //
-// 当前认领语义下，置 failed 的下推条件要求租约已过期（下推条件见
-// ClaimQuery.RetryLimit），故认领侧终态必经接管路径，恒有
-// TerminalFailed ≤ Takeovers。计数与落库事实严格一致（接管计数覆盖发放
-// 与终态两条路径），可经 Inspector.ClaimState / claim_count 对账。
-// len(Leases) == 0 表示本轮无发放（nil 性不作承诺——后端空轮次可能返回
-// nil 或非 nil 空切片，调用方以 len 判断）。
+// 计数与落库事实严格一致，可经 Inspector.ClaimState / claim_count 对账；
+// len(Leases) == 0 表示本轮无发放（nil 性不作承诺，调用方以 len 判断）。
 type ClaimResult struct {
 	Leases         []Lease // 本次发放的租约（至多 q.Limit 条；批次内顺序不承诺）
 	Takeovers      int     // 接管发放数量（含终态接管）

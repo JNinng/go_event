@@ -222,7 +222,7 @@ func TestCrossInstanceNotify_OverlongSchema_HashedChannelWakes(t *testing.T) {
 }
 
 // 连接断开恢复：终止 LISTEN 专用连接（模拟断连），有界退避重连并重新
-// LISTEN（ADR 0013 §3）；重连窗口内的信号丢失由轮询兜底（ADR 0003），
+// LISTEN（ADR 0013 §2）；重连窗口内的信号丢失由轮询兜底（ADR 0003），
 // 恢复后的信号路径照常端到端可达。重连完成以第二次「已连接」日志为
 // 确定性观察点（日志在 LISTEN 成功后发出），其后发布必达。
 func TestListenerConnectionKilled_ReconnectsAndWakesAgain(t *testing.T) {

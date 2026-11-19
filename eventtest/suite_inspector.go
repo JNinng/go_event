@@ -15,8 +15,7 @@ import (
 //   - 分档计数：「待处理」= 该身份无认领行（口径写进 Inspector 契约）；
 //     done 为归档档，五档互斥且完备。
 //   - failed 列表：偏移分页（首页/末页/越界/零 Limit/负 Offset），按
-//     failed_at 降序、同刻按事件 ID 升序；摘要与终态时刻随行返回
-//     （ADR 0009 口径：接管终态只写 failed_at）。
+//     failed_at 降序、同刻按事件 ID 升序；摘要与终态时刻随行（ADR 0009）。
 //
 // 结果仅在保留窗口内可见：超窗行被清理后查询自然不可见，Inspector 不做
 // 额外过滤（清理资格已由 RunRetentionSuite 契约约束，此处不重复）。

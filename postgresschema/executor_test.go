@@ -198,7 +198,8 @@ func newFakeBackend(snap Snapshot, tryLocks ...bool) (*fakeConnector, *fakeTx) {
 // planExecs 返回已执行的计划语句（去掉首条 lock_timeout 设置）。
 func planExecs(tx *fakeTx) []string { return tx.execs[1:] }
 
-// consistentSnapshot 构造与期望对象完全一致的快照（全量接管场景）。
+// consistentSnapshot 构造基线与 v2 对象齐全的快照（不含 v3 的
+// event.deliver_at；仅缺对象不阻断接管校验）。
 func consistentSnapshot() Snapshot {
 	toColStates := func(cols []Column) []ColumnState {
 		states := make([]ColumnState, 0, len(cols))

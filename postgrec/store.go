@@ -8,21 +8,15 @@ import (
 
 // Store 后端组合对象（便利构造，非能力面）：一个对象同时持有运行面
 // Driver、只读查询面 Inspector、管理面 Admin 与事务性入队
-// TransactionalAppender。各面共享同一连接与命名空间（同一 schema、
-// 同一迁移模式语义），选项解析一次、经同一份配置传导——观测各面共享
-// 同一口径（迁移与管理面指标同一 scope，Admin 用同一 logger 与 Observer）。
+// TransactionalAppender。各面共享同一连接与命名空间（同一 schema、同一
+// 迁移模式语义），选项解析一次、经同一份配置传导，观测口径一致。
 //
 // 组合而非合并接口（design.md §6 三面分离）：Store 不实现任何能力接口，
-// core 也不定义 event.Store 接口——NewPublisher / NewRunner 仍接收
-// Store.Driver，各面语义与独立构造完全等价。Store 持有 Admin 是容器
-// 聚合，不是把管理写路径挂到 Driver 类型上：对 Driver 做 event.Admin
-// 类型断言仍不成立，管理写路径只经本组合的 Admin 字段或 NewAdmin 获得
-// （ADR 0010），鉴权由使用方负责；持有 TransactionalAppender 同为容器
-// 聚合——事务载体是本包具体类型 *sql.Tx，core 不定义 outbox 接口
-// （ADR 0012）。
+// core 也不定义 event.Store 接口，各面语义与独立构造完全等价。Admin 与
+// TransactionalAppender 是容器聚合——写路径不经 Driver 类型获得（对
+// Driver 做相应类型断言不成立；ADR 0010 / 0012），鉴权由使用方负责。
 //
-// 构造不触发迁移：各面沿 NewDriver 现状，首次操作时按迁移模式处理持久
-// 结构（缺省 Create 持迁移锁幂等应用版本计划）。
+// 构造不触发迁移：首次操作时按迁移模式处理持久结构。
 type Store struct {
 	// Driver 运行面：与 NewDriver 等价（Store 内唯一实例）。
 	Driver event.Driver

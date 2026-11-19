@@ -11,23 +11,12 @@ import (
 )
 
 // Admin 管理面重放契约用例（design.md §5.3/§9.2、ADR 0010）：failed 终态
-// 的手工重放由独立写面 Admin 承载（不进 Driver、不挂 Driver 类型）。
-//   - 仅 failed 可重放：重放后可被再次认领并完成（端到端）；claim_count
-//     归零（再 Claim 的 Attempts 语义合法）；再 Fail 到上限进入 failed 后
-//     可再次重放（循环）。
-//   - 非 failed 一律无效果且判别统一（ok=false）：done 不可逆、active
-//     拒绝且行不变（原租约凭证仍有效）、retrying 拒绝且退避窗口不变、
-//     未知事件 / 身份同判别；被重新认领后迟到的重放不污染新属主行。
-//   - 重放落库事实（ADR 0009 口径）：last_error 保留、failed_at 清空；
-//     经 ClaimStateReader 断言。
-//   - 并发防护：单条条件更新（CAS，仅命中 status='failed'）——并发重放
-//     恰好一次生效。
-//   - 互斥（契约约束「所有写操作必须持相应锁」）：写路径持与迁移执行相同
-//     的命名空间互斥锁——锁占用期间有界等待并返回 ErrAdminLockTimeout
-//     （瞬时）、行不被改写，锁释放后重放生效。
-//   - 操作来源记录（观测旁路）：每次重放发射 AdminReplayEvent（ok /
-//     no_effect / lock_timeout 结果），事件 × 身份字段与调用一致。
-//
+// 的手工重放由独立写面 Admin 承载（不进 Driver、不挂 Driver 类型）。契约
+// 要点：仅 failed 可重放，非 failed 一律无效果且判别统一（ok=false）；重放
+// 落库事实按 ADR 0009（last_error 保留、failed_at 清空，经 ClaimStateReader
+// 断言）；并发重放经单条 CAS（仅命中 status='failed'）恰好一次生效；写路径
+// 持与迁移执行相同的命名空间互斥锁（占用期间有界等待返回 ErrAdminLockTimeout、
+// 行不被改写）；每次重放发射 AdminReplayEvent 观测事件（操作来源记录）。
 // 重放窗口 = 保留窗口：超窗行被清理后与「行不存在」同判别（清理资格已由
 // RunRetentionSuite 契约约束，此处不重复）。
 

@@ -9,16 +9,11 @@ import (
 // TransactionalAppender，各面共享同一份内存状态与互斥锁。
 //
 // 组合而非合并接口（design.md §6 三面分离）：Store 不实现任何能力接口，
-// core 也不定义 event.Store 接口——NewPublisher / NewRunner 仍接收
-// Store.Driver，各面语义与独立构造完全等价。Store 持有 Admin 是容器
-// 聚合，不是把管理写路径挂到 Driver 类型上（ADR 0010）；持有
-// TransactionalAppender 同为容器聚合（事务载体类型为本包具体类型，
-// core 不定义 outbox 接口，ADR 0012）。
-//
-// Admin 为缺省构造（无 Observer、缺省锁等待）：需要观测注入或缩短锁
-// 等待的测试可经 NewAdmin(st.Driver, ...) 构造等价 Admin 替换——与
-// Store 的 Driver 共享同一份内存状态与互斥锁（进程内无 otel / slog，
-// 观测仅 Observer 旁路）。
+// core 也不定义 event.Store 接口，各面语义与独立构造完全等价（签名见
+// docs/api.md §4 Store 块）；Admin 与 TransactionalAppender 为容器聚合，
+// 不经运行面类型获得（ADR 0010 / 0012）。Admin 为缺省构造（无 Observer、
+// 缺省锁等待），需观测注入或缩短锁等待可经 NewAdmin(st.Driver, ...)
+// 构造等价 Admin 替换（共享同一份内存状态与互斥锁，进程内观测仅 Observer 旁路）。
 type Store struct {
 	// Driver 运行面：与 New 等价（Store 内唯一实例）。
 	Driver event.Driver

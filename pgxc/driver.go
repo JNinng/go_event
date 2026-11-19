@@ -212,7 +212,6 @@ func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
 	if err != nil {
 		return err
 	}
-	// 幂等 Append：同 ID 首写为准，不覆盖、不重投（design.md §4）。
 	if err := d.execAppend(ctx, d.pool.Exec, e, meta); err != nil {
 		return fmt.Errorf("pgxc: append: %w", err)
 	}
@@ -297,18 +296,11 @@ WHERE c.event_id = e.id AND e.type = $1 AND c.consumer_type = $2
 	}
 	terminalFailed := int(terminalTag.RowsAffected())
 
-	// 2) 原子认领（单语句两个数据修改 CTE 共享同一拾取窗口）：picked 按
-	//    position 升序拾取至多 Limit 条可认领行并锁定事件行（SKIP LOCKED
-	//    降低并发争用，design.md §5.3）；延迟事件以 q.Now 判定到期
-	//    （deliver_at <= now，ADR 0013 §1），未到期行不进拾取窗口。无主与
-	//    retrying 重认领走 INSERT（接管不计入——Fail 时已计入，ADR 0006），
-	//    active 过期租约走 UPDATE 接管（计入重试）。takeover 标记来自
-	//    拾取快照的旧行状态，RETURNING 随行带回，供接管计数汇总。过滤在
-	//    认领时单条操作内下推（ADR 0004）。已知边界：快照路由为 active
-	//    （只走 takeover）的行若在 UPDATE 执行时被旧属主迟到 Fail 翻成
-	//    retrying 且退避未期满，guard 重查不命中则本轮不发放、下轮再认领
-	//    ——与旧单语句实现非逐点等价（旧实现在零退避下当轮按 retrying
-	//    发放），语义更安全，at-least-once 不破坏（ADR 0011）。
+	// 2) 原子认领（单语句两个数据修改 CTE 共享同一拾取窗口）：延迟事件按 q.Now 判定到期（deliver_at
+	//    <= now，ADR 0013 §1），未到期行不进拾取窗口；无主与 retrying 重认领走 INSERT（Fail 时已计入，
+	//    接管不再计数，ADR 0006），active 过期租约走 UPDATE 接管（计入重试）。已知边界：快照为 active
+	//    的行若在 UPDATE 执行时被旧属主迟到 Fail 翻成 retrying 且退避未期满，本轮不发放、下轮再认领
+	//    （ADR 0011，at-least-once 不破坏）。
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 WITH picked AS (
 	SELECT e.id, c.status

@@ -9,18 +9,15 @@ import (
 	"github.com/jninng/go_event"
 )
 
-// TransactionalAppender 事务性事件入队（outbox 可选面，不进 Driver 契约，
-// ADR 0012）：调用方在自己的业务事务内调用 AppendTx，事件与业务写共享
-// 同一事务，随事务原子提交/回滚；提交与回滚归调用方。形态与 Admin 同款
-// ——经 NewTransactionalAppender 构造或经组合对象 Store 聚合，不经运行面
-// 类型获得。
+// TransactionalAppender 事务性事件入队（outbox 可选面，core 不定义接口，
+// ADR 0012；语义边界见 docs/design.md §6「事务入队」行）：调用方在自己的
+// 业务事务内调用 AppendTx，事件与业务写共享同一事务，随事务原子提交/
+// 回滚；提交与回滚归调用方。形态与 Admin 同款——经 NewTransactionalAppender
+// 构造或经组合对象 Store 聚合，不经运行面类型获得。
 //
-// 进程内事务为最小模拟：AppendTx 在 Driver 锁内分配 position 并缓冲（对
-// Fetch / Claim / HeadPosition 不可见——隔离性），Commit 在单次锁内原子
-// 应用全部缓冲行，Rollback 丢弃缓冲；position 在 AppendTx 时分配、回滚不
-// 回收（与 Postgres 序列不回收的行为对齐，ADR 0012 §5，缺口不进入契约）。
-// 幂等与普通 Append 同口径（同 ID 首写为准）：AppendTx 时查已提交行与同
-// 事务缓冲，Commit 时对交错提交的行重查首写为准。
+// 进程内事务为最小模拟：AppendTx 缓冲、Commit 原子应用、Rollback 丢弃，
+// position 分配即消耗、回滚不回收（与 Postgres 序列不回收对齐，
+// ADR 0012 §5）；幂等与普通 Append 同口径（同 ID 首写为准）。
 type TransactionalAppender struct {
 	d *Driver
 }

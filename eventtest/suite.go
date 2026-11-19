@@ -1,18 +1,13 @@
 // Package eventtest 契约测试套件：接口的语义就是这套测试，新后端必须
 // 全过（design.md §1、§9.1）。RunSuite 覆盖公共、广播读取、认领消费与
-// core 编排语义；RunRetentionSuite 覆盖保留窗口惰性清理资格（design.md
-// §5.2；保留窗口自可投递时刻起算，ADR 0013）；RunDelayedDeliverySuite
-// 覆盖延迟事件（deliver_at 定时投递、到期边界、水位组合边界，ADR 0013）；
-// RunMigrationSuite 经 MigrationBackend 适配接口覆盖初始化面
-// （Migrate/Verify、三种迁移模式、导出物、并发首启与锁语义、Lock=none
-// 变体、语句边界故障注入）；RunInspectorSuite 覆盖只读查询面
-// event.Inspector（可选能力，按类型断言探测，ADR 0005）；RunStoreSuite
-// 覆盖后端组合对象 Store 的三面同源（便利构造，各面完整语义仍由上述
-// 套件约束）；RunTransactionalAppendSuite 覆盖 outbox 事务性入队（可选
-// 面，经 TxSession 适配注入事务载体，ADR 0012）。用例级清单以
-// 各 Run 入口的注册表为准。
-//
-// 用例命名遵循三段式「条件_动作_预期结果」。
+// core 编排语义；RunRetentionSuite / RunDelayedDeliverySuite 覆盖保留窗
+// 口清理资格与延迟事件（design.md §5.2、ADR 0013）；RunMigrationSuite
+// 经 MigrationBackend 覆盖持久结构初始化面；RunInspectorSuite /
+// RunAdminReplaySuite / RunTransactionalAppendSuite 覆盖只读查询面
+// （ADR 0005）、管理面重放（ADR 0010）与 outbox 事务性入队（ADR 0012）
+// 三个可选面；RunStoreSuite 覆盖组合对象 Store 的三面同源（便利构造，
+// 各面完整语义仍由上述套件约束）。用例级清单以各 Run 入口的注册表为
+// 准；用例命名遵循三段式「条件_动作_预期结果」。
 package eventtest
 
 import (
@@ -69,7 +64,7 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("RetryLimitFail_Fail_TerminalNoReclaim", func(t *testing.T) { testFailRetryLimit(t, d) })
 
 	// ---- Fail 错误摘要落库口径（docs/design.md §5.3；经 ClaimStateReader
-	// ---- 断言落库事实）----
+	// 断言落库事实）----
 	reader, ok := d.(ClaimStateReader)
 	if !ok {
 		t.Fatalf("driver %T must implement ClaimStateReader: the error summary "+

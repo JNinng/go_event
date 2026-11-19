@@ -481,8 +481,9 @@ func (r *Runner) pollClaim(ctx context.Context, s *subscription) {
 		return
 	}
 	// 接管与终态计数随 ClaimResult 返回，与落库事实一致（design.md §9.2）；
-	// 各自条件打点（仅计数非零），不产生空轮次的零值数据点。接管可见性
-	// 补齐 ADR 0008 的已知口径限制（此前 Attempts 混合 Fail 重试与过期接管）。
+	// 各自条件打点（仅计数非零），不产生空轮次的零值数据点。接管/终态
+	// 独立计量，补齐 ADR 0008 已知口径限制（Attempts 混合 Fail 重试与
+	// 过期接管，不因本计量改变）。
 	if result.Takeovers > 0 || result.TerminalFailed > 0 {
 		cAttrs := metric.WithAttributes(
 			attribute.String(attrEvent, s.typ),

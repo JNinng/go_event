@@ -695,7 +695,8 @@ func TestMigrationMidwayFailureRollback(t *testing.T) {
 		if _, err := db.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
 			t.Fatalf("create schema: %v", err)
 		}
-		// 此时 event 表与其索引已在同一事务内创建，必须整体回滚。
+		// 同名类型令迁移在建 event_claim 时中途失败：event 表与其索引已在
+		// 同一事务内先行建出，失败后必须整体回滚。
 		if _, err := db.ExecContext(ctx,
 			"CREATE TYPE "+schema+".event_claim AS ENUM ('x')"); err != nil {
 			t.Fatalf("create conflicting type: %v", err)

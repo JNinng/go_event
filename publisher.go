@@ -32,8 +32,8 @@ type Publisher struct {
 
 // PublisherOption 生产者构造选项。与 RunnerOption 同为接口形态：
 // 同时实现两侧 apply 方法的选项（如 WithLocalWake 与 codec 选项）可注入
-// 任一构造器；其余选项传错构造器会编译报错（docs/api.md §2.3/§2.5
-// 同名选项）。
+// 任一构造器；其余选项传错构造器会编译报错（两侧选项清单见
+// docs/api.md §2.3/§2.5）。
 type PublisherOption interface {
 	applyPublisher(*Publisher)
 }

@@ -535,7 +535,7 @@ func TestAdminReplayObservability(t *testing.T) {
 	})
 
 	t.Run("ExecutionFault_CountsError", func(t *testing.T) {
-		// None 模式 + 缺表：ensure 失败为执行故障（非无效果）。
+		// None 模式 + 缺表：ensure 放行，重放 DML 直面 42P01——执行故障（非无效果）。
 		fresh := newMigrationSchema(t, db)
 		faulted := postgrec.NewAdmin(db, postgrec.WithSchema(fresh),
 			postgrec.WithMigrateMode(event.MigrateNone), postgrec.WithMeterProvider(mp),

@@ -1,22 +1,13 @@
 // Package inmem 构造进程内 event.Driver：供 eventtest 契约测试与使用方
 // 本地测试/示例使用。条件过滤在内存模拟，能力边界注明「模拟」档
-// （ADR 0005）。同一实现同时提供只读查询面 event.Inspector（经
-// NewInspector 构造或对 Driver 类型断言探测）：查询口径与 Postgres
-// 后端一致，返回落库事实、不做租约过期推断。认领随 ClaimResult 返回
-// 接管与终态计数（内存计数，口径与 Postgres 后端一致、与落库状态可
-// 对账，ADR 0011）。延迟事件（DeliverAt）在内存模拟同一到期判据
-// （deliver_at <= now，ADR 0013）。管理写路径由独立 Admin
-// 承载（NewAdmin，与 Driver 共享同一份内存状态，不挂 Driver 类型）：
-// failed 事件手工重放，语义与 Postgres 后端一致——写路径持与迁移执行
-// 等价的进程内互斥锁（本进程无迁移执行，契约等价形态）并发射类型化
-// Observer 事件（进程内不接 otel / slog）。事务性入队（outbox 可选面）由
-// TransactionalAppender 承载（NewTransactionalAppender 构造，与 Driver
-// 共享同一份内存状态，不挂 Driver 类型）：最小缓冲事务模拟，Commit 原子
-// 应用、Rollback 丢弃，position 分配即消耗（与 Postgres 序列对齐，
-// ADR 0012）。NewStore 提供组合对象
-// （便利构造，非能力面）：一个对象持有 Driver / Inspector / Admin /
-// TransactionalAppender，各面共享同一份内存状态与互斥锁。就近唤醒为
-// 同进程 LocalWake 语义（无跨实例面）。
+// （ADR 0005）。同一实现提供只读查询面 event.Inspector（NewInspector
+// 构造或类型断言探测）、管理写面 event.Admin（NewAdmin 构造，failed
+// 事件手工重放）、事务性入队面 TransactionalAppender（outbox 可选面，
+// NewTransactionalAppender 构造）与组合对象 Store（NewStore 构造，便利
+// 构造非能力面）：各面共享同一份内存状态与互斥锁，语义与 Postgres 后端
+// 一致，逐面契约见 docs/api.md §4 与 docs/design.md §6。延迟事件
+// （DeliverAt）在内存模拟同一到期判据（deliver_at <= now，ADR 0013）；
+// 就近唤醒为同进程 LocalWake 语义（无跨实例面）。
 package inmem
 
 import (

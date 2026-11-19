@@ -62,14 +62,11 @@ func NewAdmin(d event.Driver, opts ...AdminOption) event.Admin {
 }
 
 // ReplayFailed 把（事件 × 消费者身份）的 failed 终态行重新置为可认领
-// （语义见 event.Admin.ReplayFailed）。执行次序与 Postgres 后端一致：
-// 有界等待取得互斥锁（进程内无迁移执行，锁为契约等价形态）→ 单次持锁的
-// 条件更新（仅改写 status='failed' 的行，CAS；归属校验即 CAS 本身）→
-// 释放。重放置 retrying、claim_count=0、清 lease_token、lease_until /
-// next_eligible 置为 now、failed_at 清空、last_error 保留（ADR 0009）。
-// 非 failed 行（done / active / retrying）与不存在的键一律 ok=false 且不
-// 改动（判别方式统一，需区分原因先经 Inspector.ClaimState 查询）。锁等待
-// 超时返回 event.ErrAdminLockTimeout（瞬时），执行故障不折叠为 ok=false。
+// （语义见 event.Admin.ReplayFailed；字段级结果见 docs/design.md §6）：
+// 仅 failed 行生效，非 failed 行与不存在的键一律 ok=false 且不改动；
+// 重放置 retrying、claim_count=0、清租约、next_eligible 置 now、
+// failed_at 清空、last_error 保留（ADR 0009）；锁等待超时返回
+// event.ErrAdminLockTimeout（瞬时），执行故障不折叠为 ok=false。
 func (a *Admin) ReplayFailed(ctx context.Context, eventID, consumerType string, now time.Time) (bool, error) {
 	ok, err := a.replayFailed(ctx, eventID, consumerType, now)
 	a.record(eventID, consumerType, ok, err)

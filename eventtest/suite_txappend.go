@@ -22,14 +22,11 @@ type TxSession interface {
 }
 
 // RunTransactionalAppendSuite 运行 outbox 事务性入队契约测试（可选面，
-// ADR 0012）：业务事务与事件入队原子提交/回滚、提交前对外不可见、提交
-// 后广播/认领可见、乱序边界（并发业务事务交错提交下广播可能漏投、认领
-// 不受影响——ADR 0006 广播位置语义重审的定稿口径）。
-//
-// d 与 beginTx 须同源（同一后端、同一命名空间——套件用 d 的 Fetch/Claim/
-// HeadPosition 断言事务外可见性）。beginTx 为 nil、返回 nil TxSession
-// 或装配缺失按先例（RunAdminReplaySuite）Fatal 终止——提供事务性入队的
-// 后端必须全过本套件。
+// ADR 0012）：原子提交/回滚、提交前对外不可见、提交后广播/认领可见、
+// 乱序边界与延迟事件（乱序边界为 ADR 0012 对 ADR 0006 广播位置语义
+// 重审后的定稿口径）。d 与 beginTx 须同源（同一后端、同一命名空间，
+// 事务外可见性经 d 断言）；装配缺失沿 RunAdminReplaySuite 先例 Fatal
+// 终止——提供事务性入队的后端必须全过本套件。
 func RunTransactionalAppendSuite(t *testing.T, d event.Driver,
 	beginTx func(t *testing.T) TxSession) {
 	if beginTx == nil {

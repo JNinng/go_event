@@ -10,7 +10,7 @@ import (
 )
 
 // migrationResult 分类单元测试：迁移生命周期指标的 result 枚举是观测
-// 契约，逐档断言（锁超时/权限/定义冲突单列，其余按永久/瞬时归类）。
+// 契约，逐档断言（取消、锁超时/权限/定义冲突单列，其余按永久/瞬时归类）。
 func TestMigrationResult_ClassifyByErrorKind(t *testing.T) {
 	cases := []struct {
 		name string

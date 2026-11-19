@@ -1,22 +1,15 @@
 // Package pgxc 是 go_event 的 Postgres 后端，基于 pgx v5 连接池
-// （*pgxpool.Pool）。event / event_claim 两表、FOR UPDATE SKIP LOCKED
-// 认领、惰性清理；与 postgrec 共享同一套能力与选项语义（docs/api.md §3）。
+// （*pgxpool.Pool）：event / event_claim 两表、FOR UPDATE SKIP LOCKED 认领、
+// 惰性清理；与 postgrec 共享同一套能力与选项语义（docs/api.md §3）。
 //
-// 可选能力面（均不经运行面类型获得，与各自 Driver 共享连接与命名空间
-// 选项）：只读查询面 Inspector（NewInspector 或对 Driver 类型断言探测）、
-// 管理面 Admin（NewAdmin，写路径不挂 Driver 类型，ADR 0010）、事务性
-// 入队 TransactionalAppender（NewTransactionalAppender，调用方在自己的
-// pgx.Tx 业务事务内 AppendTx，随事务原子提交/回滚，ADR 0012）、跨实例
-// 唤醒 Wake（NewWake 构造、Bind 桥接 LocalWake，LISTEN/NOTIFY 仅信号、
-// 不承载投递保证，ADR 0013）。延迟投递（event.deliver_at，WithDeliverAt /
-// RawEnvelope.DeliverAt）为 Driver 语义内字段，未到期行不满足 Fetch /
-// Claim 下推条件。
+// 可选能力面（Inspector / Admin / TransactionalAppender / Wake 与延迟投递）
+// 均不经运行面类型获得，经各自构造函数（NewInspector / NewAdmin /
+// NewTransactionalAppender / NewWake）接入，与 Driver 共享连接与命名空间
+// 选项；各自契约见本目录 README.md「能力边界表」。
 //
-// 持久结构按 NewDriver 的迁移模式处理：缺省 Create 在首次使用时持迁移锁
-// 幂等应用版本计划全量语句（基线与各版本，升级随部署隐式发生，协议见
-// docs/adr/0007）；Verify 只读校验，None 不建也不校验——后两种模式要求
-// 表已由部署流程创建。运行账号只授 DML 权限时用 Verify / None；Create
-// 需要 DDL 权限。
+// 持久结构按迁移模式在首次使用时处理：缺省 Create 持迁移锁幂等应用版本
+// 计划（需 DDL 权限）；Verify 只读校验、None 不建不校验——两者要求表已
+// 由部署流程创建，运行账号只授 DML 权限。
 package pgxc
 
 import (

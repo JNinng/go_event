@@ -5,23 +5,16 @@ import (
 	"time"
 )
 
-// Inspector 只读查询面（可选接口，不加入 Driver）：面向排障与观测的
-// 三类查询——（事件 × 消费者身份）状态、按身份的状态分档计数、failed
-// 事件分页列表。设计口径见 design.md §6/§9.2：运行面 Driver、查询面
-// Inspector 与管理面 Admin 是三个分离的面，只读与写操作分离；Inspector
-// 不定义任何写路径。
+// Inspector 只读查询面（可选接口，不加入 Driver）：面向排障与观测的三类
+// 查询——（事件 × 消费者身份）状态、按身份的状态分档计数、failed 事件
+// 分页列表；与运行面 Driver、管理面 Admin 三面分离（design.md §6）。
 //
-// 能力探测（ADR 0005）：Inspector 不进入 Driver 契约，调用方对后端
-// Driver 做 event.Inspector 类型断言探测（提供该能力的后端其 Driver
-// 同时实现本接口），或经后端的 NewInspector 显式构造——与各自 Driver
-// 共享连接与命名空间选项。
+// 能力探测（ADR 0005）：对后端 Driver 做 event.Inspector 类型断言探测
+// （提供该能力的后端其 Driver 同时实现本接口），或经后端 NewInspector
+// 显式构造——与各自 Driver 共享连接与命名空间选项。
 //
-// 边界（硬边界，写进契约）：
-//   - 只读：不产生任何簿记，不参与认领/完成/心跳路径，不做租约过期
-//     推断——查询返回落库事实（认领行有无与 status 列）。
-//   - 保留窗口：结果仅在保留窗口内可见（design.md §5.2）。超窗且无
-//     活跃租约的行被惰性清理删除后，查询结果自然不再可见，Inspector
-//     不做任何额外过滤。
+// 硬边界：只读，不产生任何簿记、不做租约过期推断——查询返回落库事实；
+// 结果仅在保留窗口内可见（design.md §5.2）。
 type Inspector interface {
 	// ClaimState 返回（事件 × 消费者身份）认领行的当前状态与重试计数。
 	// ok 为 false 表示该身份对该事件无认领行——事件不存在、已超保留
@@ -32,15 +25,10 @@ type Inspector interface {
 
 	// CountStates 按消费者身份对某事件类型做状态分档计数：待处理 /
 	// 重试中 / processing / failed / done 五档互斥且完备，合计等于该
-	// 类型的事件总数（每（事件 × 身份）恰处一档）。分档口径与
-	// Claim/Fail/Complete 的落库事实严格对齐：
-	//   - Pending：该类型事件中该身份无认领行的数量——「待处理」的
-	//     口径即此，而非「退避中」；
-	//   - Retrying：认领行 status='retrying'（Fail 未达终态，退避中）；
-	//   - Processing：认领行 status='active'（该身份落库持有租约；
-	//     租约是否已过期不改变本档——接管由认领路径发生）；
-	//   - Failed / Done：认领行 status='failed' / 'done' 终态；done 为
-	//     归档档，不计入其余四档。
+	// 类型的事件总数，分档口径与 Claim/Fail/Complete 的落库事实严格
+	// 对齐（docs/api.md §2.10）——Pending 即「该身份无认领行」而非
+	// 「退避中」；processing 按落库 status='active' 分档，租约是否
+	// 已过期不改变本档。
 	CountStates(ctx context.Context, typ, consumerType string) (StateCounts, error)
 
 	// FailedEvents 返回 failed 终态事件的分页列表（含错误摘要与终态
@@ -83,16 +71,12 @@ type StateCounts struct {
 // FailedQuery failed 事件分页列表条件。Type 与 ConsumerType 为空串表示
 // 不限（跨类型 / 跨身份列出全部 failed 行）。
 //
-// 分页语义（偏移分页，边界写死）：
-//   - Offset < 0 视为 0；Limit <= 0 返回空列表（nil）且不发起查询；
-//   - 首页：Offset = 0 返回排序后的前 Limit 条；末页：剩余不足 Limit
-//     条时返回剩余条（可少于 Limit）；越界：Offset 不小于结果总数时
-//     返回空列表（非错误）；
-//   - 排序固定为 failed_at 降序（最新在前），同一时刻按事件 ID 升序
-//     保证确定性；
-//   - 稳定性边界：偏移分页以每次查询时刻的数据为准，无快照——跨页
-//     间隙发生的终态变化（新增 failed、超窗清理、管理面重放）可能
-//     造成跨页重复或遗漏。
+// 分页语义（偏移分页，边界写死）：Offset < 0 视为 0；Limit <= 0 返回空
+// 列表（nil）且不发起查询；末页剩余不足 Limit 条时返回剩余条（可少于
+// Limit）；越界（Offset 不小于结果总数）返回空列表（非错误）。排序固定
+// 为 failed_at 降序（最新在前），同一时刻按事件 ID 升序保证确定性。
+// 稳定性边界：以每次查询时刻的数据为准，无快照——跨页间隙发生的终态
+// 变化（新增 failed、超窗清理、管理面重放）可能造成跨页重复或遗漏。
 type FailedQuery struct {
 	Type         string
 	ConsumerType string
