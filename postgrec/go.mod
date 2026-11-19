@@ -4,9 +4,9 @@ go 1.26.8
 
 require (
 	github.com/jackc/pgx/v5 v5.7.6
-	github.com/jninng/go_event v0.1.1
-	github.com/jninng/go_event/eventtest v0.1.1
-	github.com/jninng/go_event/postgresschema v0.1.1
+	github.com/jninng/go_event v0.2.0
+	github.com/jninng/go_event/eventtest v0.2.0
+	github.com/jninng/go_event/postgresschema v0.2.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk/metric v1.47.0
