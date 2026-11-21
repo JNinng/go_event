@@ -25,7 +25,7 @@ import (
 func provisionFailedRow(t *testing.T, drv event.Driver, id, typ, consumerType string) event.Lease {
 	t.Helper()
 	ctx := context.Background()
-	if err := drv.Append(ctx, event.RawEnvelope{
+	if _, err := drv.Append(ctx, event.RawEnvelope{
 		ID: id, Type: typ, Payload: []byte(`{}`), OccurredAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("append: %v", err)
@@ -208,7 +208,7 @@ func TestAdminReplayAndMigrate_ConcurrentBothSucceed(t *testing.T) {
 	schema := newMigrationSchema(t, db)
 	admin := postgrec.NewAdmin(db, postgrec.WithSchema(schema))
 	drv := postgrec.NewDriver(db, postgrec.WithSchema(schema))
-	if err := drv.Append(ctx, event.RawEnvelope{
+	if _, err := drv.Append(ctx, event.RawEnvelope{
 		ID: "cc-1", Type: "t.concurrent", Payload: []byte(`{}`), OccurredAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("append: %v", err)

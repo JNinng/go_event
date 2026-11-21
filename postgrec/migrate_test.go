@@ -135,7 +135,7 @@ func TestNewDriverInvalidSchema(t *testing.T) {
 		t.Run(mode.String()+"Mode_InvalidSchemaAppend_ReturnsErrInvalidSchema", func(t *testing.T) {
 			drv := postgrec.NewDriver(nil, postgrec.WithSchema("bad-name"),
 				postgrec.WithMigrateMode(mode))
-			err := drv.Append(context.Background(), event.RawEnvelope{
+			_, err := drv.Append(context.Background(), event.RawEnvelope{
 				ID: "x", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 			})
 			if !errors.Is(err, event.ErrInvalidSchema) {

@@ -83,7 +83,7 @@ func schemaExists(t *testing.T, db *sql.DB, schema string) bool {
 
 func appendEvent(t *testing.T, drv event.Driver, typ, id string) {
 	t.Helper()
-	err := drv.Append(context.Background(), event.RawEnvelope{
+	_, err := drv.Append(context.Background(), event.RawEnvelope{
 		ID:         id,
 		Type:       typ,
 		Payload:    []byte(`{}`),
@@ -600,7 +600,7 @@ func TestNoneModeDoesNotMigrate(t *testing.T) {
 		schema := newMigrationSchema(t, db)
 		drv := postgrec.NewDriver(db, postgrec.WithSchema(schema),
 			postgrec.WithMigrateMode(event.MigrateNone))
-		err := drv.Append(ctx, event.RawEnvelope{
+		_, err := drv.Append(ctx, event.RawEnvelope{
 			ID: "none-1", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 		})
 		if err == nil {
@@ -611,7 +611,7 @@ func TestNoneModeDoesNotMigrate(t *testing.T) {
 		schema := newMigrationSchema(t, db)
 		drv := postgrec.NewDriver(db, postgrec.WithSchema(schema),
 			postgrec.WithMigrateMode(event.MigrateNone))
-		err := drv.Append(ctx, event.RawEnvelope{
+		_, err := drv.Append(ctx, event.RawEnvelope{
 			ID: "none-2", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 		})
 		if err == nil {
@@ -779,7 +779,7 @@ func TestVerifyModeDriver(t *testing.T) {
 		schema := newMigrationSchema(t, db)
 		drv := postgrec.NewDriver(db, postgrec.WithSchema(schema),
 			postgrec.WithMigrateMode(event.MigrateVerify))
-		err := drv.Append(ctx, event.RawEnvelope{
+		_, err := drv.Append(ctx, event.RawEnvelope{
 			ID: "verify-1", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 		})
 		var verifyErr *event.VerifyError
@@ -844,7 +844,7 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %[1]s TO %[2]s;`, schema, quotedR
 		fresh := newMigrationSchema(t, admin)
 		drv := postgrec.NewDriver(dmlDB, postgrec.WithSchema(fresh),
 			postgrec.WithMigrateMode(event.MigrateCreate))
-		err := drv.Append(ctx, event.RawEnvelope{
+		_, err := drv.Append(ctx, event.RawEnvelope{
 			ID: "dml-4", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 		})
 		if !errors.Is(err, event.ErrMigrationPermissionDenied) {
@@ -854,7 +854,7 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %[1]s TO %[2]s;`, schema, quotedR
 			t.Fatal("permission error must be classified permanent (bounded retry)")
 		}
 		// 永久错误 fail-fast：再次调用不重新执行 DDL。
-		err2 := drv.Append(ctx, event.RawEnvelope{
+		_, err2 := drv.Append(ctx, event.RawEnvelope{
 			ID: "dml-5", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 		})
 		if !errors.Is(err2, event.ErrMigrationPermissionDenied) {
@@ -922,7 +922,7 @@ func TestConcurrentFirstUse(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				errs[i] = drivers[i].Append(ctx, event.RawEnvelope{
+				_, errs[i] = drivers[i].Append(ctx, event.RawEnvelope{
 					ID:         fmt.Sprintf("concurrent-%d", i),
 					Type:       "concurrent",
 					Payload:    []byte(`{}`),
@@ -1045,7 +1045,7 @@ func TestCanceledContext(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		drv := postgrec.NewDriver(db, postgrec.WithSchema(schema))
-		err := drv.Append(ctx, event.RawEnvelope{
+		_, err := drv.Append(ctx, event.RawEnvelope{
 			ID: "canceled-1", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 		})
 		if !errors.Is(err, context.Canceled) {
@@ -1193,6 +1193,88 @@ func TestMigrateUpgradesV2Baseline(t *testing.T) {
 		exerciseDML(t, drv, "t.upgrade3", "up3")
 		if !columnExists(t, db, schema, "event", "deliver_at") {
 			t.Fatal("create-mode first use must upgrade v2 baseline with deliver_at")
+		}
+	})
+}
+
+// indexExists 报告 schema 内是否存在指定名称的索引。
+func indexExists(t *testing.T, db *sql.DB, schema, index string) bool {
+	t.Helper()
+	var exists bool
+	if err := db.QueryRow(
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = $2)`,
+		schema, index).Scan(&exists); err != nil {
+		t.Fatalf("index exists %s.%s: %v", schema, index, err)
+	}
+	return exists
+}
+
+// 旧二进制（v3）升级：Migrate 幂等补齐 v4 合并投递对象（event.coalesce_key
+// / event.superseded_at 加列与同键取代查找索引，ADR 0014），升级随部署隐
+// 式发生（ADR 0007）；Verify 对 v3 基线报告缺失对象（待升级）。expand-only
+// 加列对既有行与旧二进制无害——混合版本下旧二进制照常消费被取代行（合并
+// 是优化不是正确性保证，ADR 0014）。
+func TestMigrateUpgradesV3Baseline(t *testing.T) {
+	db := migrationDB(t)
+
+	t.Run("V3Baseline_Migrate_AddsCoalesceColumnsAndIndex", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		provisionVersion(t, db, schema, 2)
+		provisionVersion(t, db, schema, 3)
+		if err := postgrec.Migrate(context.Background(), db, postgrec.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate over v3 baseline: %v", err)
+		}
+		if !columnExists(t, db, schema, "event", "coalesce_key") ||
+			!columnExists(t, db, schema, "event", "superseded_at") {
+			t.Fatal("v4 columns not added to event")
+		}
+		if !indexExists(t, db, schema, "event_type_coalesce_idx") {
+			t.Fatal("v4 coalesce index not created on event")
+		}
+	})
+	t.Run("V3Baseline_MigrateTwice_Idempotent", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		provisionVersion(t, db, schema, 2)
+		provisionVersion(t, db, schema, 3)
+		if err := postgrec.Migrate(context.Background(), db, postgrec.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 1: %v", err)
+		}
+		if err := postgrec.Migrate(context.Background(), db, postgrec.WithSchema(schema)); err != nil {
+			t.Fatalf("migrate 2: %v", err)
+		}
+	})
+	t.Run("V3Baseline_Verify_ReportsMissingCoalesceObjects", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		provisionVersion(t, db, schema, 2)
+		provisionVersion(t, db, schema, 3)
+		report, err := postgrec.Verify(context.Background(), db, postgrec.WithSchema(schema))
+		var verifyErr *event.VerifyError
+		if !errors.As(err, &verifyErr) {
+			t.Fatalf("verify on v3 baseline = %v, want *VerifyError (missing v4 objects)", err)
+		}
+		requireIssue(t, report,
+			postgresschema.Qualified(schema, "event")+".coalesce_key",
+			event.KindColumn, event.ProblemMissing)
+		requireIssue(t, verifyErr.Report,
+			postgresschema.Qualified(schema, "event")+".superseded_at",
+			event.KindColumn, event.ProblemMissing)
+		requireIssue(t, verifyErr.Report,
+			postgresschema.Qualified(schema, "event_type_coalesce_idx"),
+			event.KindIndex, event.ProblemMissing)
+	})
+	t.Run("V3Baseline_DriverFirstAppend_UpgradeConverges", func(t *testing.T) {
+		schema := newMigrationSchema(t, db)
+		provisionVersion(t, db, schema, 1)
+		provisionVersion(t, db, schema, 2)
+		provisionVersion(t, db, schema, 3)
+		drv := postgrec.NewDriver(db, postgrec.WithSchema(schema))
+		exerciseDML(t, drv, "t.upgrade4", "up4")
+		if !columnExists(t, db, schema, "event", "coalesce_key") {
+			t.Fatal("create-mode first use must upgrade v3 baseline with coalesce columns")
 		}
 	})
 }

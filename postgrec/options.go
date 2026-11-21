@@ -4,8 +4,9 @@
 //
 // 可选能力面（Inspector / Admin / TransactionalAppender）均不经运行面类型
 // 获得，经各自构造函数接入、与 Driver 共享连接与命名空间选项；延迟投递
-// 为 Driver 语义内字段（WithDeliverAt / RawEnvelope.DeliverAt）；契约见
-// 本目录 README.md「能力边界表」（跨实例推送唤醒不做实现，退化轮询）。
+// 与合并投递为 Driver 语义内字段（WithDeliverAt / RawEnvelope.DeliverAt、
+// WithCoalesceKey / RawEnvelope.CoalesceKey，ADR 0014）；契约见本目录
+// README.md「能力边界表」（跨实例推送唤醒不做实现，退化轮询）。
 //
 // 持久结构按迁移模式在首次使用时处理：缺省 Create 持迁移锁幂等应用版本
 // 计划（需 DDL 权限）；Verify 只读校验、None 不建不校验——两者要求表已

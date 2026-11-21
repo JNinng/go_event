@@ -195,28 +195,30 @@ func (d *Driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 	return strconv.FormatInt(pos, 10), nil
 }
 
-// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）。INSERT 语句与
-// 事务性 AppendTx 共用同一份定义（appendInsertSQL，ADR 0012）；本后端不
-// 发跨实例唤醒信号（退化轮询，ADR 0013 §4）。
-func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
+// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）；CoalesceKey 非
+// 空时原子执行「置同键待消费前驱 superseded + 插入新行」（ADR 0014）。
+// INSERT 语句与事务性 AppendTx 共用同一份定义（appendInsertSQL，ADR 0012）；
+// 本后端不发跨实例唤醒信号（退化轮询，ADR 0013 §4）。返回取代行数（与
+// 落库事实一致，供观测面计量）。
+func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) (event.AppendResult, error) {
 	if err := d.ensure(ctx); err != nil {
-		return err
+		return event.AppendResult{}, err
 	}
 	meta, err := marshalMetadata(e.Metadata)
 	if err != nil {
-		return err
+		return event.AppendResult{}, err
 	}
-	_, err = d.db.ExecContext(ctx, fmt.Sprintf(appendInsertSQL, d.schema),
-		e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt))
+	res, err := d.execAppend(ctx, d.db.QueryRowContext, e, meta)
 	if err != nil {
-		return fmt.Errorf("postgrec: append: %w", err)
+		return event.AppendResult{}, fmt.Errorf("postgrec: append: %w", err)
 	}
 	d.lazyCleanup(ctx, time.Now())
-	return nil
+	return res, nil
 }
 
 // Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；
-// 延迟事件以 q.Now 判定到期，未到期行在单条读取内过滤（ADR 0013 §1）。
+// 延迟事件以 q.Now 判定到期，未到期行在单条读取内过滤（ADR 0013 §1）；
+// 被取代行（superseded）不满足下推条件——广播水位直接越过（ADR 0014）。
 // Limit<=0 返回 nil。
 func (d *Driver) Fetch(ctx context.Context, q event.FetchQuery) ([]event.RawEnvelope, error) {
 	if err := d.ensure(ctx); err != nil {
@@ -233,9 +235,10 @@ func (d *Driver) Fetch(ctx context.Context, q event.FetchQuery) ([]event.RawEnve
 		}
 	}
 	rows, err := d.db.QueryContext(ctx, fmt.Sprintf(`
-SELECT id, type, payload, metadata, occurred_at, position, deliver_at
+SELECT id, type, payload, metadata, occurred_at, position, deliver_at, coalesce_key
 FROM %s.event
 WHERE type = $1 AND position > $2
+  AND superseded_at IS NULL
   AND (deliver_at IS NULL OR deliver_at <= $3)
 ORDER BY position ASC
 LIMIT $4`, d.schema), q.Type, after, q.Now, q.Limit)
@@ -292,9 +295,11 @@ WHERE c.event_id = e.id AND e.type = $1 AND c.consumer_type = $2
 	}
 	terminalFailed := int(terminalRows)
 
-	// 2) 原子认领：两个数据修改 CTE 共享同一拾取窗口；无主 / retrying 重认领走
-	//    INSERT（接管不计入——Fail 时已计入，ADR 0006），active 过期租约走 UPDATE
-	//    接管（计入重试）。已知边界：拾取快照为 active 的行若执行时被旧属主迟到
+	// 2) 原子认领：两个数据修改 CTE 共享同一拾取窗口；延迟事件按 q.Now 判定到期
+	//    （ADR 0013 §1），被取代行不进拾取窗口（superseded 是事件行属性，对新
+	//    消费者身份同样生效，ADR 0014）；无主 / retrying 重认领走 INSERT（接管
+	//    不计入——Fail 时已计入，ADR 0006），active 过期租约走 UPDATE 接管
+	//    （计入重试）。已知边界：拾取快照为 active 的行若执行时被旧属主迟到
 	//    Fail 翻成 retrying 且退避未期满，本轮不发放、下轮再认领（ADR 0011，at-least-once 不破坏）。
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 WITH picked AS (
@@ -303,6 +308,7 @@ WITH picked AS (
 	LEFT JOIN %s.event_claim c
 	       ON c.event_id = e.id AND c.consumer_type = $2
 	WHERE e.type = $1
+	  AND e.superseded_at IS NULL
 	  AND (e.deliver_at IS NULL OR e.deliver_at <= $3)
 	  AND (
 	        c.event_id IS NULL
@@ -414,7 +420,7 @@ SELECT event_id, claim_count, takeover FROM reclaim
 // database/sql 无数组绑定，用动态 IN 参数（driver 无关）。
 func fetchByIDInTx(ctx context.Context, tx *sql.Tx, schema string, ids []string) (map[string]event.RawEnvelope, error) {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, `SELECT id, type, payload, metadata, occurred_at, position, deliver_at FROM %s.event WHERE id IN (`, schema)
+	fmt.Fprintf(&sb, `SELECT id, type, payload, metadata, occurred_at, position, deliver_at, coalesce_key FROM %s.event WHERE id IN (`, schema)
 	args := make([]any, 0, len(ids))
 	for i, id := range ids {
 		if i > 0 {
@@ -571,13 +577,17 @@ func scanEnvelopes(rows *sql.Rows) ([]event.RawEnvelope, error) {
 		var e event.RawEnvelope
 		var meta []byte
 		var pos int64
-		var deliverAt sql.NullTime // NULL = 立即可投递（零值）
-		if err := rows.Scan(&e.ID, &e.Type, &e.Payload, &meta, &e.OccurredAt, &pos, &deliverAt); err != nil {
+		var deliverAt sql.NullTime   // NULL = 立即可投递（零值）
+		var coalesceKey sql.NullString // NULL = 未设置（空串）
+		if err := rows.Scan(&e.ID, &e.Type, &e.Payload, &meta, &e.OccurredAt, &pos, &deliverAt, &coalesceKey); err != nil {
 			return nil, fmt.Errorf("postgrec: scan envelope: %w", err)
 		}
 		e.Position = strconv.FormatInt(pos, 10)
 		if deliverAt.Valid {
 			e.DeliverAt = deliverAt.Time
+		}
+		if coalesceKey.Valid {
+			e.CoalesceKey = coalesceKey.String
 		}
 		if len(meta) > 0 {
 			if err := json.Unmarshal(meta, &e.Metadata); err != nil {

@@ -50,9 +50,9 @@ WHERE event_id = $1 AND consumer_type = $2`, d.schema),
 }
 
 // CountStates 按消费者身份对事件类型做状态分档计数。单条语句内完成：
-// LEFT JOIN 认领行，无认领行（c.event_id IS NULL）计入 Pending——
-// 「待处理」= 该身份无认领行，其余按 status 列分档（口径见
-// event.Inspector.CountStates）。
+// LEFT JOIN 认领行，无认领行（c.event_id IS NULL）按 superseded 属性细分
+// ——未取代计入 Pending、已被合并取代计入 Superseded（事件行属性档，
+// ADR 0014），其余按 status 列分档（口径见 event.Inspector.CountStates）。
 func (d *Driver) CountStates(ctx context.Context, typ, consumerType string) (event.StateCounts, error) {
 	if err := d.ensure(ctx); err != nil {
 		return event.StateCounts{}, err
@@ -60,7 +60,8 @@ func (d *Driver) CountStates(ctx context.Context, typ, consumerType string) (eve
 	var c event.StateCounts
 	err := d.db.QueryRowContext(ctx, fmt.Sprintf(`
 SELECT
-	COUNT(*) FILTER (WHERE c.event_id IS NULL)    AS pending,
+	COUNT(*) FILTER (WHERE c.event_id IS NULL AND e.superseded_at IS NULL)     AS pending,
+	COUNT(*) FILTER (WHERE c.event_id IS NULL AND e.superseded_at IS NOT NULL) AS superseded,
 	COUNT(*) FILTER (WHERE c.status = 'retrying') AS retrying,
 	COUNT(*) FILTER (WHERE c.status = 'active')   AS processing,
 	COUNT(*) FILTER (WHERE c.status = 'failed')   AS failed,
@@ -69,7 +70,7 @@ FROM %s.event e
 LEFT JOIN %s.event_claim c
        ON c.event_id = e.id AND c.consumer_type = $2
 WHERE e.type = $1`, d.schema, d.schema), typ, consumerType).
-		Scan(&c.Pending, &c.Retrying, &c.Processing, &c.Failed, &c.Done)
+		Scan(&c.Pending, &c.Superseded, &c.Retrying, &c.Processing, &c.Failed, &c.Done)
 	if err != nil {
 		return event.StateCounts{}, fmt.Errorf("postgrec: count states: %w", err)
 	}
