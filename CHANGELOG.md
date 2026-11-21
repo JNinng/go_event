@@ -4,21 +4,27 @@
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-11-21
+
 ### 新特性
 
-- **合并投递（同键最新一次消费）**：事件信封新增可选合并键字段 `CoalesceKey`（`RawEnvelope` / `Envelope`，作用域 = (Type, key)，与事件 ID 正交）；发布侧经新选项 `WithCoalesceKey(key)` 设置，事务性入队复用 `RawEnvelope.CoalesceKey`（Publish 与 AppendTx 均可设置）。同键 Append 原子「置同键待消费前驱 superseded + 插入新行」（单条 CTE，普通 Append 与 AppendTx 共用同一语句定义）——同键短期多次发布只消费最新一次（如知识库重建短窗多次触发）。Fetch / Claim 下推排除被取代行（`superseded_at IS NULL`），一种机制同时服务广播与认领两种消费模式：广播水位直接越过（HeadPosition / position 语义不变，被取代行照常占 position）、认领不发放、新消费者身份同样跳过（superseded 是事件行属性）。**取代范围为 v1 保守口径**：仅无任何认领行的待消费前驱——处理中 / 等退避 / 租约过期待接管 / 终态行不取代，新事件照常排队（旧事件多跑一趟对幂等任务无害）；被取代的延迟行永不到期投递；superseded 行照常参与保留期清理。**幂等与合并正交**：重复 Append 同 ID 纯 no-op 不触发取代（取代谓词含同 ID 守卫，重发旧事件不会杀死新赢家）——去抖/合并配方须每次发布新 ID。**窗口语义不加糖**：不内建时间窗参数，去抖经与 `WithDeliverAt` 组合表达（合并键 + deliver_at = now + 静默期，每次新发布自带基线，usage.md §4.3 配方）。已知边界：同键并发发布不互斥（短窗可能并存）；混合版本下旧二进制照常消费被取代行——合并是优化不是正确性保证。Postgres 后端由版本计划 v4 自动补齐（`event.coalesce_key text` / `event.superseded_at timestamptz` 可空无默认 + `(type, coalesce_key)` 部分索引，expand-only，升级随部署隐式发生）；inmem 同形模拟。决策记录见 [ADR 0014](docs/adr/0014-coalescing-delivery.md)。
-  - `eventtest` 新增 `RunCoalescingSuite` 契约套件（latest-wins 计数与双模式排除、水位越过与 HeadPosition 锚定、新身份跳过、活跃租约 / 退避 / 过期租约 / 终态前驱不取代、作用域 (Type, key) 与空键、ID 正交、同 ID 幂等、被取代延迟行永不到期投递、信封透传、AppendTx 提交前不可见 / 提交后取代 / 回滚零事实、Inspector 分档、保留期清理），pgxc / postgrec / inmem 全过；迁移契约增 v3 基线升级用例（Migrate 补齐 v4 对象、幂等、Verify 报告缺失、首次 DML 收敛）。
+- **合并投递（`WithCoalesceKey`）**：同键短期多次发布只消费最新一次——知识库重建类任务在短窗内多次触发时，不再全量重跑。合并键作用域为 `(Type, key)`、与事件 ID 正交：每次发布原子将同键的待消费前驱置为 superseded 并插入新行，广播与认领两种消费模式均不再返回被取代行（广播水位直接越过，`HeadPosition` / 基线锚点不变）。
+  - 取代范围为保守口径：仅无任何认领行的待消费前驱——处理中 / 等退避 / 租约过期待接管 / 终态的前驱一律不动，新事件照常排队；被取代的延迟行永不到期投递，被取代行照常参与保留期清理。
+  - 不内建时间窗：去抖经与 `WithDeliverAt` 组合表达（合并键 + `deliver_at = now + 静默期`，每次新发布自带基线）。须每次发布新 ID——稳定 ID 重复发布不触发取代（与 ID 幂等语义一致），配方见 usage.md §4.3。
+  - 已知边界：同键并发发布不互斥（短窗可能并存）；混合版本部署下旧二进制照常消费被取代行——合并是优化不是正确性保证，需要「恰好一次」仍靠 handler 幂等。
+  - Postgres 后端由版本计划 v4 自动补齐（`event.coalesce_key` / `event.superseded_at` 可空加列与同键查找索引，升级随部署隐式发生）；inmem 同形模拟。契约套件 `eventtest.RunCoalescingSuite` 三后端全过。
+- **合并投递可观测**：`<scope>.append.supersede` 计数（`event` 维度）记录每次发布的取代行数；`Inspector.CountStates` 新增 `Superseded` 档，取代事实可直接对账与排障。
 
 ### 破坏性变更与兼容期
 
-- **`Driver.Append` 返回类型由 `error` 变更为 `(AppendResult, error)`**（v0.x 允许破坏性变更）：`AppendResult.Superseded` 为本次原子取代的同键待消费前驱行数（与落库事实一致，可经 Inspector.CountStates 的 Superseded 档对账）；未设置 CoalesceKey 与重复 Append 恒为 0。全部后端（pgxc / postgrec）、`eventtest` / `eventtest/inmem` / `eventtest/simmigrate` 已同步；core 据此发射 `<scope>.append.supersede` 计数（event 维度，非零才打点）。`AppendTx` 签名不变、不返回取代计数（ADR 0012 边界：取代随事务提交才生效，提交前的计数与回滚后的事实可能矛盾）（[ADR 0014](docs/adr/0014-coalescing-delivery.md)）。
-- **`event.StateCounts` 新增 `Superseded` 档、Pending 口径收窄**：被合并取代的行（无认领行且 `superseded_at` 非空）从 Pending 移入 Superseded 档——六档互斥且完备、合计仍等于该类型事件总数；「待处理」= 该身份无认领行且未被取代。`Inspector.CountStates` 契约注释同步修订（[ADR 0014](docs/adr/0014-coalescing-delivery.md)）。
-- `postgresschema` 版本计划升级至 v4（`event` 表加 `coalesce_key` / `superseded_at` 与同键取代查找索引 `event_type_coalesce_idx`），`ExpectedObjects` / `Plan` / `SQL` 随之扩展；expand-only，旧基线由迁移自动补齐。
+- **`Driver.Append` 返回类型由 `error` 变更为 `(AppendResult, error)`**（v0.x 允许破坏性变更）：调用方经 `AppendResult.Superseded` 读取本次取代行数（未设合并键与重复发布恒为 0）；库内全部后端与契约套件已同步。`AppendTx` 签名不变（取代随事务提交才生效，不返回计数）。
+- **`StateCounts` 新增 `Superseded` 档、Pending 口径收窄**：被合并取代的行从 Pending 移入 Superseded——「待处理」= 该身份无认领行且未被取代；六档互斥且完备，合计仍等于该类型事件总数。
+- `postgresschema` 版本计划升级至 v4（`Plan` / `ExpectedObjects` / `SQL` 随之扩展）：存量 schema 由迁移自动补齐，无手工升级步骤；`Create` 需 DDL 权限的口径不变。
 
 ### 文档
 
-- 新增 [ADR 0014](docs/adr/0014-coalescing-delivery.md)：合并投递的语义口径（信封可选字段与作用域、Append 单 CTE 原子取代、v1 保守取代范围、双模式同一下推排除、窗口语义不内建与去抖配方、schema v4 expand-only 与混合版本边界、`AppendResult` / supersede 计数 / Inspector 分档观测口径）的决策记录。
-- design.md §5.2 增被取代行水位边界、§6 增「合并投递」行（事件信封 / 生产 / Inspector 行同步）、§9.2 增合并投递已落地条目；api.md §2.2 / §2.3 / §2.4 / §2.10 / §2.12 / §4 同步签名与语义；usage.md §4.3 增合并投递与去抖配方、§10 选项速查行、§11 运维注意事项；根与后端 README 能力边界表。
+- 新增 [ADR 0014](docs/adr/0014-coalescing-delivery.md)：合并投递的语义口径决策记录（取代范围、双模式排除、去抖组合、schema v4 边界、观测口径与已否决备选）。
+- design.md 增「合并投递」能力行与广播水位边界；api.md 同步 `WithCoalesceKey` / `AppendResult` / 六档 `StateCounts` 签名；usage.md §4.3 增合并投递与去抖配方、§11 增运维注意事项；根与后端 README 能力边界表同步。
 
 ## [v0.2.0] - 2026-11-19
 
@@ -70,4 +76,5 @@
 - 新增 LICENSE（MIT），README 增许可证一节并同步状态与路线。
 
 [v0.2.0]: https://github.com/JNinng/go_event/compare/v0.1.1...v0.2.0
-[Unreleased]: https://github.com/JNinng/go_event/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/JNinng/go_event/compare/v0.3.0...HEAD
+[v0.3.0]: https://github.com/JNinng/go_event/compare/v0.2.0...v0.3.0
