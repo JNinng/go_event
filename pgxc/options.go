@@ -5,7 +5,8 @@
 // 可选能力面（Inspector / Admin / TransactionalAppender / Wake 与延迟投递）
 // 均不经运行面类型获得，经各自构造函数（NewInspector / NewAdmin /
 // NewTransactionalAppender / NewWake）接入，与 Driver 共享连接与命名空间
-// 选项；各自契约见本目录 README.md「能力边界表」。
+// 选项；合并投递（CoalesceKey，同键最新一次消费）与延迟投递同为 Driver
+// 语义内字段（ADR 0014）；各自契约见本目录 README.md「能力边界表」。
 //
 // 持久结构按迁移模式在首次使用时处理：缺省 Create 持迁移锁幂等应用版本
 // 计划（需 DDL 权限）；Verify 只读校验、None 不建不校验——两者要求表已

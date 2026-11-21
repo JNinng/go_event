@@ -201,26 +201,30 @@ func (d *Driver) HeadPosition(ctx context.Context, typ string) (string, error) {
 	return strconv.FormatInt(pos, 10), nil
 }
 
-// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）。INSERT 语句与
-// 事务性 AppendTx 共用同一份定义与执行路径（appendInsertSQL / execAppend，
-// ADR 0012）；实际插入行时发跨实例唤醒 NOTIFY（ADR 0013）。
-func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) error {
+// Append 写入事件：同 ID 首写为准、不覆盖不重投（幂等）；CoalesceKey 非
+// 空时原子执行「置同键待消费前驱 superseded + 插入新行」（ADR 0014）。
+// INSERT 语句与事务性 AppendTx 共用同一份定义与执行路径（appendInsertSQL /
+// execAppend，ADR 0012）；实际插入行时发跨实例唤醒 NOTIFY（ADR 0013）。
+// 返回取代行数（与落库事实一致，供观测面计量）。
+func (d *Driver) Append(ctx context.Context, e event.RawEnvelope) (event.AppendResult, error) {
 	if err := d.ensure(ctx); err != nil {
-		return err
+		return event.AppendResult{}, err
 	}
 	meta, err := marshalMetadata(e.Metadata)
 	if err != nil {
-		return err
+		return event.AppendResult{}, err
 	}
-	if err := d.execAppend(ctx, d.pool.Exec, e, meta); err != nil {
-		return fmt.Errorf("pgxc: append: %w", err)
+	res, err := d.execAppend(ctx, d.pool.QueryRow, e, meta)
+	if err != nil {
+		return event.AppendResult{}, fmt.Errorf("pgxc: append: %w", err)
 	}
 	d.lazyCleanup(ctx, time.Now())
-	return nil
+	return res, nil
 }
 
 // Fetch 返回 position 严格大于 After 的已提交事件（升序，按 Limit 截断）；
-// 延迟事件以 q.Now 判定到期，未到期行在单条读取内过滤（ADR 0013 §1）。
+// 延迟事件以 q.Now 判定到期，未到期行在单条读取内过滤（ADR 0013 §1）；
+// 被取代行（superseded）不满足下推条件——广播水位直接越过（ADR 0014）。
 // Limit<=0 返回 nil。
 func (d *Driver) Fetch(ctx context.Context, q event.FetchQuery) ([]event.RawEnvelope, error) {
 	if err := d.ensure(ctx); err != nil {
@@ -237,9 +241,10 @@ func (d *Driver) Fetch(ctx context.Context, q event.FetchQuery) ([]event.RawEnve
 		}
 	}
 	rows, err := d.pool.Query(ctx, fmt.Sprintf(`
-SELECT id, type, payload, metadata, occurred_at, position, deliver_at
+SELECT id, type, payload, metadata, occurred_at, position, deliver_at, coalesce_key
 FROM %s.event
 WHERE type = $1 AND position > $2
+  AND superseded_at IS NULL
   AND (deliver_at IS NULL OR deliver_at <= $3)
 ORDER BY position ASC
 LIMIT $4`, d.schema), q.Type, after, q.Now, q.Limit)
@@ -297,10 +302,12 @@ WHERE c.event_id = e.id AND e.type = $1 AND c.consumer_type = $2
 	terminalFailed := int(terminalTag.RowsAffected())
 
 	// 2) 原子认领（单语句两个数据修改 CTE 共享同一拾取窗口）：延迟事件按 q.Now 判定到期（deliver_at
-	//    <= now，ADR 0013 §1），未到期行不进拾取窗口；无主与 retrying 重认领走 INSERT（Fail 时已计入，
-	//    接管不再计数，ADR 0006），active 过期租约走 UPDATE 接管（计入重试）。已知边界：快照为 active
-	//    的行若在 UPDATE 执行时被旧属主迟到 Fail 翻成 retrying 且退避未期满，本轮不发放、下轮再认领
-	//    （ADR 0011，at-least-once 不破坏）。
+	//    <= now，ADR 0013 §1），未到期行不进拾取窗口；被取代行不进拾取窗口
+	//    （superseded 是事件行属性，对新消费者身份同样生效，ADR 0014）；无主
+	//    与 retrying 重认领走 INSERT（Fail 时已计入，接管不再计数，ADR 0006），
+	//    active 过期租约走 UPDATE 接管（计入重试）。已知边界：快照为 active
+	//    的行若在 UPDATE 执行时被旧属主迟到 Fail 翻成 retrying 且退避未期满，
+	//    本轮不发放、下轮再认领（ADR 0011，at-least-once 不破坏）。
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 WITH picked AS (
 	SELECT e.id, c.status
@@ -308,6 +315,7 @@ WITH picked AS (
 	LEFT JOIN %s.event_claim c
 	       ON c.event_id = e.id AND c.consumer_type = $2
 	WHERE e.type = $1
+	  AND e.superseded_at IS NULL
 	  AND (e.deliver_at IS NULL OR e.deliver_at <= $3)
 	  AND (
 	        c.event_id IS NULL
@@ -377,7 +385,7 @@ SELECT event_id, claim_count, takeover FROM reclaim
 			ids[i] = c.eventID
 		}
 		rows, err = tx.Query(ctx, fmt.Sprintf(`
-SELECT id, type, payload, metadata, occurred_at, position, deliver_at
+SELECT id, type, payload, metadata, occurred_at, position, deliver_at, coalesce_key
 FROM %s.event WHERE id = ANY($1) ORDER BY position ASC`, d.schema), ids)
 		if err != nil {
 			return event.ClaimResult{}, fmt.Errorf("pgxc: claim fetch: %w", err)
@@ -554,12 +562,16 @@ func collectEnvelopes(rows pgx.Rows) ([]event.RawEnvelope, error) {
 		var meta []byte
 		var pos int64
 		var deliverAt *time.Time // NULL = 立即可投递（零值）
-		if err := rows.Scan(&e.ID, &e.Type, &e.Payload, &meta, &e.OccurredAt, &pos, &deliverAt); err != nil {
+		var coalesceKey *string  // NULL = 未设置（空串）
+		if err := rows.Scan(&e.ID, &e.Type, &e.Payload, &meta, &e.OccurredAt, &pos, &deliverAt, &coalesceKey); err != nil {
 			return nil, fmt.Errorf("pgxc: scan envelope: %w", err)
 		}
 		e.Position = strconv.FormatInt(pos, 10)
 		if deliverAt != nil {
 			e.DeliverAt = *deliverAt
+		}
+		if coalesceKey != nil {
+			e.CoalesceKey = *coalesceKey
 		}
 		if len(meta) > 0 {
 			if err := json.Unmarshal(meta, &e.Metadata); err != nil {

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/jninng/go_event"
 )
@@ -19,22 +18,39 @@ import (
 // 调用方事务上（库不 commit、不 rollback）。执行路径与提交后可见性由
 // TEST_POSTGRES_DSN 门控的契约套件与集成测试覆盖。
 
-// recordingTx 是 pgx.Tx 的替身：仅记录 Exec；其余方法不触达（嵌入 nil
-// 接口，误用即 panic——AppendTx 契约只允许 Exec）。
+// recordingTx 是 pgx.Tx 的替身：仅记录 QueryRow；其余方法不触达（嵌入 nil
+// 接口，误用即 panic——AppendTx 契约只允许 QueryRow）。
 type recordingTx struct {
 	pgx.Tx
-	execCalls atomic.Int64
-	execErr   error
-	lastSQL   string
+	queryCalls atomic.Int64
+	queryErr   error
+	lastSQL    string
 }
 
-func (t *recordingTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	t.execCalls.Add(1)
+func (t *recordingTx) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	t.queryCalls.Add(1)
 	t.lastSQL = sql
-	if t.execErr != nil {
-		return pgconn.CommandTag{}, t.execErr
+	if t.queryErr != nil {
+		return stubRow{err: t.queryErr}
 	}
-	return pgconn.NewCommandTag("INSERT 0 1"), nil
+	return stubRow{}
+}
+
+// stubRow 恒定扫描为「零取代、未唤醒」的单行结果（errRow 形态注入扫描
+// 故障）。
+type stubRow struct{ err error }
+
+func (r stubRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if p, ok := dest[0].(*int64); ok {
+		*p = 0
+	}
+	if p, ok := dest[1].(*int64); ok {
+		*p = 0
+	}
+	return nil
 }
 
 // ensure 失败（迁移面错误）：原样上抛，调用方事务零触碰（事务控制归调用方）。
@@ -50,8 +66,8 @@ func TestTransactionalAppender_AppendTx_EnsureFailure_ReturnsErrorWithoutTouchin
 	if !errors.Is(err, boom) {
 		t.Fatalf("append tx = %v, want ensure error", err)
 	}
-	if tx.execCalls.Load() != 0 {
-		t.Fatalf("exec calls = %d, want 0 (ensure failure must not touch the caller tx)", tx.execCalls.Load())
+	if tx.queryCalls.Load() != 0 {
+		t.Fatalf("exec calls = %d, want 0 (ensure failure must not touch the caller tx)", tx.queryCalls.Load())
 	}
 }
 
@@ -74,12 +90,12 @@ func TestTransactionalAppender_AppendTx_CanceledContext_ShortCircuitsBeforeEnsur
 	if mgr.migrateCalls.Load() != 0 {
 		t.Fatalf("migrate calls = %d, want 0 (canceled ctx must short-circuit)", mgr.migrateCalls.Load())
 	}
-	if tx.execCalls.Load() != 0 {
-		t.Fatalf("exec calls = %d, want 0", tx.execCalls.Load())
+	if tx.queryCalls.Load() != 0 {
+		t.Fatalf("exec calls = %d, want 0", tx.queryCalls.Load())
 	}
 }
 
-// ensure 通过：INSERT 落在调用方事务上（一次 Exec，共用语句，不 commit）。
+// ensure 通过：写入落在调用方事务上（一次 QueryRow，共用单语句，不 commit）。
 func TestTransactionalAppender_AppendTx_EnsurePassed_ExecutesSharedInsertOnCallerTx(t *testing.T) {
 	d := testDriver(event.MigrateNone, &fakeManager{}, newFakeClock())
 	ta := newTransactionalAppenderOn(d)
@@ -93,8 +109,8 @@ func TestTransactionalAppender_AppendTx_EnsurePassed_ExecutesSharedInsertOnCalle
 	if err != nil {
 		t.Fatalf("append tx: %v", err)
 	}
-	if tx.execCalls.Load() != 1 {
-		t.Fatalf("exec calls = %d, want 1", tx.execCalls.Load())
+	if tx.queryCalls.Load() != 1 {
+		t.Fatalf("exec calls = %d, want 1", tx.queryCalls.Load())
 	}
 	if !strings.Contains(tx.lastSQL, "INSERT INTO") ||
 		!strings.Contains(tx.lastSQL, "ON CONFLICT (id) DO NOTHING") {
@@ -107,13 +123,13 @@ func TestTransactionalAppender_AppendTx_ExecFault_ReturnsWrappedError(t *testing
 	d := testDriver(event.MigrateNone, &fakeManager{}, newFakeClock())
 	ta := newTransactionalAppenderOn(d)
 	boom := errors.New("exec boom")
-	tx := &recordingTx{execErr: boom}
+	tx := &recordingTx{queryErr: boom}
 
 	err := ta.AppendTx(context.Background(), tx, event.RawEnvelope{
 		ID: "ta-4", Type: "t", Payload: []byte(`{}`), OccurredAt: time.Now(),
 	})
 	if !errors.Is(err, boom) {
-		t.Fatalf("append tx = %v, want wrapped exec error", err)
+		t.Fatalf("append tx = %v, want wrapped query error", err)
 	}
 }
 

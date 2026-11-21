@@ -24,7 +24,7 @@ import (
 // provisionFailedRow 构造一条 failed 终态行（终态 Fail 携带错误摘要）。
 func provisionFailedRow(t *testing.T, drv event.Driver, id, typ, consumerType string) event.Lease {
 	t.Helper()
-	if err := drv.Append(context.Background(), event.RawEnvelope{
+	if _, err := drv.Append(context.Background(), event.RawEnvelope{
 		ID: id, Type: typ, Payload: []byte(`{}`), OccurredAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("append: %v", err)
@@ -206,7 +206,7 @@ func TestAdminReplayAndMigrate_ConcurrentBothSucceed(t *testing.T) {
 	schema := newMigrationSchema(t, pool)
 	admin := pgxc.NewAdmin(pool, pgxc.WithSchema(schema))
 	drv := pgxc.NewDriver(pool, pgxc.WithSchema(schema))
-	if err := drv.Append(ctx, event.RawEnvelope{
+	if _, err := drv.Append(ctx, event.RawEnvelope{
 		ID: "cc-1", Type: "t.concurrent", Payload: []byte(`{}`), OccurredAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("append: %v", err)

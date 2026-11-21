@@ -213,6 +213,58 @@ func TestPgxcRetentionSuite(t *testing.T) {
 	})
 }
 
+// pgxCoalescingAssembly 合并投递套件装配：工厂按用例生成独立 schema +
+// 短保留窗口的全新 Driver（保留期清理用例构造超窗行）；beginTx 与传入
+// driver 同源——经用例 schema 上的事务性入队列开启业务事务（driver 实例
+// 到 schema 的登记由工厂维护，suite 串行执行）。
+type pgxCoalescingAssembly struct {
+	pool    *pgxpool.Pool
+	seq     atomic.Int64
+	schemas map[event.Driver]string
+}
+
+func newPgxcCoalescingAssembly(pool *pgxpool.Pool) *pgxCoalescingAssembly {
+	return &pgxCoalescingAssembly{pool: pool, schemas: make(map[event.Driver]string)}
+}
+
+func (a *pgxCoalescingAssembly) newDriver(t *testing.T) event.Driver {
+	t.Helper()
+	schema := fmt.Sprintf("go_event_co_%d_%d", time.Now().UnixNano(), a.seq.Add(1))
+	t.Cleanup(func() {
+		_, _ = a.pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+	})
+	drv := pgxc.NewDriver(a.pool, pgxc.WithSchema(schema), pgxc.WithRetention(2*time.Second))
+	a.schemas[drv] = schema
+	return drv
+}
+
+func (a *pgxCoalescingAssembly) beginTx(t *testing.T, d event.Driver) eventtest.TxSession {
+	t.Helper()
+	drv, ok := d.(*pgxc.Driver)
+	if !ok {
+		t.Fatalf("coalescing suite beginTx requires the factory's *pgxc.Driver, got %T", d)
+	}
+	schema, ok := a.schemas[drv]
+	if !ok {
+		t.Fatal("beginTx driver was not produced by the coalescing factory")
+	}
+	ta := pgxc.NewTransactionalAppender(a.pool, pgxc.WithSchema(schema))
+	tx, err := a.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	return pgxTxSession{ta: ta, tx: tx}
+}
+
+// 合并投递契约（同键最新一次消费，ADR 0014）：latest-wins、双模式排除、
+// 保守取代范围、ID 正交、与延迟组合、AppendTx 同事务、superseded 分档与
+// 保留期清理。
+func TestPgxcCoalescingSuite(t *testing.T) {
+	pool, _, _ := testPool(t)
+	assembly := newPgxcCoalescingAssembly(pool)
+	eventtest.RunCoalescingSuite(t, assembly.newDriver, assembly.beginTx)
+}
+
 // 遗留 failed 行（v2 加列前 failed_at 落 NULL，加列无回填）：FailedEvents
 // 不报错，该行 FailedAt 映射为零值、摘要可见（升级边界，docs/api.md
 // §2.10）。inmem 无 NULL 语义，不模拟该场景。
@@ -221,7 +273,7 @@ func TestPgxcLegacyFailedRow_FailedEvents_MapsNullFailedAtToZeroValue(t *testing
 	ctx := context.Background()
 	typ := t.Name()
 
-	if err := drv.Append(ctx, event.RawEnvelope{
+	if _, err := drv.Append(ctx, event.RawEnvelope{
 		ID: "legacy-1", Type: typ, Payload: []byte(`{}`), OccurredAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatalf("append: %v", err)

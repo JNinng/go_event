@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jninng/go_event"
@@ -26,24 +25,51 @@ const wakeChannelPrefix = "go_event_wake_"
 // 按字节截断安全。
 const wakeChannelTrunc = 32
 
-// appendInsertSQL 是事件 INSERT 的单一语句定义：普通 Append（自管连接，
-// 独立提交）与事务性 AppendTx（加入调用方业务事务）共用同一份，避免第
-// 二份拷贝漂移（幂等语义一致：同 ID 首写为准，design.md §4）。
+// appendInsertSQL 是事件写入的单一语句定义：普通 Append（自管连接，独立
+// 提交）与事务性 AppendTx（加入调用方业务事务）共用同一份，避免第二份拷
+// 贝漂移（幂等语义一致：同 ID 首写为准，design.md §4；合并投递取代与插入
+// 同一写路径，ADR 0014）。
 //
-// 跨实例唤醒信号经 CTE 挂在插入事实之后：仅实际插入行时 NOTIFY（幂等
-// 冲突不重发信号）；通道与 payload 只带 schema 名，不带事件内容（ADR 0013
-// §2）。pg_notify 随所在事务提交才可见——事务性入队的信号在提交时刻发出，
-// 与「提交前发信号只会让消费者空拉一趟」的边界（ADR 0012 §2）天然相容；
-// 延迟行的信号同样在插入（事务提交）时发出，不判断 deliver_at——推送只
-// 回答「有新行」，不回答「有可投递行」，消费侧空拉一趟由轮询兜底。
+// 单条 CTE 原子「置同键待消费前驱 superseded + 插入新行」（ADR 0014）：
+//   - sup：同 (type, coalesce_key)、未被取代、且无任何认领行（任意消费者
+//     身份——处理中 / 等退避 / 租约过期待接管 / 终态行均不取代，v1 保守
+//     口径）的待消费前驱置 superseded_at；NOT EXISTS(dup.id) 使重复 Append
+//     同 ID 成为纯 no-op（幂等与合并正交，重发旧事件不杀死新赢家）。
+//   - ins：INSERT ... ON CONFLICT (id) DO NOTHING（首写为准）；coalesce_key
+//     空串存 NULL——NULL 不参与取代匹配，未设键的发布天然不合并。
+//
+// 数据修改 CTE 按文档保证「恰好执行一次、不受主查询是否读取输出影响」；
+// 跨实例唤醒信号经 wake CTE 挂在插入事实之后：仅实际插入行时 NOTIFY（幂
+// 等冲突不重发信号），MATERIALIZED + 主查询引用保证求值恰好一次；通道与
+// payload 只带 schema 名，不带事件内容（ADR 0013 §2）。pg_notify 随所在
+// 事务提交才可见——事务性入队的信号在提交时刻发出，与「提交前发信号只会
+// 让消费者空拉一趟」的边界（ADR 0012 §2）天然相容；延迟行与被取代的延迟
+// 行同样只在插入（事务提交）时发，不判断 deliver_at——推送只回答「有新
+// 行」，不回答「有可投递行」，消费侧空拉一趟由轮询兜底。
+//
+// 返回行恒一行两列：superseded（本次取代的待消费前驱行数，与落库事实
+// 一致）、woke（唤醒信号发出数，0/1——仅插入行时为 1）。
 const appendInsertSQL = `
-WITH ins AS (
-	INSERT INTO %s.event (id, type, payload, metadata, occurred_at, deliver_at)
-	VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+WITH sup AS (
+	UPDATE %s.event e
+	SET superseded_at = $7
+	WHERE e.type = $2
+	  AND e.coalesce_key = $8
+	  AND e.superseded_at IS NULL
+	  AND NOT EXISTS (SELECT 1 FROM %s.event dup WHERE dup.id = $1)
+	  AND NOT EXISTS (SELECT 1 FROM %s.event_claim c WHERE c.event_id = e.id)
+	RETURNING 1
+),
+ins AS (
+	INSERT INTO %s.event (id, type, payload, metadata, occurred_at, deliver_at, coalesce_key)
+	VALUES ($1, $2, $3, $4::jsonb, $5, $6, $8)
 	ON CONFLICT (id) DO NOTHING
 	RETURNING 1
+),
+wake AS MATERIALIZED (
+	SELECT pg_notify($9, $10) FROM ins
 )
-SELECT pg_notify($7, $8) FROM ins`
+SELECT (SELECT count(*) FROM sup), (SELECT count(*) FROM wake)`
 
 // wakeChannel 返回 schema 的唤醒通道名：短 schema（前缀 + 全名不超
 // Postgres 标识上限 63 字节）直用全名；超限截取前 wakeChannelTrunc 字节
@@ -68,17 +94,36 @@ func deliverAtArg(t time.Time) any {
 	return t
 }
 
-// execAppend 执行事件 INSERT（普通 Append 与事务性 AppendTx 共用同一执行
-// 路径）：实际插入行时经 CTE 发跨实例唤醒 NOTIFY（幂等冲突不重发信号；
-// 延迟行同样在插入时发，不判断 deliver_at——推送只回答「有新行」，
-// ADR 0013 §2）。
-func (d *Driver) execAppend(ctx context.Context,
-	exec func(context.Context, string, ...any) (pgconn.CommandTag, error),
-	e event.RawEnvelope, meta string) error {
-	_, err := exec(ctx, fmt.Sprintf(appendInsertSQL, d.schema),
+// coalesceKeyArg 把信封的 CoalesceKey 归一为落库参数：空串存 NULL（未
+// 设置，不参与合并取代），非空原样写入 coalesce_key（ADR 0014）。
+func coalesceKeyArg(key string) any {
+	if key == "" {
+		return nil
+	}
+	return key
+}
+
+// queryRowFunc 是 Append 单语句的执行载体抽象：池连接（普通 Append）与
+// 事务（AppendTx）的 QueryRow 同型（pgx.Row），共享同一执行路径。
+type queryRowFunc func(ctx context.Context, sql string, args ...any) pgx.Row
+
+// execAppend 执行事件写入单语句（普通 Append 与事务性 AppendTx 共用同一
+// 执行路径）：原子完成「置同键待消费前驱 superseded + 插入新行」，实际
+// 插入行时经 wake CTE 发跨实例唤醒 NOTIFY（幂等冲突不重发信号；延迟行
+// 同样在插入时发，不判断 deliver_at——推送只回答「有新行」，ADR 0013
+// §2）。返回取代行数（AppendResult，与落库事实一致）；AppendTx 调用方
+// 按契约丢弃计数（不返回落库事实，ADR 0012——取代随事务提交才生效）。
+func (d *Driver) execAppend(ctx context.Context, queryRow queryRowFunc,
+	e event.RawEnvelope, meta string) (event.AppendResult, error) {
+	var superseded, woke int64
+	err := queryRow(ctx, fmt.Sprintf(appendInsertSQL, d.schema, d.schema, d.schema, d.schema),
 		e.ID, e.Type, e.Payload, meta, e.OccurredAt, deliverAtArg(e.DeliverAt),
-		d.wakeChannel, d.schema)
-	return err
+		time.Now().UTC(), coalesceKeyArg(e.CoalesceKey),
+		d.wakeChannel, d.schema).Scan(&superseded, &woke)
+	if err != nil {
+		return event.AppendResult{}, err
+	}
+	return event.AppendResult{Superseded: int(superseded)}, nil
 }
 
 // TransactionalAppender 事务性事件入队（outbox 可选面，不进 Driver 契约，
@@ -127,7 +172,9 @@ func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx pgx.Tx, e even
 	if err != nil {
 		return err
 	}
-	if err := ta.d.execAppend(ctx, tx.Exec, e, meta); err != nil {
+	// 取代与插入同事务（共用 appendInsertSQL）；计数按 ADR 0012 契约丢弃
+	// ——不返回落库事实（提交归调用方，回滚则取代一并撤销）。
+	if _, err := ta.d.execAppend(ctx, tx.QueryRow, e, meta); err != nil {
 		return fmt.Errorf("pgxc: append tx: %w", err)
 	}
 	return nil
