@@ -329,7 +329,7 @@ func testMigrationCompleteVerify(t *testing.T, b MigrationBackend) {
 func testMigrationCreateDriver(t *testing.T, b MigrationBackend) {
 	resetTo(t, b, MigrationSceneEmpty)
 	drv := b.NewDriver(t, event.MigrateCreate)
-	if err := drv.Append(t.Context(), migrationEnvelope("create-first")); err != nil {
+	if _, err := drv.Append(t.Context(), migrationEnvelope("create-first")); err != nil {
 		t.Fatalf("create-mode first append: %v", err)
 	}
 	requireMigrationVerifyOK(t, b)
@@ -338,7 +338,7 @@ func testMigrationCreateDriver(t *testing.T, b MigrationBackend) {
 func testMigrationVerifyDriver(t *testing.T, b MigrationBackend) {
 	resetTo(t, b, MigrationSceneEmpty)
 	drv := b.NewDriver(t, event.MigrateVerify)
-	err := drv.Append(t.Context(), migrationEnvelope("verify-first"))
+	_, err := drv.Append(t.Context(), migrationEnvelope("verify-first"))
 	var verifyErr *event.VerifyError
 	if !errors.As(err, &verifyErr) {
 		t.Fatalf("verify-mode first append = %v, want *event.VerifyError", err)
@@ -356,7 +356,7 @@ func testMigrationVerifyDriver(t *testing.T, b MigrationBackend) {
 func testMigrationNoneDriver(t *testing.T, b MigrationBackend) {
 	resetTo(t, b, MigrationSceneEmpty)
 	drv := b.NewDriver(t, event.MigrateNone)
-	err := drv.Append(t.Context(), migrationEnvelope("none-first"))
+	_, err := drv.Append(t.Context(), migrationEnvelope("none-first"))
 	if err == nil {
 		t.Fatal("none-mode first append = nil, want table-missing error")
 	}
@@ -470,7 +470,7 @@ func testMigrationConcurrentFirstStart(t *testing.T, b MigrationBackend) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			errs[i] = drivers[i].Append(ctx,
+			_, errs[i] = drivers[i].Append(ctx,
 				migrationEnvelope("concurrent-"+string(rune('a'+i))))
 		}(i)
 	}
@@ -539,7 +539,7 @@ func testMigrationLockNone(t *testing.T, b MigrationBackend) {
 	none.Reset(t)
 	none.Prepare(t, MigrationSceneEmpty)
 	drv := none.NewDriver(t, event.MigrateCreate)
-	err := drv.Append(t.Context(), migrationEnvelope("lock-none-first"))
+	_, err := drv.Append(t.Context(), migrationEnvelope("lock-none-first"))
 	if !errors.Is(err, event.ErrMigrationUnsupported) {
 		t.Fatalf("Lock=none create-mode first append = %v, want ErrMigrationUnsupported", err)
 	}

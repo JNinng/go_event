@@ -38,9 +38,18 @@ func (ta *TransactionalAppender) BeginTx(context.Context) (*Tx, error) {
 	return &Tx{d: ta.d}, nil
 }
 
-// AppendTx 在业务事务 tx 内追加事件（幂等：同 ID 首写为准）。事件在提交
-// 前对外不可见，提交后经轮询/认领可见（就近唤醒信号不覆盖事务内发布，
-// ADR 0012）。tx 为 nil、非本 appender 的事务或已终结的事务返回错误。
+// AppendTx 在业务事务 tx 内追加事件（幂等：同 ID 首写为准；CoalesceKey
+// 非空时记录同键取代意图，ADR 0014）。事件在提交前对外不可见，提交后经
+// 轮询/认领可见（就近唤醒信号不覆盖事务内发布，ADR 0012）。tx 为 nil、
+// 非本 appender 的事务或已终结的事务返回错误。
+//
+// 取代意图镜像 SQL 语义：sup 语句在 AppendTx 调用（执行）时刻解析候选前驱
+// ——已提交行与本事务先前缓冲行（同事务可见自身未提交写）、未被取代且无
+// 任何认领行；标记本身为事务内写，Commit 原子应用、Rollback 丢弃（与
+// Postgres 行锁随事务提交/回滚的可见性边界对齐）。进程内模拟不持行锁：
+// 调用与提交之间被并发认领的候选前驱在提交时仍被标记（SQL 后端该行为由
+// 语句执行时刻的行锁排序承载，本处不重查认领），旧事件多跑一趟对幂等
+// 任务无害（ADR 0014 v1 保守口径的已知边界）。
 func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *Tx, e event.RawEnvelope) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -65,7 +74,8 @@ func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *Tx, e event.R
 	ev.Attempts = 0
 	ev.LastAttempt = false
 	// 幂等：同 ID 首写为准——已提交行存在或同事务已缓冲同 ID 均丢弃本次
-	// 写入（缓冲行对内不可见，重复 ID 不产生第二行）。
+	// 写入（缓冲行对内不可见，重复 ID 不产生第二行；重复 Append 不触发
+	// 取代，与普通 Append 同口径）。
 	if _, ok := d.events[ev.ID]; ok {
 		return nil
 	}
@@ -74,21 +84,60 @@ func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *Tx, e event.R
 			return nil
 		}
 	}
+	// 合并投递：调用时刻解析同键待消费前驱（已提交行 + 本事务先前缓冲行），
+	// 标记随事务提交生效。
+	if ev.CoalesceKey != "" {
+		tx.supersede = append(tx.supersede, txSupersede{
+			ids: d.resolveSupersedeLocked(ev.Type, ev.CoalesceKey, tx),
+			at:  time.Now(),
+		})
+	}
 	tx.buffered = append(tx.buffered, ev)
 	return nil
 }
 
-// Tx 进程内业务事务（最小模拟）：缓冲事务性 Append，Commit 原子应用、
-// Rollback 丢弃。状态迁移全部在 Driver 锁内完成；非本包 Driver 的事务
-// 载体不可混用。
+// Tx 进程内业务事务（最小模拟）：缓冲事务性 Append 与同键取代意图，
+// Commit 原子应用、Rollback 丢弃。状态迁移全部在 Driver 锁内完成；非本
+// 包 Driver 的事务载体不可混用。
 type Tx struct {
-	d        *Driver
-	buffered []event.RawEnvelope // 已分配 position 的缓冲行（保持 AppendTx 序）
-	done     bool
+	d         *Driver
+	buffered  []event.RawEnvelope // 已分配 position 的缓冲行（保持 AppendTx 序）
+	supersede []txSupersede       // 与 buffered 对应的取代意图（AppendTx 时解析，提交时应用）
+	done      bool
 }
 
-// Commit 原子提交：单次锁内应用全部缓冲行（要么全部可见、要么全部不可
-// 见），并按首写为准重查交错提交的行。重复 Commit / 已回滚的事务返回错误。
+// txSupersede 是一次 AppendTx 的同键取代意图：候选前驱 ID 集与调用时刻
+// （标记写入时刻的模拟）。
+type txSupersede struct {
+	ids []string
+	at  time.Time
+}
+
+// resolveSupersedeLocked 解析同键待消费前驱（v1 保守口径，ADR 0014）：
+// 同 (type, key)、未被取代、无任何认领行——已提交行加上本事务先前缓冲的
+// 同键行（同事务可见自身未提交写，与 SQL 后端一致）。
+func (d *Driver) resolveSupersedeLocked(typ, key string, tx *Tx) []string {
+	var ids []string
+	for id, ev := range d.events {
+		if ev.env.Type != typ || ev.env.CoalesceKey != key {
+			continue
+		}
+		if !ev.supersededAt.IsZero() || d.hasClaimLocked(id) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	for _, b := range tx.buffered {
+		if b.Type == typ && b.CoalesceKey == key {
+			ids = append(ids, b.ID)
+		}
+	}
+	return ids
+}
+
+// Commit 原子提交：单次锁内应用全部缓冲行与取代意图（要么全部可见、
+// 要么全部不可见），并按首写为准重查交错提交的行。重复 Commit / 已回滚
+// 的事务返回错误。
 func (tx *Tx) Commit() error {
 	d := tx.d
 	d.mu.Lock()
@@ -102,7 +151,18 @@ func (tx *Tx) Commit() error {
 		}
 		d.events[e.ID] = &storedEvent{env: e, position: parsePosition(e.Position)}
 	}
+	// 应用取代意图：仅命中现存且未被取代的行（候选行被并发取代时后到
+	// 让先到，与 READ COMMITTED 重评估口径一致）；候选行未随事务插入或
+	// 已被清理则跳过。
+	for _, s := range tx.supersede {
+		for _, id := range s.ids {
+			if ev, ok := d.events[id]; ok && ev.supersededAt.IsZero() {
+				ev.supersededAt = s.at
+			}
+		}
+	}
 	tx.buffered = nil
+	tx.supersede = nil
 	tx.done = true
 	d.cleanupLocked(time.Now())
 	return nil

@@ -9,7 +9,9 @@ import (
 // noopDriver 满足 Driver 接口：被拒绝的发布不应触达任何后端方法。
 type noopDriver struct{}
 
-func (noopDriver) Append(context.Context, RawEnvelope) error { return nil }
+func (noopDriver) Append(context.Context, RawEnvelope) (AppendResult, error) {
+	return AppendResult{}, nil
+}
 
 func (noopDriver) Fetch(context.Context, FetchQuery) ([]RawEnvelope, error) {
 	return nil, nil

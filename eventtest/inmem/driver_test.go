@@ -43,7 +43,7 @@ func TestInmemMigrationNoop(t *testing.T) {
 		env := event.RawEnvelope{
 			ID: "noop-1", Type: "noop", Payload: []byte(`{}`), OccurredAt: time.Now(),
 		}
-		if err := drv.Append(t.Context(), env); err != nil {
+		if _, err := drv.Append(t.Context(), env); err != nil {
 			t.Fatalf("append: %v", err)
 		}
 		if err := inmem.Migrate(t.Context()); err != nil {
@@ -107,6 +107,24 @@ func TestInmemTransactionalAppendSuite(t *testing.T) {
 		}
 		return &inmemTxSession{ta: ta, tx: tx}
 	})
+}
+
+// 合并投递契约（同键最新一次消费，ADR 0014）：inmem 在内存模拟同一取代
+// 与下推排除口径，契约套件全过。工厂按用例返回配置保留窗口的全新 Driver
+// （保留期清理用例构造超窗行）；beginTx 与传入 driver 同源绑定事务会话。
+func TestInmemCoalescingSuite(t *testing.T) {
+	eventtest.RunCoalescingSuite(t,
+		func(t *testing.T) event.Driver {
+			return inmem.New(inmem.WithRetention(2 * time.Second))
+		},
+		func(t *testing.T, d event.Driver) eventtest.TxSession {
+			ta := inmem.NewTransactionalAppender(d)
+			tx, err := ta.BeginTx(t.Context())
+			if err != nil {
+				t.Fatalf("begin tx: %v", err)
+			}
+			return &inmemTxSession{ta: ta, tx: tx}
+		})
 }
 
 // inmemTxSession 把 TransactionalAppender 的缓冲事务适配成套件 TxSession。

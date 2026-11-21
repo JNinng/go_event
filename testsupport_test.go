@@ -22,6 +22,7 @@ type stubDriver struct {
 	headFail  error // HeadPosition 注入错误
 	fetchErrs int   // Fetch 剩余注入错误次数
 	appendErr error // Append 注入错误
+	supersede int   // Append 返回的合并取代行数（计量用例注入）
 	appends   []event.RawEnvelope
 }
 
@@ -29,21 +30,21 @@ func newStubDriver() *stubDriver {
 	return &stubDriver{events: make(map[string]event.RawEnvelope)}
 }
 
-func (s *stubDriver) Append(_ context.Context, e event.RawEnvelope) error {
+func (s *stubDriver) Append(_ context.Context, e event.RawEnvelope) (event.AppendResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.appendErr != nil {
-		return s.appendErr
+		return event.AppendResult{}, s.appendErr
 	}
 	if _, ok := s.events[e.ID]; ok {
-		return nil // 幂等：首写为准
+		return event.AppendResult{}, nil // 幂等：首写为准
 	}
 	s.position++
 	ev := e
 	ev.Position = strconv.FormatUint(s.position, 10)
 	s.events[e.ID] = ev
 	s.appends = append(s.appends, ev)
-	return nil
+	return event.AppendResult{Superseded: s.supersede}, nil
 }
 
 func (s *stubDriver) HeadPosition(_ context.Context, typ string) (string, error) {

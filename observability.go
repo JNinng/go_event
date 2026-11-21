@@ -234,6 +234,7 @@ func safeObserve(fn func()) {
 type publisherMetrics struct {
 	publish         metric.Int64Counter
 	publishDuration metric.Float64Histogram
+	supersede       metric.Int64Counter
 	wake            metric.Int64Counter
 }
 
@@ -247,6 +248,8 @@ func newPublisherMetrics(mp metric.MeterProvider, scope string) *publisherMetric
 		metric.WithDescription("事件发布结果计数"), metric.WithUnit("1"))
 	pm.publishDuration, _ = m.Float64Histogram(scope+".publish.duration",
 		metric.WithDescription("事件发布耗时"), metric.WithUnit("s"))
+	pm.supersede, _ = m.Int64Counter(scope+".append.supersede",
+		metric.WithDescription("合并投递取代前驱行数（与落库事实一致，ADR 0014）"), metric.WithUnit("1"))
 	pm.wake, _ = m.Int64Counter(scope+".wake",
 		metric.WithDescription("就近唤醒信号计数（sent/dropped）"), metric.WithUnit("1"))
 	return pm

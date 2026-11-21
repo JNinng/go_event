@@ -282,6 +282,41 @@ func TestPublishResult_Publish_CountsResultAndDuration(t *testing.T) {
 	}
 }
 
+// 合并取代计数（ADR 0014）：Append 返回非零取代行数时按 event 属性打点
+// <scope>.append.supersede；零取代（未设键 / 幂等冲突）不打点——计数与
+// 落库事实一致（AppendResult）。
+func TestAppendSupersede_Publish_CountsSupersededRows(t *testing.T) {
+	mp, reader := newManualProvider(t)
+	d := newStubDriver()
+	d.mu.Lock()
+	d.supersede = 3
+	d.mu.Unlock()
+	p := event.NewPublisher(d, event.WithMeterProvider(mp))
+
+	if err := event.Publish(context.Background(), p, obsType, runPayload{Value: "x"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	dps := counterDatapoints(t, reader, "go_event.append.supersede")
+	if got := counterTotal(dps); got != 3 {
+		t.Fatalf("append.supersede total = %d, want 3", got)
+	}
+	for _, dp := range dps {
+		if v, ok := dp.Attributes.Value("event"); !ok || v.AsString() != obsType.Name {
+			t.Fatalf("supersede datapoint attrs = %v, want event=%q", dp.Attributes, obsType.Name)
+		}
+	}
+
+	// 零取代不打点：新 Publisher 无取代事实时指标不出现在收集中。
+	mp2, reader2 := newManualProvider(t)
+	p2 := event.NewPublisher(newStubDriver(), event.WithMeterProvider(mp2))
+	if err := event.Publish(context.Background(), p2, obsType, runPayload{Value: "y"}); err != nil {
+		t.Fatalf("publish 2: %v", err)
+	}
+	if dps := counterDatapointsOrEmpty(reader2, "go_event.append.supersede"); dps != nil {
+		t.Fatalf("zero supersede must not emit, got datapoints %v", dps)
+	}
+}
+
 func TestObserverPanic_Publish_BypassedAndCounted(t *testing.T) {
 	mp, reader := newManualProvider(t)
 	p := event.NewPublisher(newStubDriver(), event.WithMeterProvider(mp),

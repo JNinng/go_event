@@ -1,7 +1,8 @@
 // Package eventtest 契约测试套件：接口的语义就是这套测试，新后端必须
 // 全过（design.md §1、§9.1）。RunSuite 覆盖公共、广播读取、认领消费与
 // core 编排语义；RunRetentionSuite / RunDelayedDeliverySuite 覆盖保留窗
-// 口清理资格与延迟事件（design.md §5.2、ADR 0013）；RunMigrationSuite
+// 口清理资格与延迟事件（design.md §5.2、ADR 0013）；RunCoalescingSuite
+// 覆盖合并投递（同键最新一次消费，ADR 0014）；RunMigrationSuite
 // 经 MigrationBackend 覆盖持久结构初始化面；RunInspectorSuite /
 // RunAdminReplaySuite / RunTransactionalAppendSuite 覆盖只读查询面
 // （ADR 0005）、管理面重放（ADR 0010）与 outbox 事务性入队（ADR 0012）
@@ -168,7 +169,7 @@ func appendEvent(t *testing.T, d event.Driver, id, typ string, value string,
 		ID: id, Type: typ, Payload: payload,
 		Metadata: meta, OccurredAt: baseNow,
 	}
-	if err := d.Append(t.Context(), e); err != nil {
+	if _, err := d.Append(t.Context(), e); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	return e
@@ -183,7 +184,7 @@ func appendOccurredAt(t *testing.T, d event.Driver, id, typ string,
 		t.Fatalf("encode payload: %v", err)
 	}
 	e := event.RawEnvelope{ID: id, Type: typ, Payload: payload, OccurredAt: occurredAt}
-	if err := d.Append(t.Context(), e); err != nil {
+	if _, err := d.Append(t.Context(), e); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 }

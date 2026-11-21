@@ -155,6 +155,35 @@ func TestPublishMetadata_Merges_AndPassesThrough(t *testing.T) {
 	}
 }
 
+// WithCoalesceKey 合并投递键透传（ADR 0014）：声明后原样落库信封，缺省
+// （空串）不携带——键与事件 ID 正交，ID 照常由生成器填充。
+func TestWithCoalesceKey_Publish_CarriesKeyOnEnvelope(t *testing.T) {
+	d := newStubDriver()
+	pub := event.NewPublisher(d)
+	ev := event.Declare[pubPayload]("unit.coalesce")
+	ctx := context.Background()
+
+	if err := ev.Publish(ctx, pub, pubPayload{"a"},
+		event.WithEventID("c-1"), event.WithCoalesceKey("kb:doc-1")); err != nil {
+		t.Fatalf("publish with coalesce key: %v", err)
+	}
+	if err := ev.Publish(ctx, pub, pubPayload{"b"},
+		event.WithEventID("c-2"), event.WithCoalesceKey("")); err != nil {
+		t.Fatalf("publish with empty coalesce key: %v", err)
+	}
+
+	appends := d.appended()
+	if appends[0].CoalesceKey != "kb:doc-1" {
+		t.Fatalf("coalesce key must be carried on the envelope, got %q", appends[0].CoalesceKey)
+	}
+	if appends[1].CoalesceKey != "" {
+		t.Fatalf("unset coalesce key must be empty, got %q", appends[1].CoalesceKey)
+	}
+	if appends[0].ID != "c-1" || appends[1].ID != "c-2" {
+		t.Fatalf("coalesce key must not affect ID generation, got %q / %q", appends[0].ID, appends[1].ID)
+	}
+}
+
 // 编码失败：Publish 返回错误且不落库（编码在 Append 前短路）。
 func TestEncodeFailure_Publish_ReturnsErrorWithoutAppend(t *testing.T) {
 	d := newStubDriver()

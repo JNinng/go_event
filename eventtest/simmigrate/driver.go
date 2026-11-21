@@ -76,9 +76,9 @@ func (d *driver) ready(ctx context.Context) error {
 	return nil
 }
 
-func (d *driver) Append(ctx context.Context, e event.RawEnvelope) error {
+func (d *driver) Append(ctx context.Context, e event.RawEnvelope) (event.AppendResult, error) {
 	if err := d.ready(ctx); err != nil {
-		return err
+		return event.AppendResult{}, err
 	}
 	return d.inner.Append(ctx, e)
 }

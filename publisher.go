@@ -92,6 +92,9 @@ type publishConfig struct {
 	eventID *string
 	// deliverAt 是延迟投递声明（WithDeliverAt）；零值 = 立即可投递。
 	deliverAt time.Time
+	// coalesceKey 是合并投递键声明（WithCoalesceKey，ADR 0014）；空串 =
+	// 未设置，不参与合并。
+	coalesceKey string
 }
 
 // WithEventID 显式指定事件 ID，优先于 IDGenerator；空串非法，
@@ -127,6 +130,19 @@ func WithDeliverAt(t time.Time) PublishOption {
 	return func(c *publishConfig) { c.deliverAt = t }
 }
 
+// WithCoalesceKey 声明合并投递键（ADR 0014）：同 (Type, CoalesceKey)
+// 作用域内，Append 原子将「无任何认领行的待消费前驱」置为 superseded
+// 并插入新行——同键短期多次发布只消费最新一次（如知识库重建短窗多次
+// 触发）。空串（选项缺省）= 未设置，不参与合并；处理中 / 等退避 / 租约
+// 过期待接管 / 终态的前驱不取代，新事件照常排队（v1 保守口径）。键与
+// 事件 ID 正交：同 ID 幂等 Append 语义不变（重复 Append 不触发取代——
+// 去抖配方须每次发布新 ID，见 usage.md §4.3）。窗口语义不内建：去抖经
+// 与 WithDeliverAt 组合表达（合并键 + deliver_at = now + 静默期，每次
+// 新发布自带基线）。被取代行照常占 position，广播水位直接越过。
+func WithCoalesceKey(key string) PublishOption {
+	return func(c *publishConfig) { c.coalesceKey = key }
+}
+
 // Publish 发布实现：ID 与 OccurredAt 缺省自动填充（design.md §6）。
 // 显式 WithEventID 优先于 IDGenerator；空串返回 ErrEmptyEventID。
 // 事件侧糖 Event[T].Publish 委托到此。
@@ -154,15 +170,16 @@ func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
 		return err
 	}
 	raw := RawEnvelope{
-		ID:         id,
-		Type:       ev.Name,
-		Payload:    encoded,
-		Metadata:   cfg.metadata,
-		OccurredAt: time.Now().UTC(),
-		DeliverAt:  cfg.deliverAt, // 零值 = 立即可投递（WithDeliverAt 缺省）
+		ID:          id,
+		Type:        ev.Name,
+		Payload:     encoded,
+		Metadata:    cfg.metadata,
+		OccurredAt:  time.Now().UTC(),
+		DeliverAt:   cfg.deliverAt,   // 零值 = 立即可投递（WithDeliverAt 缺省）
+		CoalesceKey: cfg.coalesceKey, // 空串 = 未设置（WithCoalesceKey 缺省）
 	}
 	start := time.Now()
-	err = p.drv.Append(ctx, raw)
+	res, err := p.drv.Append(ctx, raw)
 	result := resultOK
 	if err != nil {
 		result = resultAppendError
@@ -170,6 +187,12 @@ func Publish[T any](ctx context.Context, p *Publisher, ev Event[T],
 	p.recordPublish(ctx, ev.Name, result, err, time.Since(start))
 	if err != nil {
 		return err
+	}
+	if res.Superseded > 0 {
+		// 合并取代计数（ADR 0014）：计数与落库事实一致（AppendResult），
+		// 非零才打点（与 claim.granted 口径一致）。
+		p.metrics.supersede.Add(ctx, int64(res.Superseded),
+			metric.WithAttributes(attribute.String(attrEvent, ev.Name)))
 	}
 	if p.wake != nil {
 		notified, dropped := p.wake.notify(ev.Name) // 仅信号；poll 兜底（ADR 0003）

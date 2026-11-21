@@ -42,7 +42,7 @@ func appendDelayed(t *testing.T, d event.Driver, id, typ string,
 		ID: id, Type: typ, Payload: payload,
 		OccurredAt: occurredAt, DeliverAt: deliverAt,
 	}
-	if err := d.Append(t.Context(), e); err != nil {
+	if _, err := d.Append(t.Context(), e); err != nil {
 		t.Fatalf("append delayed: %v", err)
 	}
 }

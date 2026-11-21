@@ -39,8 +39,10 @@ func (d *Driver) ClaimState(_ context.Context, eventID, consumerType string) (ev
 	}, true, nil
 }
 
-// CountStates 按消费者身份对事件类型做状态分档计数：无认领行计入
-// Pending（「待处理」= 该身份无认领行），其余按认领行 status 分档。
+// CountStates 按消费者身份对事件类型做状态分档计数：无认领行按 superseded
+// 属性细分——未取代计入 Pending（「待处理」= 该身份无认领行且未被取代）、
+// 已被合并取代计入 Superseded（事件行属性档，ADR 0014），其余按认领行
+// status 分档。
 func (d *Driver) CountStates(_ context.Context, typ, consumerType string) (event.StateCounts, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -51,7 +53,11 @@ func (d *Driver) CountStates(_ context.Context, typ, consumerType string) (event
 		}
 		sc, ok := d.claims[claimKey{ev.env.ID, consumerType}]
 		if !ok {
-			c.Pending++
+			if ev.supersededAt.IsZero() {
+				c.Pending++
+			} else {
+				c.Superseded++
+			}
 			continue
 		}
 		switch sc.status {

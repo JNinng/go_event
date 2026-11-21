@@ -1027,7 +1027,7 @@ func testRuntimeFieldsNotPersisted(t *testing.T, d event.Driver) {
 		ID: "rf1", Type: typ, Payload: payload, OccurredAt: baseNow,
 		Attempts: 99, LastAttempt: true,
 	}
-	if err := d.Append(t.Context(), injected); err != nil {
+	if _, err := d.Append(t.Context(), injected); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 

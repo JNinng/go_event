@@ -58,6 +58,11 @@ type Envelope[T any] struct {
 	// 消费下延迟行可能被水位越过而不再投递（ADR 0013 §1 的边界），需要
 	// 定时必达用认领消费。
 	DeliverAt time.Time
+	// CoalesceKey 是合并投递键（WithCoalesceKey 设置，ADR 0014）：同
+	// (Type, CoalesceKey) 作用域内最新一次发布取代之前的待消费前驱，
+	// 被取代行不再投递。空串表示未设置。与事件 ID 正交：同 ID 幂等
+	// Append 语义不变（重复 Append 不触发取代）。
+	CoalesceKey string
 
 	// Attempts 是本次投递的尝试序号（含本次）：新认领为「已失败次数 + 1」，
 	// 接管认领在先前基础上递增。仅认领消费有意义，广播消费恒为 0。
@@ -82,6 +87,12 @@ type RawEnvelope struct {
 	// 行在单条操作内被过滤（ADR 0004 过滤发生在读取/认领时）。过去时刻
 	// 等价立即可投递，不报错。
 	DeliverAt time.Time
+	// CoalesceKey 是合并投递键（ADR 0014）：后端原样落库（空串存 NULL）。
+	// 同 (Type, CoalesceKey) 作用域内，Append 原子将「无任何认领行的待
+	// 消费前驱」置为 superseded，Fetch / Claim 不再返回被取代行（广播
+	// 水位直接越过，无新边界）；与事件 ID 正交——重复 Append 同 ID 不
+	// 触发取代（幂等语义不变）。空串表示未设置，不参与合并。
+	CoalesceKey string
 	// Position 是后端定义的全序位置（如 Postgres bigserial），仅用于
 	// 广播消费的已读水位条件（ADR 0004）：core 内存按订阅类型维护、
 	// 只进不退，Fetch 时原样回传。Append 输入侧忽略此字段。
@@ -114,6 +125,7 @@ func wrapHandler[T any](r *Runner, h Handler[T]) func(context.Context, RawEnvelo
 			Metadata:    raw.Metadata,
 			OccurredAt:  raw.OccurredAt,
 			DeliverAt:   raw.DeliverAt,
+			CoalesceKey: raw.CoalesceKey,
 			Attempts:    raw.Attempts,
 			LastAttempt: raw.LastAttempt,
 		})

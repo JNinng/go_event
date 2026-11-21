@@ -312,7 +312,7 @@ func testTxCrossPathIdempotent(t *testing.T, d event.Driver, beginTx func(*testi
 	tx.AppendTx(t, event.RawEnvelope{ID: "tx-xp-1", Type: typ,
 		Payload: txPayload(t, "first"), OccurredAt: baseNow})
 	tx.Commit(t)
-	if err := d.Append(t.Context(), event.RawEnvelope{ID: "tx-xp-1", Type: typ,
+	if _, err := d.Append(t.Context(), event.RawEnvelope{ID: "tx-xp-1", Type: typ,
 		Payload: txPayload(t, "second"), OccurredAt: baseNow}); err != nil {
 		t.Fatalf("plain append over tx-committed id: %v", err)
 	}
@@ -326,7 +326,7 @@ func testTxCrossPathIdempotent(t *testing.T, d event.Driver, beginTx func(*testi
 	}
 
 	// 方向二：普通 Append 提交在前，AppendTx 同 ID 在后——首写保留。
-	if err := d.Append(t.Context(), event.RawEnvelope{ID: "tx-xp-2", Type: typ,
+	if _, err := d.Append(t.Context(), event.RawEnvelope{ID: "tx-xp-2", Type: typ,
 		Payload: txPayload(t, "first"), OccurredAt: baseNow}); err != nil {
 		t.Fatalf("plain append: %v", err)
 	}

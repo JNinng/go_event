@@ -18,17 +18,18 @@ import (
 type Inspector interface {
 	// ClaimState 返回（事件 × 消费者身份）认领行的当前状态与重试计数。
 	// ok 为 false 表示该身份对该事件无认领行——事件不存在、已超保留
-	// 窗口被清理、或该身份尚未认领，三者即「待处理」态（与
-	// CountStates 的 Pending 档同口径）；查询故障经 error 返回，不得
-	// 折叠为 ok=false。
+	// 窗口被清理、或该身份尚未认领，三者即「待处理」态（该身份无认领
+	// 行的行按 superseded 属性细分进 CountStates 的 Pending / Superseded
+	// 两档）；查询故障经 error 返回，不得折叠为 ok=false。
 	ClaimState(ctx context.Context, eventID, consumerType string) (ClaimState, bool, error)
 
 	// CountStates 按消费者身份对某事件类型做状态分档计数：待处理 /
-	// 重试中 / processing / failed / done 五档互斥且完备，合计等于该
-	// 类型的事件总数，分档口径与 Claim/Fail/Complete 的落库事实严格
-	// 对齐（docs/api.md §2.10）——Pending 即「该身份无认领行」而非
-	// 「退避中」；processing 按落库 status='active' 分档，租约是否
-	// 已过期不改变本档。
+	// superseded / 重试中 / processing / failed / done 六档互斥且完备，
+	// 合计等于该类型的事件总数，分档口径与 Claim/Fail/Complete/Append
+	// 的落库事实严格对齐（docs/api.md §2.10）——Pending 即「该身份无
+	// 认领行且未被取代」而非「退避中」；Superseded 是事件行属性档（该
+	// 身份无认领行且已被合并取代，ADR 0014）；processing 按落库
+	// status='active' 分档，租约是否已过期不改变本档。
 	CountStates(ctx context.Context, typ, consumerType string) (StateCounts, error)
 
 	// FailedEvents 返回 failed 终态事件的分页列表（含错误摘要与终态
@@ -61,7 +62,8 @@ type ClaimState struct {
 // StateCounts 某事件类型在某消费者身份下的状态分档计数（口径见
 // Inspector.CountStates）。
 type StateCounts struct {
-	Pending    int // 待处理：该身份无认领行
+	Pending    int // 待处理：该身份无认领行且未被取代
+	Superseded int // superseded：该身份无认领行且已被合并取代（ADR 0014）
 	Retrying   int // 重试中：Fail 未达终态
 	Processing int // processing：落库持有租约（status='active'）
 	Failed     int // failed 终态
