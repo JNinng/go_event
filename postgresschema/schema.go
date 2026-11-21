@@ -48,6 +48,21 @@ func EventVersionColumns() []Column {
 	}
 }
 
+// EventCoalesceVersionColumns 返回 event 表基线之后以 ALTER TABLE ...
+// ADD COLUMN IF NOT EXISTS 追加的列（顺序即版本计划 v4 语句顺序）：
+// 合并投递键 coalesce_key 与取代时刻 superseded_at，均可空、无默认值
+// （NULL = 未设置 / 未取代，合并投递 ADR 0014）。
+func EventCoalesceVersionColumns() []Column {
+	return []Column{
+		{Name: "coalesce_key", DataType: "text"},
+		{Name: "superseded_at", DataType: "timestamp with time zone"},
+	}
+}
+
+// EventCoalesceIndex 是 event 表的同键取代查找索引名（版本计划 v4 构造）：
+// (type, coalesce_key) 部分索引，仅覆盖参与合并的行。
+const EventCoalesceIndex = "event_type_coalesce_idx"
+
 // EventClaimColumns 返回 event_claim 表的期望列（顺序即建表顺序）。仅含
 // 基线 v1 建表列；基线之后以 ADD COLUMN IF NOT EXISTS 追加的列见
 // EventClaimVersionColumns（独立列对象参与期望对象集合，不进本表定义）。
@@ -191,5 +206,22 @@ func ExpectedObjects(schema string) []Object {
 			Columns: []Column{col},
 		})
 	}
+	// v4 合并投递：独立列对象（event.coalesce_key / event.superseded_at，
+	// ADR 0014）+ 同键取代查找索引（部分索引，谓词不参与快照比对口径，
+	// 与列/索引的名称-表-键列比对一致）。
+	for _, col := range EventCoalesceVersionColumns() {
+		objs = append(objs, Object{
+			Kind:    event.KindColumn,
+			Name:    Qualified(schema, TableEvent) + "." + col.Name,
+			Table:   TableEvent,
+			Columns: []Column{col},
+		})
+	}
+	objs = append(objs, Object{
+		Kind:       event.KindIndex,
+		Name:       Qualified(schema, EventCoalesceIndex),
+		Table:      TableEvent,
+		KeyColumns: []string{"type", "coalesce_key"},
+	})
 	return objs
 }

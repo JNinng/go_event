@@ -71,8 +71,8 @@ func TestPlan(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PlannedStatements: %v", err)
 		}
-		if len(paired) != 12 {
-			t.Fatalf("plan statements = %d, want 12 (baseline v1: 9 + v2 add-column: 2 + v3 add-column: 1)", len(paired))
+		if len(paired) != 15 {
+			t.Fatalf("plan statements = %d, want 15 (baseline v1: 9 + v2 add-column: 2 + v3 add-column: 1 + v4 coalesce: 3)", len(paired))
 		}
 		objs := postgresschema.ExpectedObjects("public")
 		if len(objs) != len(paired) {
@@ -102,8 +102,8 @@ func TestPlan(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Plan: %v", err)
 		}
-		if len(plan) != 3 {
-			t.Fatalf("plan versions = %d, want 3", len(plan))
+		if len(plan) != 4 {
+			t.Fatalf("plan versions = %d, want 4", len(plan))
 		}
 		v2 := plan[1]
 		if v2.Number != 2 || len(v2.Statements) != 2 {
@@ -183,6 +183,61 @@ func TestPlan(t *testing.T) {
 		}
 		if !strings.Contains(v3.Statements[0], "ADD COLUMN IF NOT EXISTS") {
 			t.Fatalf("v3 statement must be idempotent ADD COLUMN IF NOT EXISTS: %s", v3.Statements[0])
+		}
+	})
+	t.Run("VersionFour_Statements_AddCoalesceColumnsAndIndexIdempotent", func(t *testing.T) {
+		plan, err := postgresschema.Plan("tenant")
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		v4 := plan[3]
+		if v4.Number != 4 || len(v4.Statements) != 3 {
+			t.Fatalf("v4 = %+v, want exactly 3 statements (2 add-column + 1 index)", v4)
+		}
+		// 语句与期望对象按序一一配对：两条加列 + 一条部分索引。
+		paired, err := postgresschema.PlannedStatements("tenant")
+		if err != nil {
+			t.Fatalf("PlannedStatements: %v", err)
+		}
+		want := []struct {
+			name string
+			ddl  string
+			kind event.ObjectKind
+		}{
+			{"tenant.event.coalesce_key",
+				"ALTER TABLE tenant.event ADD COLUMN IF NOT EXISTS coalesce_key text;", event.KindColumn},
+			{"tenant.event.superseded_at",
+				"ALTER TABLE tenant.event ADD COLUMN IF NOT EXISTS superseded_at timestamptz;", event.KindColumn},
+			{"tenant.event_type_coalesce_idx",
+				"CREATE INDEX IF NOT EXISTS event_type_coalesce_idx ON tenant.event (type, coalesce_key) WHERE coalesce_key IS NOT NULL;",
+				event.KindIndex},
+		}
+		for i, w := range want {
+			ps := paired[12+i]
+			if ps.SQL != w.ddl {
+				t.Fatalf("v4 statement %d = %q, want %q", i, ps.SQL, w.ddl)
+			}
+			if ps.Object.Kind != w.kind || ps.Object.Name != w.name {
+				t.Fatalf("v4 statement %d pairs with %+v, want %s %s", i, ps.Object, w.kind, w.name)
+			}
+		}
+		coalesceCol := paired[12].Object.Columns[0]
+		if coalesceCol.NotNull || coalesceCol.DataType != "text" {
+			t.Fatalf("coalesce_key must be nullable text: %+v", coalesceCol)
+		}
+		supersededCol := paired[13].Object.Columns[0]
+		if supersededCol.NotNull || supersededCol.DataType != "timestamp with time zone" {
+			t.Fatalf("superseded_at must be nullable timestamptz: %+v", supersededCol)
+		}
+		idx := paired[14].Object
+		if !reflect.DeepEqual(idx.KeyColumns, []string{"type", "coalesce_key"}) || idx.Unique {
+			t.Fatalf("coalesce index object = %+v, want (type, coalesce_key) non-unique", idx)
+		}
+		// 全部 v4 语句幂等（IF NOT EXISTS），expand-only。
+		for _, stmt := range v4.Statements {
+			if !strings.Contains(stmt, "IF NOT EXISTS") {
+				t.Fatalf("v4 statement must be idempotent: %s", stmt)
+			}
 		}
 	})
 }
@@ -312,6 +367,9 @@ func TestExpectedObjects(t *testing.T) {
 			event.KindColumn,
 			event.KindColumn,
 			event.KindColumn,
+			event.KindColumn,
+			event.KindColumn,
+			event.KindIndex,
 		}
 		if len(objs) != len(wantKinds) {
 			t.Fatalf("ExpectedObjects = %d, want %d", len(objs), len(wantKinds))
@@ -367,6 +425,29 @@ func TestExpectedObjects(t *testing.T) {
 		if len(obj.Columns) != 1 || obj.Columns[0].NotNull ||
 			obj.Columns[0].DataType != "timestamp with time zone" {
 			t.Fatalf("v3 column object must carry a single nullable timestamptz: %+v", obj.Columns)
+		}
+		// v4 合并投递对象：两条 event 版本加列 + 同键取代查找索引。
+		v4Cols := []string{"public.event.coalesce_key", "public.event.superseded_at"}
+		for i, name := range v4Cols {
+			obj := objs[12+i]
+			if obj.Name != name || obj.Table != "event" {
+				t.Fatalf("v4 column object %d = %+v, want %s on event", 12+i, obj, name)
+			}
+			if len(obj.Columns) != 1 || obj.Columns[0].NotNull {
+				t.Fatalf("v4 column object %s must carry a single nullable column: %+v", name, obj.Columns)
+			}
+		}
+		if objs[12].Columns[0].DataType != "text" ||
+			objs[13].Columns[0].DataType != "timestamp with time zone" {
+			t.Fatalf("v4 column types = %q / %q, want text / timestamp with time zone",
+				objs[12].Columns[0].DataType, objs[13].Columns[0].DataType)
+		}
+		idx := objs[14]
+		if idx.Name != "public.event_type_coalesce_idx" || idx.Table != "event" || idx.Unique {
+			t.Fatalf("v4 index object = %+v, want public.event_type_coalesce_idx on event (non-unique)", idx)
+		}
+		if !reflect.DeepEqual(idx.KeyColumns, []string{"type", "coalesce_key"}) {
+			t.Fatalf("v4 index key columns = %+v, want type + coalesce_key", idx.KeyColumns)
 		}
 	})
 }
@@ -587,8 +668,9 @@ func TestDiff(t *testing.T) {
 }
 
 func fullSnapshot() postgresschema.Snapshot {
-	eventCols := make([]postgresschema.ColumnState, 0, 7)
-	for _, col := range append(postgresschema.EventColumns(), postgresschema.EventVersionColumns()...) {
+	eventCols := make([]postgresschema.ColumnState, 0, 9)
+	for _, col := range append(append(postgresschema.EventColumns(), postgresschema.EventVersionColumns()...),
+		postgresschema.EventCoalesceVersionColumns()...) {
 		eventCols = append(eventCols, postgresschema.ColumnState{
 			Name: col.Name, DataType: col.DataType, NotNull: col.NotNull,
 			HasSequenceDefault: col.Sequence,
@@ -630,6 +712,10 @@ func fullSnapshot() postgresschema.Snapshot {
 			"event_claim_eligible_idx": {
 				Name: "event_claim_eligible_idx", Table: "event_claim",
 				Columns: []string{"status", "next_eligible_at"},
+			},
+			"event_type_coalesce_idx": {
+				Name: "event_type_coalesce_idx", Table: "event",
+				Columns: []string{"type", "coalesce_key"},
 			},
 		},
 	}

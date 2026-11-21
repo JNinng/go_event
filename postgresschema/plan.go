@@ -54,6 +54,11 @@ func Plan(schema string) ([]Version, error) {
 		return nil, err
 	}
 	versions = append(versions, Version{Number: 3, Statements: v3})
+	v4, err := v4Statements(schema)
+	if err != nil {
+		return nil, err
+	}
+	versions = append(versions, Version{Number: 4, Statements: v4})
 	// 后续版本在此按 Number 递增追加；每版至少一条语句。
 	return versions, nil
 }
@@ -210,6 +215,29 @@ func v3Statements(schema string) ([]string, error) {
 			`ALTER TABLE %[1]s.%[2]s ADD COLUMN IF NOT EXISTS %[3]s %[4]s;`,
 			schema, TableEvent, col.Name, ddlType(col.DataType)))
 	}
+	return stmts, nil
+}
+
+// v4Statements 合并投递版本：event 追加合并键列（coalesce_key）与取代
+// 时刻列（superseded_at），并建同键取代查找索引（docs/design.md §9.2、
+// ADR 0014）。沿 v2/v3 先例：语句幂等且 expand-only，一条语句恰好构造
+// 期望对象集合中的一个对象；列可空、无默认值（NULL = 未设置 / 未取代），
+// 对既有行与旧二进制无害——合并是优化不是正确性保证。索引为部分索引
+// （仅覆盖参与合并的行），快照比对只看名称/表/键列，谓词不参与。
+func v4Statements(schema string) ([]string, error) {
+	if err := ValidateSchema(schema); err != nil {
+		return nil, err
+	}
+	cols := EventCoalesceVersionColumns()
+	stmts := make([]string, 0, len(cols)+1)
+	for _, col := range cols {
+		stmts = append(stmts, fmt.Sprintf(
+			`ALTER TABLE %[1]s.%[2]s ADD COLUMN IF NOT EXISTS %[3]s %[4]s;`,
+			schema, TableEvent, col.Name, ddlType(col.DataType)))
+	}
+	stmts = append(stmts, fmt.Sprintf(
+		`CREATE INDEX IF NOT EXISTS %[3]s ON %[1]s.%[2]s (type, coalesce_key) WHERE coalesce_key IS NOT NULL;`,
+		schema, TableEvent, EventCoalesceIndex))
 	return stmts, nil
 }
 
