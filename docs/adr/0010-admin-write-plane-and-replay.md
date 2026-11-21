@@ -6,7 +6,7 @@
 ## 背景
 
 认领消费的 `failed` 终态此前只能等保留窗口清理：没有把失败事件重新置为
-可认领的入口。TODO 把「failed 事件手工重放」定为 P1 项，写操作由管理面
+可认领的入口。failed 事件手工重放是生产化能力缺口，写操作由管理面
 `Admin` 承载；[ADR 0009](0009-error-summary-persistence.md) 已定下重放与
 错误摘要的交集口径（清 `failed_at`、保留 `last_error`）。
 
@@ -63,7 +63,7 @@
 
 ### 5. 加固：与迁移执行共用命名空间互斥锁
 
-- TODO 契约要求「所有写操作必须持相应锁、并发调用与迁移互斥」。重放在
+- 管理面契约要求「所有写操作必须持相应锁、并发调用与迁移互斥」。重放在
   事务内先取得**与迁移执行同一把** advisory 锁
   （`postgresschema.LockKey(schema)`，键含 schema——不同命名空间互不
   阻塞），再执行 CAS 更新：管理写与迁移串行化（迁移的 `ADD COLUMN` 与
@@ -77,7 +77,7 @@
 
 ### 6. 加固：操作来源记录（观测旁路）
 
-- TODO 契约要求「记录操作来源」。沿 [ADR 0008](0008-observability.md)
+- 契约要求「记录操作来源」。沿 [ADR 0008](0008-observability.md)
   口径补管理面观测：otel 指标 `<scope>.admin.replay`（Counter，`result`=
   ok/no_effect/canceled/lock_timeout/error 与 `schema` 属性）与
   `<scope>.admin.replay.duration`（直方图，`result` 维度，操作入口到返回

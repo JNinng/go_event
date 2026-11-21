@@ -9,7 +9,7 @@
 
 本库此前只有两类观测缝：Runner 的 slog 生命周期日志（缺省
 `slog.Default()`，`WithLogger` 注入）与「以日志为同步点」的测试技巧；
-发布、消费、唤醒丢弃、迁移成败均不可观测。TODO 中预留的方案是「可注入
+发布、消费、唤醒丢弃、迁移成败均不可观测。原预留方案是「可注入
 `Metrics` 接口 + 实现方适配 otel」，其动机是不把 otel 依赖引入 core。
 
 工程层面的可观测统一规范已经确定：日志走 stdlib `log/slog`、指标走
@@ -84,7 +84,7 @@
 - core 首次引入第三方依赖（otel 两包）；未配置 otel 时 provider 即 noop，
   构造与打点零成本，调用方无感知。
 - 已知口径限制：`Claim` 无法区分「接管」与「Fail 重试」（`Attempts` 混
-  合两者，见 TODO），故无接管专属指标；停机放弃租约以
+  合两者），故无接管专属指标；停机放弃租约以
   `go_event.lease.abandoned` 计数（接管前兆）。
   **补充（ADR 0011 落地后）**：该限制已解除——`Claim` 随轮返回
   `ClaimResult`（后端落库事实），core 计量

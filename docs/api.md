@@ -86,6 +86,11 @@ type Envelope[T any] struct {
     // 表示立即可投递。广播消费下延迟行可能被水位越过而不再投递
     // （ADR 0013），需要定时必达用认领消费。
     DeliverAt time.Time
+    // CoalesceKey 是合并投递键（WithCoalesceKey 设置，ADR 0014）：同
+    // (Type, CoalesceKey) 作用域内最新一次发布取代之前的待消费前驱，
+    // 被取代行不再投递。空串表示未设置。与事件 ID 正交：同 ID 幂等
+    // Append 语义不变（重复 Append 不触发取代）。
+    CoalesceKey string
     // Attempts 是本次投递的尝试序号（含本次）：新认领为「已失败次数 + 1」，
     // 接管认领在先前基础上递增。仅认领消费有意义，广播消费恒为 0。
     Attempts    int
@@ -108,6 +113,12 @@ type RawEnvelope struct {
     // 存 NULL），Fetch / Claim 以 q.Now 下推判定 deliver_at <= now，未到期
     // 行在单条操作内被过滤（ADR 0013）。过去时刻等价立即可投递，不报错。
     DeliverAt time.Time
+    // CoalesceKey 是合并投递键（ADR 0014）：后端原样落库（空串存 NULL）。
+    // 同 (Type, CoalesceKey) 作用域内，Append 原子将「无任何认领行的待
+    // 消费前驱」置为 superseded，Fetch / Claim 不再返回被取代行（广播
+    // 水位直接越过，无新边界）；与事件 ID 正交——重复 Append 同 ID 不
+    // 触发取代（幂等语义不变）。空串表示未设置，不参与合并。
+    CoalesceKey string
     // Position 是后端定义的全序位置（如 Postgres bigserial），仅用于
     // 广播消费的已读水位条件（ADR 0004）：core 内存按订阅类型维护、
     // 只进不退，Fetch 时原样回传。
@@ -164,6 +175,17 @@ func WithMetadata(meta map[string]string) PublishOption // 合并进缺省元数
 // 水位越过而不再投递（ADR 0013），需要定时必达用认领消费。
 func WithDeliverAt(t time.Time) PublishOption
 
+// WithCoalesceKey 声明合并投递键（ADR 0014）：同 (Type, CoalesceKey)
+// 作用域内，Append 原子将「无任何认领行的待消费前驱」置为 superseded
+// 并插入新行——同键短期多次发布只消费最新一次。空串（选项缺省）= 未
+// 设置，不参与合并；处理中 / 等退避 / 租约过期待接管 / 终态的前驱不
+// 取代，新事件照常排队（v1 保守口径）。键与事件 ID 正交：同 ID 幂等
+// Append 语义不变（重复 Append 不触发取代——去抖配方须每次发布新 ID，
+// 见 usage.md §4.3）。窗口语义不内建：去抖经与 WithDeliverAt 组合表达
+// （合并键 + deliver_at = now + 静默期，每次新发布自带基线）。被取代行
+// 照常占 position，广播水位直接越过。
+func WithCoalesceKey(key string) PublishOption
+
 // WithEventID 显式指定事件 ID，优先于 IDGenerator；空串非法，Publish
 // 返回 ErrEmptyEventID（不静默回退到生成器）。
 func WithEventID(id string) PublishOption
@@ -183,14 +205,22 @@ OccurredAt 同样保留首写）。**跨事件类型复用同一 ID 不报错**�
 // Runner 完成。所有方法语义由 eventtest 契约测试约束。
 type Driver interface {
     // Append 幂等：重复 Append 同 ID 视为成功（首写为准，不覆盖既有行、
-    // 不触发重投，不校验 payload 一致性）。
-    Append(ctx context.Context, e RawEnvelope) error
+    // 不触发重投，不校验 payload 一致性）——幂等与合并投递正交，重复
+    // Append 不触发取代（ADR 0014）。CoalesceKey 非空时原子执行「置同键
+    // 待消费前驱 superseded + 插入新行」（单条写路径）：前驱 = (Type,
+    // CoalesceKey) 作用域内无任何认领行的事件行，处理中 / 等退避 / 租约
+    // 过期待接管 / 终态行均不取代；被取代行照常占 position，Fetch /
+    // Claim 不再返回。返回 AppendResult 汇总本次落库事实（取代行数），
+    // 供观测面计量（design.md §9.2）；错误时返回零值 AppendResult。
+    Append(ctx context.Context, e RawEnvelope) (AppendResult, error)
 
     // Fetch 广播消费读取：Type 匹配且 Position 严格大于 q.After 的行，
     // 按 Position 升序返回至多 q.Limit 条。只读，不产生任何簿记。
     // q.After 为空串表示从头；非空但无法解析为 Position 时返回错误。
     // 延迟事件（DeliverAt 非零）在到期前不满足下推条件：以 q.Now 判定
-    // deliver_at <= now，过滤在单条读取内完成（ADR 0013）。
+    // deliver_at <= now，过滤在单条读取内完成（ADR 0013）。被取代行
+    // （superseded，ADR 0014）不满足下推条件——广播水位直接越过，无新
+    // 边界。
     Fetch(ctx context.Context, q FetchQuery) ([]RawEnvelope, error)
 
     // HeadPosition 广播基线锚点：返回该类型当前已提交事件的最大
@@ -199,12 +229,14 @@ type Driver interface {
     HeadPosition(ctx context.Context, typ string) (string, error)
 
     // Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、退避期满，
-    // 且 DeliverAt 已到期」的行（Postgres 实现为 FOR UPDATE SKIP LOCKED）。
-    // 已 done / failed 的行不可认领；接管（租约过期）认领递增 claim_count
-    // （ADR 0006）；达 q.RetryLimit 的接管认领置 failed 终态、不再认领
-    // （终态判定需认领侧获知上限，故由 core 随条件下推）。批次内顺序
-    // 不承诺（契约仅约束 Fetch 升序）。返回 ClaimResult 汇总本轮落库
-    // 事实（发放租约与接管/终态计数，计数与落库状态一致，ADR 0011）。
+    // 且 DeliverAt 已到期，且未被取代」的行（Postgres 实现为 FOR UPDATE
+    // SKIP LOCKED）。已 done / failed 的行不可认领；接管（租约过期）认领
+    // 递增 claim_count（ADR 0006）；达 q.RetryLimit 的接管认领置 failed
+    // 终态、不再认领（终态判定需认领侧获知上限，故由 core 随条件下推）。
+    // 批次内顺序不承诺（契约仅约束 Fetch 升序）。返回 ClaimResult 汇总
+    // 本轮落库事实（发放租约与接管/终态计数，计数与落库状态一致，
+    // ADR 0011）。被取代行不进拾取窗口（superseded 是事件行属性，对新
+    // 消费者身份同样生效，ADR 0014）。
     Claim(ctx context.Context, q ClaimQuery) (ClaimResult, error)
 
     // Heartbeat 续租：仅当属主凭证匹配时生效；租约过期或已被接管后
@@ -231,6 +263,15 @@ type Driver interface {
 请求/响应类型：
 
 ```go
+// AppendResult 一次 Append 的落库事实汇总（design.md §9.2、ADR 0014）：
+// Superseded 为本次原子取代（置 superseded）的同键待消费前驱行数。
+// 重复 Append 同 ID（幂等冲突）与未设置 CoalesceKey 的 Append 恒为 0；
+// 计数与落库事实严格一致，可经 Inspector.CountStates 的 Superseded 档
+// 对账；错误时返回零值。
+type AppendResult struct {
+    Superseded int
+}
+
 type FetchQuery struct {
     Type  string // 单类型单次取数：编排按类型轮询限额，防单类型洪泛（ADR 0004）
     After string // 已读水位（Position），首次为空串；core 内存维护，只进不退；
@@ -755,17 +796,19 @@ func WithObserver(o Observer) Option            // 缺省无观察者（当前�
 type Inspector interface {
     // ClaimState 返回（事件 × 消费者身份）认领行的当前状态与重试计数。
     // ok 为 false 表示该身份对该事件无认领行——事件不存在、已超保留
-    // 窗口被清理、或该身份尚未认领，三者即「待处理」态（与 CountStates
-    // 的 Pending 档同口径）；查询故障经 error 返回，不得折叠为 ok=false。
+    // 窗口被清理、或该身份尚未认领，三者即「待处理」态（该身份无认领
+    // 行的行按 superseded 属性细分进 CountStates 的 Pending / Superseded
+    // 两档）；查询故障经 error 返回，不得折叠为 ok=false。
     ClaimState(ctx context.Context, eventID, consumerType string) (ClaimState, bool, error)
 
-    // CountStates 按消费者身份对某事件类型做状态分档计数：五档互斥且
-    // 完备，合计等于该类型事件总数。分档口径与 Claim/Fail/Complete 的
-    // 落库事实严格对齐：Pending = 该身份无认领行（「待处理」口径即此，
-    // 而非「退避中」）；Retrying = 认领行 status='retrying'；
-    // Processing = status='active'（该身份落库持有租约，不做租约过期
-    // 推断——接管由认领路径发生）；Failed / Done = 终态，done 为归档档，
-    // 不计入其余四档。
+    // CountStates 按消费者身份对某事件类型做状态分档计数：六档互斥且
+    // 完备，合计等于该类型事件总数。分档口径与 Claim/Fail/Complete/
+    // Append 的落库事实严格对齐：Pending = 该身份无认领行且未被取代
+    // （「待处理」口径即此，而非「退避中」）；Superseded = 该身份无认领
+    // 行且已被合并取代（事件行属性档，ADR 0014）；Retrying = 认领行
+    // status='retrying'；Processing = status='active'（该身份落库持有
+    // 租约，不做租约过期推断——接管由认领路径发生）；Failed / Done =
+    // 终态，done 为归档档，不计入其余档。
     CountStates(ctx context.Context, typ, consumerType string) (StateCounts, error)
 
     // FailedEvents 返回 failed 终态事件的分页列表，排序与分页边界见
@@ -796,7 +839,8 @@ type ClaimState struct {
 // StateCounts 某事件类型在某消费者身份下的状态分档计数（口径见
 // Inspector.CountStates）。
 type StateCounts struct {
-    Pending    int // 待处理：该身份无认领行
+    Pending    int // 待处理：该身份无认领行且未被取代
+    Superseded int // superseded：该身份无认领行且已被合并取代（ADR 0014）
     Retrying   int // 重试中：Fail 未达终态
     Processing int // processing：落库持有租约（status='active'）
     Failed     int // failed 终态
@@ -925,6 +969,11 @@ postgrec 为 `*sql.Tx`、inmem 为包内缓冲事务——core 接口只能以 `
   均不可见——基线锚点只锚已提交行；提交后经轮询/认领可见。
 - **幂等与普通 Append 同口径**：同 ID 首写为准，不覆盖、不重投；事务内
   重复 ID 与跨事务重复 ID 同判。
+- **合并投递同事务**（ADR 0014）：`RawEnvelope.CoalesceKey` 非空时，
+  同键待消费前驱的取代与新行插入共用同一语句定义、随业务事务原子生效
+  ——回滚则取代一并撤销，前驱照常待消费。`AppendTx` 不返回取代计数
+  （与「不返回 position」同一边界：取代随提交才生效，提交前的计数与
+  回滚后的事实可能矛盾）。
 - **广播位置边界（ADR 0006 重审定稿，ADR 0012 §2）**：就近唤醒信号不
   覆盖事务内发布（提交后由下一个轮询周期拉取/认领）；并发提交的更大
   position 会把广播内存水位推过晚提交的行，该行对在途广播实例永久漏投
@@ -1227,6 +1276,20 @@ func RunRetentionSuite(t *testing.T, newDriver func(*testing.T) event.Driver)
 // 注入，含到时刻本身）、信封 DeliverAt 原样透传、延迟行与广播水位的
 // 组合边界（水位越过即不再广播、认领不受影响）。
 func RunDelayedDeliverySuite(t *testing.T, d event.Driver)
+
+// RunCoalescingSuite 运行合并投递契约（同键最新一次消费，design.md §9.2、
+// ADR 0014）：latest-wins 计数与双模式排除（Fetch / Claim 均只见最新行）、
+// 广播水位越过与 HeadPosition 锚定、新消费者身份跳过、保守取代范围
+// （活跃租约 / 退避 / 过期租约 / 终态前驱不取代，新事件照常排队）、
+// 作用域 (Type, key) 与空键、ID 正交（重发旧 ID 纯 no-op 不杀新赢家）、
+// 同 ID 幂等、被取代延迟行永不到期投递、信封透传、AppendTx 提交前不可见
+// / 提交后取代 / 回滚零事实、Inspector superseded 分档、保留期照常清理。
+// newDriver 须为每个用例返回配置了保留窗口（≤ 2s）的全新 Driver 实例
+// （同 RunRetentionSuite 契约）；beginTx 须与传入 driver 同源绑定事务
+// 会话（同 RunTransactionalAppendSuite 的 TxSession），任一为 nil Fatal
+// 终止——核心语义全后端同形实现，必须全过本套件。
+func RunCoalescingSuite(t *testing.T, newDriver func(*testing.T) event.Driver,
+    beginTx func(*testing.T, event.Driver) TxSession)
 
 // RunInspectorSuite 运行只读查询面 event.Inspector 的契约测试
 // （design.md §6/§9.2）：三类查询与 Claim/Fail/Complete 落库事实比对。

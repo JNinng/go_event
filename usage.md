@@ -159,6 +159,7 @@ type Envelope[T any] struct {
     Metadata   map[string]string // 原样透传，如 trace_id
     OccurredAt time.Time
     DeliverAt  time.Time // 最早投递时刻（WithDeliverAt 设置），零值 = 立即（见 §4.3）
+    CoalesceKey string // 合并投递键（WithCoalesceKey 设置），空串 = 未设置（见 §4.3）
 
     Attempts    int  // 本次投递的尝试序号（含本次）；广播恒为 0（见 §6.7）
     LastAttempt bool // 本次是否为最后一次尝试；广播恒为 false（见 §6.7）
@@ -304,7 +305,28 @@ err = pub.PublishNoPayload(ctx, cacheFlush)
   ```
 
   仅声明「不早于」语义：投递仍经轮询/认领路径，最坏延迟等于轮询间隔，不保证恰在该时刻发生。**保留窗口自可投递时刻起算**（延迟行不因「等待投递」被清理，[§8.5](#85-保留窗口与惰性清理)）。**广播消费组合边界**：延迟行可能被内存水位越过而不再投递（[§5.2](#52-语义)）——需要定时必达用认领消费。
-- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）见 [§4.4](#44-事务内发布outbox)（`AppendTx` 同样可经 `RawEnvelope.DeliverAt` 设置延迟投递，语义与普通发布一致）。
+- **合并投递（`WithCoalesceKey`）**：声明合并键（ADR 0014）——同 `(Type, CoalesceKey)` 作用域内，Append 原子将「无任何认领行的待消费前驱」置为 superseded 并插入新行，Fetch / Claim 不再返回被取代行——同键短期多次发布只消费最新一次（如知识库重建短窗多次触发）：
+
+  ```go
+  // 同一文档的重复触发只消费最新一次
+  err := kbRebuild.Publish(ctx, pub, KbRebuild{DocID: docID},
+      event.WithCoalesceKey("kb_rebuild:"+docID),
+  )
+  ```
+
+  键的作用域是 `(Type, key)`，与事件 ID 正交：ID 照常由生成器填充（或 `WithEventID` 显式指定），同 ID 幂等 Append 语义不变——**重复 Append 同 ID 不触发取代**（纯 no-op），因此去抖/合并配方必须**每次发布新 ID**（不要为合并场景复用稳定 ID，稳定 ID 重发不会取代任何前驱）。取代范围是 v1 保守口径：仅无任何认领行的待消费前驱——处理中 / 等退避 / 租约过期待接管 / 终态的前驱一律不动，新事件照常排队（旧事件多跑一趟对幂等任务无害）。被取代行照常占 position（HeadPosition / 广播基线口径不变），被取代的延迟行永不到期投递，superseded 行照常参与保留期清理；取代行数经 `<scope>.append.supersede` 指标与 `Inspector.CountStates` 的 Superseded 档可见。
+- **去抖 = 合并键 + 延迟投递**：合并投递不内建时间窗；需要「静默期内多次触发只跑最后一次」时，与 `WithDeliverAt` 组合——每次新发布把可投递时刻推后一个静默期并取代前驱，前驱永不到期、只有最后一次发布到期投递：
+
+  ```go
+  // 5s 静默期去抖：窗口内的多次触发只投递最新一次，且在其 5s 后发生
+  err := kbRebuild.Publish(ctx, pub, KbRebuild{DocID: docID},
+      event.WithCoalesceKey("kb_rebuild:"+docID),
+      event.WithDeliverAt(time.Now().Add(5*time.Second)),
+  )
+  ```
+
+  注意静默期长于处理时长才有意义：到期投递后若又来一次同键触发，会再次执行（合并投递不是「永不重跑」，是「短窗内最新 wins」）。已知边界：**同键并发发布不互斥**（两个并发发布可能各自快照下并存，两行都被消费）；**混合版本部署**下旧二进制照常消费被取代行——合并是优化不是正确性保证（ADR 0014）。
+- **发布是单次 Append**：默认每次发布独立提交。业务事务内原子发布（outbox）见 [§4.4](#44-事务内发布outbox)（`AppendTx` 同样可经 `RawEnvelope.DeliverAt` 设置延迟投递、`RawEnvelope.CoalesceKey` 设置合并键——取代与插入同事务，回滚则一并撤销；不返回取代计数，语义与普通发布一致）。
 - 发布成功后若注入了 `LocalWake`，会向本进程对应类型的订阅发一次非阻塞唤醒信号。
 
 ### 4.4 事务内发布（outbox）
@@ -792,6 +814,7 @@ func TestMyBackendRetention(t *testing.T) {
 | `WithPublisherCodec(c)` | payload 编码 | JSON |
 | `WithLocalWake(w)` | 发布成功后的同进程唤醒 | 无 |
 | `WithDeliverAt(t)`（发布级） | 延迟投递：最早投递时刻，零值 = 立即；过去时刻等价立即（ADR 0013） | 立即可投递 |
+| `WithCoalesceKey(key)`（发布级） | 合并投递：同 (Type, key) 作用域内最新一次消费，待消费前驱被原子取代；去抖经与 `WithDeliverAt` 组合表达（ADR 0014） | 空串 = 不参与合并 |
 | `WithMetadata(m)`（发布级） | 合并元数据 | 无 |
 | `WithMeterProvider(mp)` | 指标 provider（[§13](#13-可观测otel--slog)） | 构造期快照 `otel.GetMeterProvider()` |
 | `WithScopeName(s)` | 指标 scope 与名前缀 | `go_event` |
@@ -846,6 +869,7 @@ func TestMyBackendRetention(t *testing.T) {
 - **选型**：通知类用广播；需要补投、失败重试、完成追踪的任务用认领。
 - **广播不补投**：Start 之前与停机期间发布的事件不会投递；重启从当前头部开始。关键业务不要依赖广播保证送达。
 - **延迟事件投递是「不早于」**：`WithDeliverAt`（[§4.3](#43-发布语义)）保证到期前不被 Fetch / Claim 拾取，但不保证恰在该时刻投递——最坏延迟等于轮询间隔（需要更低延迟可调小 `WithPollInterval` 或用 pgxc `Wake` 的发布信号）。延迟事件与广播消费的组合有**水位越过边界**（[§5.2](#52-语义)）：延迟行可能被其后发布的即时行推过水位而永久漏广播——定时必达的延迟事件（提醒、定时任务类）用认领消费。保留窗口自可投递时刻起算（[§8.5](#85-保留窗口与惰性清理)），投递后的消费路径仍需窗口覆盖。
+- **合并投递是优化不是正确性保证**：`WithCoalesceKey`（[§4.3](#43-发布语义)）只对「无任何认领行的待消费前驱」生效——活跃租约 / 退避中 / 待接管 / 终态前驱不取代，新事件照常排队；同键并发发布不互斥（短窗可能并存）；混合版本部署下旧二进制照常消费被取代行。多实例应同版本部署；需要「恰好一次」语义仍靠 handler 幂等。被取代行照常占 position，HeadPosition / 广播基线与认领重放口径不变；superseded 行照常参与保留期清理。
 - **outbox 事件与广播的组合边界**：事务内发布（[§4.4](#44-事务内发布outbox)）的事件可能被并发提交的更大 position 越过广播水位而**永久漏投**（ADR 0012）；outbox 模式下承载业务事实的事件应走认领消费，广播订阅只接受「漏掉可容忍」的通知类事件。`AppendTx` 不发射库侧观测（发射点在提交前，与回滚后的事实可能矛盾）——业务事务的成败指标在调用方自己的提交点计量；惰性清理不落入调用方事务，事件行仍受保留窗口约束。
 - **幂等**：认领消费一定按 at-least-once 设计 handler，以事件 ID 为幂等键。
 - **显式 ID 去重是全局的**：ID 全局唯一，不同事件类型必须使用带类型前缀的业务键；跨类型复用同一 ID 会静默丢弃第二个 payload。去重边界由存储保证，进程内锁不能跨实例去重。
@@ -859,7 +883,7 @@ func TestMyBackendRetention(t *testing.T) {
 - **消费者身份变更**：新增身份会重放窗口内全部历史事件；改名等同于新身份，不是断点续跑。
 - **failed 事件查询（Inspector）**：只读查询面 `event.Inspector` 已提供三类查询，按能力探测接入（对 Driver 做 `event.Inspector` 类型断言，或经后端 `NewInspector` 显式构造，与 Driver 共享连接与命名空间选项）：
   - 某（事件 × 消费者身份）的当前状态与重试计数：无认领行即「待处理」（ok=false），其余按落库 `status` 报 processing / retrying / done / failed（不做租约过期推断）；
-  - 按消费者身份对事件类型的分档计数：**「待处理」= 该身份无认领行**（而非「退避中」），retrying / processing / failed / done 按认领行 `status` 分档，五档互斥且合计等于该类型事件总数；
+  - 按消费者身份对事件类型的分档计数：**「待处理」= 该身份无认领行且未被取代**（而非「退避中」），superseded（已被合并取代的事件行属性档，ADR 0014）/ retrying / processing / failed / done 按认领行 `status` 与 superseded 属性分档，六档互斥且合计等于该类型事件总数；
   - failed 事件偏移分页列表：`last_error` / `failed_at` 随行返回，按 `failed_at` 降序（最新在前）、同刻按事件 ID 升序；Offset 越界返回空列表（非错误），`Limit <= 0` 返回空，偏移分页无快照——跨页间隙的终态变化可能造成重复或遗漏。**升级边界**：不变式「`failed_at` 非空 ⟺ failed」仅对 v2 加列后的写路径成立——v2 是 `ADD COLUMN`、无回填，升级前已存在的 failed 行该列为 NULL，列表中映射为零值。
   - 结果仅在**保留窗口内可见**（硬边界）：超窗行被惰性清理删除后自然查不到，Inspector 不做额外过滤。
   - `NewInspector` 首次查询按迁移模式处理持久结构：缺省 `Create` 模式下首次查询会持迁移锁执行 DDL——只读账号请配 `Verify` / `None`（表已由部署流程建好），见 [§8.4](#84-迁移模式与权限)。
