@@ -2,7 +2,7 @@ module github.com/jninng/go_event/postgresschema
 
 go 1.26.8
 
-require github.com/jninng/go_event v0.2.0
+require github.com/jninng/go_event v0.3.0
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
