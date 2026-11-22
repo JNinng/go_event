@@ -23,7 +23,7 @@
 - **合并投递**：`WithCoalesceKey` 声明合并键（作用域 (Type, key)，与事件 ID 正交），同键短期多次发布只消费最新一次——Append 原子将同键待消费前驱置为 superseded 并插入新行，Fetch / Claim 下推排除（广播水位直接越过）；不内建时间窗，去抖经与 `WithDeliverAt` 组合表达（ADR 0014）。
 - **就近唤醒**：同进程发布触发本实例 poller 立即拉取；仅信号，不跳过存储，跨实例与信号丢失由轮询兜底。pgxc 另提供跨实例推送唤醒（LISTEN/NOTIFY，`Wake.Bind` 桥接，仅信号、断连重连；postgrec 退化轮询）——同样仅信号不承载投递保证（ADR 0013）。
 - **幂等发布**：发布侧生成或通过 `WithEventID` 显式指定唯一事件 ID，重复 `Append` 同 ID 幂等（首写为准）；元数据块原样透传（如 `trace_id`）。
-- **可观测**：otel 指标 + slog 日志 + 类型化 Observer，默认跟随全局装配（未配置即 noop 静默）；core 计量发布/消费/终态操作，后端计量迁移生命周期（见 usage.md §13、ADR 0008）。
+- **可观测**：otel 指标 + slog 日志 + 类型化 Observer，默认跟随全局装配（未配置即 noop 静默）；core 计量发布/消费/终态操作，后端计量迁移生命周期与管理面写操作（见 usage.md §13、ADR 0008）。
 - **迁移模式**：`Create`（缺省，首次操作持迁移锁幂等应用版本计划全量语句；升级随部署隐式发生）/ `Verify`（只读自检）/ `None`；运行账号只有 DML 权限时用后两者，部署期由高权限连接建表。
 - **最小缝合点**：`Driver` 只做单次原子操作，全部编排（轮询、心跳、重试、并发、优雅停机）在 core 的 `Runner`。
 - **多 module**：core 依赖标准库与 otel/metric（可观测，未配置即 noop），后端依赖按需引入；接口语义由 `eventtest` 契约测试约束。
@@ -136,7 +136,7 @@ module path 为 `github.com/jninng/go_event`，子 module 独立发版（如 `pg
 | `*.go`（仓库根） | core：事件声明、Publisher、Runner、Driver 接口、codec、就近唤醒（package `event`） |
 | `pgxc/` | Postgres 后端，pgx v5 连接池 |
 | `postgrec/` | Postgres 后端，标准库 `database/sql` |
-| `postgresschema/` | Postgres 方言 DDL 单一事实源（结构化步骤、期望对象、锁语句，无驱动依赖） |
+| `postgresschema/` | Postgres 方言 DDL 单一事实源（版本计划、期望对象、锁语句与共享执行器，无驱动依赖） |
 | `eventtest/` | 契约测试套件；`eventtest/inmem` 为进程内 Driver，`eventtest/simmigrate` 为迁移模拟 backend |
 | `docs/` | 设计文档、API 签名、ADR |
 
@@ -168,13 +168,21 @@ Postgres 集成测试需要真实数据库，通过 `TEST_POSTGRES_DSN` 启用�
 TEST_POSTGRES_DSN='postgres://user:pass@localhost:5432/postgres' go test ./...
 ```
 
-新后端必须实现 `event.Driver` 并通过 `eventtest.RunSuite` 与 `eventtest.RunRetentionSuite` 全套契约测试；迁移面通过 `eventtest.RunMigrationSuite`（由后端提供 `MigrationBackend` 实现），进程内模拟 backend 常驻，真实 Postgres 集成由环境变量门控；提供只读查询面的后端（pgxc / postgrec / inmem）加跑 `eventtest.RunInspectorSuite`（套件对 Driver 做 `event.Inspector` 类型断言探测）；提供管理面的后端加跑 `eventtest.RunAdminReplaySuite`（`admin` 由后端 `NewAdmin` 构造传入，套件经 `AdminExclusionLock` / `AdminObserverSetter` 注入接口断言互斥与操作来源观测，缺失即 Fatal）；提供组合对象 `Store` 的后端加跑 `eventtest.RunStoreSuite`（传入同一 Store 的三面，钉住三面同源与独立构造等价）；提供事务性入队（outbox）的后端加跑 `eventtest.RunTransactionalAppendSuite`（经 `TxSession` 适配注入事务载体，钉住回滚零事件、提交前不可见、提交后可见、事务内幂等与乱序边界，ADR 0012）。合并投递为核心语义（全后端同形实现），加跑 `eventtest.RunCoalescingSuite`（latest-wins、双模式排除、保守取代范围、ID 正交、与延迟组合、AppendTx 同事务、superseded 分档与保留期清理，ADR 0014）。
+新后端必须实现 `event.Driver`，按能力面通过以下契约测试套件（进程内模拟 backend 常驻，真实 Postgres 集成由环境变量门控）：
+
+- `eventtest.RunSuite` + `eventtest.RunRetentionSuite`：`Driver` 全套契约测试。
+- `eventtest.RunMigrationSuite`：迁移面，由后端提供 `MigrationBackend` 实现。
+- `eventtest.RunInspectorSuite`：提供只读查询面的后端（pgxc / postgrec / inmem）加跑；套件对 Driver 做 `event.Inspector` 类型断言探测。
+- `eventtest.RunAdminReplaySuite`：提供管理面的后端加跑；`admin` 由后端 `NewAdmin` 构造传入，套件经 `AdminExclusionLock` / `AdminObserverSetter` 注入接口断言互斥与操作来源观测，缺失即 Fatal。
+- `eventtest.RunStoreSuite`：提供组合对象 `Store` 的后端加跑；传入同一 Store 的三面，钉住三面同源与独立构造等价。
+- `eventtest.RunTransactionalAppendSuite`：提供事务性入队（outbox）的后端加跑；经 `TxSession` 适配注入事务载体，钉住回滚零事件、提交前不可见、提交后可见、事务内幂等与乱序边界（ADR 0012）。
+- `eventtest.RunCoalescingSuite`：合并投递为核心语义（全后端同形实现），加跑；latest-wins、双模式排除、保守取代范围、ID 正交、与延迟组合、AppendTx 同事务、superseded 分档与保留期清理（ADR 0014）。
 
 ## 状态与路线
 
 - **P0（已实现）**：事件生产、广播消费、认领消费、就近唤醒、Postgres 两个后端、契约测试（覆盖两种消费方式与保留窗口清理）；持久结构迁移三模式（`Create` 缺省 / `Verify` / `None`）、版本化迁移（幂等语句、单一执行路径、无台账，升级随部署隐式发生）、基线接管校验、迁移能力声明与 `RunMigrationSuite`；失败错误摘要落库（`Fail` 扩展，ADR 0009）；`Inspector` 只读查询面（状态 / 分档计数 / failed 分页列表，按能力探测接入）；`Admin` 管理面 failed 手工重放与加固（持迁移互斥锁、CAS 行归属校验、操作来源观测、错误可判别，ADR 0010）；otel 指标 + slog + 类型化 Observer 观测面（ADR 0008）；接管计数（`Claim` 返回 `ClaimResult{Leases, Takeovers, TerminalFailed}`，ADR 0011）；后端组合对象 `Store`（三面同源便利构造，各面与独立构造等价）。
 - **P1（已落地：outbox）**：事务性入队 `TransactionalAppender`（业务事务与事件入队原子提交/回滚；core 不定义接口，pgxc / postgrec / inmem 各提供构造或经组合对象 Store 聚合，ADR 0012——广播位置语义随本项重审定稿：事务内发布下广播投递为尽力而为，认领消费不受影响）。
-- **P1（已落地：延迟事件与跨实例唤醒）**：`WithDeliverAt` / `RawEnvelope.DeliverAt` 延迟投递（Fetch / Claim 下推 `deliver_at <= now`；保留窗口自可投递时刻起算；广播组合的水位越过边界写进文档，ADR 0013）；跨实例推送唤醒由 pgxc `Wake`（LISTEN/NOTIFY，专用连接 + 断线重连，payload 只带 schema 名）桥接 `LocalWake.NotifyAll`，postgrec 退化轮询（ADR 0013）。**P1（已落地：合并投递）**：`WithCoalesceKey` / `RawEnvelope.CoalesceKey` 同键最新一次消费（Append 单条 CTE 原子取代与插入，v1 保守取代范围仅无认领行的待消费前驱；Fetch / Claim 下推排除被取代行，一种机制服务广播与认领；不内建时间窗——去抖经与 `WithDeliverAt` 组合表达；`<scope>.append.supersede` 计数与 Inspector superseded 分档；Postgres 后端 v4 加列，ADR 0014）。**P1（规划）**：无——生产化缺口收尾完成。
+- **P1（已落地：延迟事件与跨实例唤醒）**：`WithDeliverAt` / `RawEnvelope.DeliverAt` 延迟投递（Fetch / Claim 下推 `deliver_at <= now`；保留窗口自可投递时刻起算；广播组合的水位越过边界写进文档，ADR 0013）；跨实例推送唤醒由 pgxc `Wake`（LISTEN/NOTIFY，专用连接 + 断线重连，payload 只带 schema 名）桥接 `LocalWake.NotifyAll`，postgrec 退化轮询（ADR 0013）。**P1（已落地：合并投递）**：`WithCoalesceKey` / `RawEnvelope.CoalesceKey` 同键最新一次消费（Append 单条 CTE 原子取代与插入，v1 保守取代范围仅无认领行的待消费前驱；Fetch / Claim 下推排除被取代行，一种机制服务广播与认领；不内建时间窗——去抖经与 `WithDeliverAt` 组合表达；`<scope>.append.supersede` 计数与 Inspector superseded 分档；Postgres 后端 v4 加列，ADR 0014）。**P1（规划）**：无——生产化缺口收尾完成；剩余规划项见 design.md §9.3（管理面查询、真推送投递 DeliverySource）。
 - **P2（规划）**：NATS JetStream / RocketMQ / Redis Stream / RabbitMQ 后端、事件链、批量认领、限流背压。
 
 详见 [docs/design.md §9](docs/design.md)。

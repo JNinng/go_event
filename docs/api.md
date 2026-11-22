@@ -761,6 +761,7 @@ const (
 | --- | --- | --- |
 | `go_event.publish` | Counter | `event`, `result` |
 | `go_event.publish.duration` | Histogram | `result`（仅 Append 已尝试时记录） |
+| `go_event.append.supersede` | Counter | `event`（每次发布原子取代的同键待消费前驱行数，与 `AppendResult.Superseded` 同源；ADR 0014） |
 | `go_event.fetch` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
 | `go_event.claim` / `.duration` | Counter + Histogram | `result`=ok/error/canceled |
 | `go_event.claim.granted` | Counter | `event`, `identity` |

@@ -34,7 +34,7 @@ st := postgrec.NewStore(db, postgrec.WithRetention(7*24*time.Hour))
 | --- | --- | --- |
 | 幂等 Append（首写为准） | 原生 | `event` 表 PRIMARY KEY (id) + `ON CONFLICT DO NOTHING` |
 | 元数据透传 | 原生 | `jsonb` 列原样存取 |
-| 广播 Fetch（类型过滤 + 水位 + 升序 + 限额） | 原生 | `WHERE type = $1 AND position > $2 AND (deliver_at IS NULL OR deliver_at <= $3) ORDER BY position LIMIT $4`（bigserial 全序位置） |
+| 广播 Fetch（类型过滤 + 水位 + 升序 + 限额） | 原生 | `WHERE type = $1 AND position > $2 AND superseded_at IS NULL AND (deliver_at IS NULL OR deliver_at <= $3) ORDER BY position ASC LIMIT $4`（bigserial 全序位置） |
 | 广播基线锚点（HeadPosition） | 原生 | `SELECT COALESCE(MAX(position), 0) FROM event WHERE type = $1`（(type, position) 索引即时求值，单条语句快照；无该类型事件时返回空串） |
 | 认领互斥 / 接管 / SKIP LOCKED | 原生 | `FOR UPDATE SKIP LOCKED` + `event_claim` 唯一约束 + `ON CONFLICT DO UPDATE`（CAS 谓词） |
 | 接管计入重试、达上限置 failed；接管/终态计数随 ClaimResult 返回 | 原生 | 认领事务内终态标记（影响行数）+ 认领 UPDATE 接管标记（拾取窗口内按旧行状态区分接管与 retrying 重认领）；计数与落库事实一致，可经 Inspector 对账（ADR 0011） |
@@ -63,7 +63,7 @@ st := postgrec.NewStore(db, postgrec.WithRetention(7*24*time.Hour))
 | 锁原语 | 事务级 advisory 锁 | `pg_try_advisory_xact_lock(hashtext('go_event:<schema>'))`，有界等待；提交/回滚自动释放 |
 | 能力声明 | `Capabilities()` | 跨语句事务；constraint 无原生 `IF NOT EXISTS`（探测 + DO 块）；schema 仅存在性，表/列/索引/约束为存在性 + 定义；错误分类全支持；同步完成；计划可包含事务外语句；不隐式提交 |
 | 权限边界 | 按模式 | `Create`/`Migrate` 需 DDL；`Verify`/`None` 只需 DML（+ 系统目录读）；锁能力为 `LockNone` 时 `Create` 返回 `ErrMigrationUnsupported` |
-| 可观测 | `postgrec.migrate` + `.duration`、`postgrec.admin.replay` + `.duration` | 迁移/校验结果计数与耗时（`result`：ok/canceled/lock_timeout/permission_denied/verify_conflict/permanent/transient；`schema` 维度），发射点单一（包级 `Migrate`/`Verify`，ensure 同路径）；成功打 Info `postgrec: migration applied`；管理面 Admin 另发 `<scope>.admin.replay`（result=ok/no_effect/canceled/lock_timeout/error）与 `<scope>.admin.replay.duration`（result 维度，操作入口到返回全程耗时）+ slog 审计日志 + `AdminReplayEvent`（`WithObserver` 注入）；`WithLogger`/`WithMeterProvider`/`WithScopeName`/`WithObserver` 注入，缺省跟随全局 |
+| 可观测 | `postgrec.migrate` + `.duration`、`postgrec.admin.replay` + `.duration` | 迁移/校验结果计数与耗时（`result`：ok/canceled/lock_timeout/permission_denied/verify_conflict/permanent/transient；`schema` 维度），发射点单一（包级 `Migrate`/`Verify`，ensure 同路径）；成功打 Info `postgrec: migration applied`；管理面 Admin 另发 `<scope>.admin.replay`（result=ok/no_effect/canceled/lock_timeout/error）与 `<scope>.admin.replay.duration`（result 维度，操作入口到返回全程耗时）+ slog 审计日志 + `AdminReplayEvent`（`WithObserver` 注入）；`WithLogger`/`WithMeterProvider`/`WithScopeName`/`WithObserver` 注入，缺省构造期快照全局（快照后替换全局不追溯） |
 
 导出 `SQL` 使用阻塞式 `pg_advisory_xact_lock` + `lock_timeout`；执行器使用
 `pg_try_advisory_xact_lock` + 有界退避，两者不是同一形式。

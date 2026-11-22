@@ -44,8 +44,9 @@
 ### 3. 口径分界（不重复计量）
 
 - **core 负责全部 driver 操作与消费编排的指标**：`publish`、`fetch`、
-  `claim`、`heartbeat`、`complete`、`fail` 的计数与耗时在 core 调用边界
-  计量——后端不再重复埋同口径操作指标，两套数据无增量信息。
+  `claim`、`heartbeat`、`complete`、`fail` 的计数（`publish`/`fetch`/`claim`
+  另有耗时直方图）在 core 调用边界计量——后端不再重复埋同口径操作指标，
+  两套数据无增量信息。
 - **后端负责迁移生命周期与管理面写操作**：迁移发射点单一，在包级
   `Migrate` / `Verify`（driver ensure 经 `pgSchemaManager` 调用同一函数，
   ensure 路径与部署期显式调用全路径无重复）。迁移成功对 core 不可见

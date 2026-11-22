@@ -95,7 +95,7 @@
 - usage.md 新增 §13 可观测（装配示例、指标口径、Observer 旁路、测试断言）与 §10 选项速查行；api.md 新增 §2.9 可观测（选项 / Observer / 指标清单）。
 - 新增 LICENSE（MIT），README 增许可证一节并同步状态与路线。
 
-[v0.2.0]: https://github.com/JNinng/go_event/compare/v0.1.1...v0.2.0
-[v0.3.0]: https://github.com/JNinng/go_event/compare/v0.2.0...v0.3.0
-[v0.4.0]: https://github.com/JNinng/go_event/compare/v0.3.0...v0.4.0
-[Unreleased]: https://github.com/JNinng/go_event/compare/v0.4.0...HEAD
+[v0.2.0]: https://github.com/jninng/go_event/compare/v0.1.1...v0.2.0
+[v0.3.0]: https://github.com/jninng/go_event/compare/v0.2.0...v0.3.0
+[v0.4.0]: https://github.com/jninng/go_event/compare/v0.3.0...v0.4.0
+[Unreleased]: https://github.com/jninng/go_event/compare/v0.4.0...HEAD

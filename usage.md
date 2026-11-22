@@ -121,7 +121,7 @@ func main() {
 - **迁移**：缺省 `Create` 在首次操作时自动建表；运行账号只有 DML 权限时改用 `Verify` / `None` 并由部署流程建表，见 [§8.4](#84-迁移模式与权限)。
 - **广播消费**：把 `SubscribeClaim` 换成 `SubscribeBroadcast`（发完即忘、无需消费者身份），见 [§5](#5-广播消费)。
 - **就近唤醒**：同一 `event.NewLocalWake()` 同时注入 `NewPublisher` 与 `NewRunner`，同进程发布可立即触发本实例拉取，见 [§3](#3-装配)。
-- **可观测**：otel 指标与 slog 日志缺省跟随全局装配，不注入即静默；需要接入见 [§13](#13-可观测otel--slog)。
+- **可观测**：otel 指标与 slog 日志缺省构造期快照全局装配（快照后替换全局不追溯已建实例），不注入即静默；需要接入见 [§13](#13-可观测otel--slog)。
 
 ### 其他后端
 
@@ -195,7 +195,7 @@ run := event.NewRunner(drv, event.WithRunnerCodec(myCodec))
 
 ```go
 type Driver interface {
-    Append(ctx context.Context, e RawEnvelope) error
+    Append(ctx context.Context, e RawEnvelope) (AppendResult, error)
     Fetch(ctx context.Context, q FetchQuery) ([]RawEnvelope, error)
     HeadPosition(ctx context.Context, typ string) (string, error)
     Claim(ctx context.Context, q ClaimQuery) (ClaimResult, error)
@@ -205,7 +205,7 @@ type Driver interface {
 }
 ```
 
-轮询、心跳、重试、并发与停机等编排全部在 core 的 `Runner` 中完成。使用方通常无需实现 `Driver`；需要接入新存储时见 [第 9 节](#9-测试)。
+轮询、心跳、重试、并发与停机等编排全部在 core 的 `Runner` 中完成。`Append` 返回 `AppendResult.Superseded` 供观测计量（§4.3）。使用方通常无需实现 `Driver`；需要接入新存储时见 [第 9 节](#9-测试)。
 
 ## 3. 装配
 
@@ -1017,7 +1017,7 @@ mp := sdkmetric.NewMeterProvider(
 defer mp.Shutdown(context.Background())
 
 publisher := event.NewPublisher(drv,
-    event.WithMeterProvider(mp),            // 缺省跟随全局
+    event.WithMeterProvider(mp),            // 构造期快照；快照后替换全局不追溯
     event.WithScopeName("go_event.orders"), // 部署期决策，勿随实例变化
 )
 runner := event.NewRunner(drv,
@@ -1028,12 +1028,15 @@ runner := event.NewRunner(drv,
 
 ### 13.2 指标口径
 
-- **core**（scope 缺省 `go_event`）：`publish` / `fetch` / `claim` /
-  `heartbeat` / `complete` / `fail` 计数与耗时、`claim.granted`、
+- **core**（scope 缺省 `go_event`）：`publish` / `fetch` / `claim` 计数与
+  耗时、`heartbeat` / `complete` / `fail` 计数、`claim.granted`、
   `claim.takeover`（接管发放数，含终态接管——与 `ClaimResult.Takeovers`
   同源、与落库事实一致）、`claim.terminal_failed`（认领侧直接置 failed 数）、
-  `lease.abandoned`、`consume` / `handle.duration`、`wake`——全部在 core
-  调用边界计量，后端不重复埋同口径操作指标。接管与终态计数只在发生时
+  `lease.abandoned`、`consume` / `handle.duration`、
+  `append.supersede`（`event` 维度，每次发布原子取代的同键待消费前驱
+  行数，与 `AppendResult.Superseded` 同源）、`wake`、
+  `subscribe`（`event` / `mode` / `result` 维度，仅启动后动态注册打点）
+  ——全部在 core 调用边界计量，后端不重复埋同口径操作指标。接管与终态计数只在发生时
   打点（无零值数据点）。注意 `lease.abandoned`（停机放弃：本实例主动
   放弃租约的前兆观测）与 `claim.takeover`（接管事实：其他实例认领侧的
   落库事实计数）事件源不同——前者是放弃意图、后者是接管完成，两者
@@ -1067,8 +1070,8 @@ runner := event.NewRunner(drv,
 Runner 发射。
 
 ```go
-// 实现 Observer（三个方法）即满足 V2；只需实现关心的额外事件，
-// 其余留空方法体——库内 recover 保证旁路安全。
+// 实现 Observer 三方法并补齐 V2 的两个方法即满足 V2；只需实现关心的
+// 更高版本事件，其余留空方法体——库内 recover 保证旁路安全。
 type slaObserver struct{}
 
 func (slaObserver) OnPublish(e event.PublishEvent) {

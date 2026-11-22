@@ -65,6 +65,10 @@
   重命名迁移归管理面（生产化能力）。
 - 两种方式统一约定：订阅在 Runner 启动前注册完毕，启动后动态注册留作扩展。
 
+> 注记：动态注册已由 [ADR 0015](0015-dynamic-subscription-registration.md) 定稿
+> 落地——Start 后注册即时生效（广播基线锚定于注册调用内、注册返回即基线确立），
+> `ErrRunnerStarted` 已移除，Stop 后注册返回 `ErrRunnerStopped`。
+
 ### 通用底线
 
 - 认领消费为 at-least-once 投递，handler 幂等是消费方责任（写进文档与
