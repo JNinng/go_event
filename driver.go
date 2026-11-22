@@ -17,22 +17,19 @@ import (
 // 正常结果。
 type Driver interface {
 	// Append 幂等：重复 Append 同 ID 视为成功（首写为准，不覆盖既有行、
-	// 不触发重投，不校验 payload 一致性）——幂等与合并投递正交，重复
-	// Append 不触发取代（ADR 0014）。CoalesceKey 非空时原子执行「置同键
-	// 待消费前驱 superseded + 插入新行」（单条写路径）：前驱 = (Type,
-	// CoalesceKey) 作用域内无任何认领行的事件行，处理中 / 等退避 / 租约
-	// 过期待接管 / 终态行均不取代；被取代行照常占 position，Fetch /
-	// Claim 不再返回。返回 AppendResult 汇总本次落库事实（取代行数），
-	// 供观测面计量（design.md §9.2）；错误时返回零值 AppendResult。
+	// 不触发重投，不校验 payload 一致性）；幂等与合并投递正交，重复
+	// Append 不触发取代（ADR 0014）。CoalesceKey 非空时原子将同键无任何
+	// 认领行的待消费前驱置 superseded 并插入新行（取代范围详见
+	// docs/api.md §2.4）；被取代行照常占 position，Fetch / Claim 不再
+	// 返回。错误时返回零值 AppendResult（取代行数供观测面计量，design.md §9.2）。
 	Append(ctx context.Context, e RawEnvelope) (AppendResult, error)
 
 	// Fetch 广播消费读取：Type 匹配且 Position 严格大于 q.After 的行，
 	// 按 Position 升序返回至多 q.Limit 条。只读，不产生任何簿记。
 	// q.After 为空串表示从头；非空但无法解析为 Position 时返回错误。
-	// 延迟事件（DeliverAt 非零）在到期前不满足下推条件：以 q.Now 判定
-	// deliver_at <= now，过滤在单条读取内完成（ADR 0004）。被取代行
-	// （superseded，ADR 0014）不满足下推条件——广播水位直接越过，无新
-	// 边界。
+	// 延迟事件（DeliverAt 非零）到期前、被取代行（superseded，ADR 0014）
+	// 均不满足下推条件：以 q.Now 判定 deliver_at <= now，过滤在单条读取
+	// 内完成（ADR 0004）；被取代行被广播水位直接越过，无新边界。
 	Fetch(ctx context.Context, q FetchQuery) ([]RawEnvelope, error)
 
 	// HeadPosition 返回该类型当前已提交事件的最大 Position，作为广播
@@ -43,12 +40,11 @@ type Driver interface {
 	HeadPosition(ctx context.Context, typ string) (string, error)
 
 	// Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、退避期满，
-	// 且 DeliverAt 已到期，且未被取代」的行；已 done / failed 的行不可
-	// 认领；接管（租约过期）认领递增重试计数（ADR 0006），达 q.RetryLimit
-	// 的行置 failed 终态、不再认领（详见 ClaimQuery）。返回 ClaimResult
-	// 汇总本轮落库事实：计数与落库状态一致，供观测面计量（design.md
-	// §9.2）；错误时返回零值 ClaimResult。被取代行不进拾取窗口（superseded
-	// 是事件行属性，对新消费者身份同样生效，ADR 0014）。
+	// 且 DeliverAt 已到期，且未被取代」的行；已 done / failed 的行不可认领。
+	// 接管（租约过期）认领递增重试计数（ADR 0006），达 q.RetryLimit 的行置
+	// failed 终态、不再认领（详见 ClaimQuery）。返回 ClaimResult 汇总本轮
+	// 落库事实：计数与落库状态一致，供观测面计量（design.md §9.2），错误时
+	// 返回零值。被取代行不进拾取窗口，对新消费者身份同样生效（ADR 0014）。
 	Claim(ctx context.Context, q ClaimQuery) (ClaimResult, error)
 
 	// Heartbeat 续租：仅当属主凭证匹配时生效；租约过期或已被接管后

@@ -27,25 +27,23 @@ func (ev Event[T]) Publish(ctx context.Context, p *Publisher,
 }
 
 // SubscribeBroadcast 注册广播订阅：发完即忘（ADR 0006）。仅接受
-// WithConcurrency / WithFetchLimit；传入认领专属选项返回
-// ErrNotClaimSubscription。
+// WithConcurrency / WithFetchLimit；认领专属选项返回 ErrNotClaimSubscription。
 //
 // 注册在 Runner 生命周期内任意时刻可用（Stop 前，ADR 0015）：Start 前
-// 注册的订阅由 Start 统一装配；启动后注册即时生效——基线锚定于注册
-// 调用内，注册返回即基线确立，只处理注册之后发布的事件；锚定查询失败
-// 返回错误、订阅不生效，修复后可重试。Stop 后注册返回 ErrRunnerStopped。
+// 注册由 Start 统一装配；启动后注册即时生效，基线锚定于注册调用内
+// （注册返回即基线确立，只处理其后发布的事件），锚定失败可修复重试；
+// Stop 后注册返回 ErrRunnerStopped。
 func (ev Event[T]) SubscribeBroadcast(r *Runner, h Handler[T],
 	opts ...SubscribeOption) error {
 	return r.subscribeBroadcast(ev.Name, wrapHandler[T](r, h), opts)
 }
 
 // SubscribeClaim 注册认领订阅（ADR 0006）。身份取 WithConsumerType，
-// 未设置时用 Runner 构造默认身份（WithIdentity）；两者皆缺返回
-// ErrIdentityMissing。
+// 未设置时用 Runner 构造默认身份（WithIdentity），两者皆缺返回 ErrIdentityMissing。
 //
 // 注册在 Runner 生命周期内任意时刻可用（Stop 前，ADR 0015）：启动后
 // 注册即时生效，起点对齐新身份口径——从当前可认领行（保留窗口内，
-// 含其他身份已 done/failed 的）开始认领（design.md §5.1）。Stop 后
+// 含其他身份已 done/failed 的）开始认领（design.md §5.1）；Stop 后
 // 注册返回 ErrRunnerStopped。
 func (ev Event[T]) SubscribeClaim(r *Runner, h Handler[T],
 	opts ...SubscribeOption) error {

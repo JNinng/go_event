@@ -39,17 +39,10 @@ func (ta *TransactionalAppender) BeginTx(context.Context) (*Tx, error) {
 }
 
 // AppendTx 在业务事务 tx 内追加事件（幂等：同 ID 首写为准；CoalesceKey
-// 非空时记录同键取代意图，ADR 0014）。事件在提交前对外不可见，提交后经
-// 轮询/认领可见（就近唤醒信号不覆盖事务内发布，ADR 0012）。tx 为 nil、
-// 非本 appender 的事务或已终结的事务返回错误。
-//
-// 取代意图镜像 SQL 语义：sup 语句在 AppendTx 调用（执行）时刻解析候选前驱
-// ——已提交行与本事务先前缓冲行（同事务可见自身未提交写）、未被取代且无
-// 任何认领行；标记本身为事务内写，Commit 原子应用、Rollback 丢弃（与
-// Postgres 行锁随事务提交/回滚的可见性边界对齐）。进程内模拟不持行锁：
-// 调用与提交之间被并发认领的候选前驱在提交时仍被标记（SQL 后端该行为由
-// 语句执行时刻的行锁排序承载，本处不重查认领），旧事件多跑一趟对幂等
-// 任务无害（ADR 0014 v1 保守口径的已知边界）。
+// 非空时记录同键取代意图，ADR 0014：取代候选在调用时刻解析——已提交行
+// 加本事务先前缓冲行，标记随事务提交生效、回滚丢弃。事件在提交前对外
+// 不可见，提交后经轮询/认领可见（就近唤醒信号不覆盖事务内发布，
+// ADR 0012）。tx 为 nil、非本 appender 的事务或已终结的事务返回错误。
 func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *Tx, e event.RawEnvelope) error {
 	if err := ctx.Err(); err != nil {
 		return err

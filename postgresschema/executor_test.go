@@ -198,7 +198,8 @@ func newFakeBackend(snap Snapshot, tryLocks ...bool) (*fakeConnector, *fakeTx) {
 // planExecs 返回已执行的计划语句（去掉首条 lock_timeout 设置）。
 func planExecs(tx *fakeTx) []string { return tx.execs[1:] }
 
-// consistentSnapshot 构造与期望对象集完全一致的快照（含基线与 v2/v3 版本列）。
+// consistentSnapshot 构造与接管校验放行口径一致的快照（基线对象 + v2/v3
+// 版本列；不含 v4 两列与同键取代索引，属可修复缺失，不阻断重放）。
 func consistentSnapshot() Snapshot {
 	toColStates := func(cols []Column) []ColumnState {
 		states := make([]ColumnState, 0, len(cols))
@@ -321,7 +322,7 @@ func TestMigrate(t *testing.T) {
 		}
 	})
 
-	t.Run("ConsistentObjects_Migrate_ReplaysFullPlanAndCommits", func(t *testing.T) {
+	t.Run("MissingV4Objects_Migrate_ReplaysFullPlanAndCommits", func(t *testing.T) {
 		conn, tx := newFakeBackend(consistentSnapshot())
 		if err := Migrate(context.Background(), conn, schema); err != nil {
 			t.Fatalf("migrate: %v", err)

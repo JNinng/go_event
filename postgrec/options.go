@@ -9,8 +9,7 @@
 // README.md「能力边界表」（跨实例推送唤醒不做实现，退化轮询）。
 //
 // 持久结构按迁移模式在首次使用时处理：缺省 Create 持迁移锁幂等应用版本
-// 计划（需 DDL 权限）；Verify 只读校验、None 不建不校验——两者要求表已
-// 由部署流程创建，运行账号只授 DML 权限。
+// 计划（需 DDL 权限），Verify / None 只需 DML 且表须已由部署流程建好。
 package postgrec
 
 import (

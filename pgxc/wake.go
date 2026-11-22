@@ -28,7 +28,7 @@ const (
 // 向 Bind 注入的 LocalWake 注入 NotifyAll 信号（跨实例信号触发本地已挂起
 // 的 Fetch/唤醒等待）。
 //
-// 连接管理（ADR 0013 §3）：LISTEN 需专用连接——经连接池 Acquire 持有一条
+// 连接管理（ADR 0013 §2）：LISTEN 需专用连接——经连接池 Acquire 持有一条
 // 连接、不随 DML 归还复用（LISTEN 会话状态无法随池连接归还清空）；连接
 // 断开按有界退避重连并重新 LISTEN，重连窗口内的信号丢失由轮询兜底；延迟
 // 行的 NOTIFY 在插入（事务提交）时发出、不判断 deliver_at（推送只回答
@@ -50,7 +50,7 @@ type Wake struct {
 
 // NewWake 构造跨实例唤醒总线并开始后台监听。schema 名在构造期校验：
 // 非法 schema 或连接池为 nil 时监听不启动（构造仍返回可用对象，跨实例
-// 信号退化由轮询兜底，ADR 0013 §3），仅记错误日志。任意合法 schema 都有
+// 信号退化由轮询兜底，ADR 0013 §2），仅记错误日志。任意合法 schema 都有
 // 唤醒通道（超长 schema 走确定性哈希通道名，见 wakeChannel）。选项与
 // NewDriver 共享（本面消费 schema 与 logger）。
 func NewWake(pool *pgxpool.Pool, opts ...Option) *Wake {

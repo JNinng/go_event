@@ -16,7 +16,7 @@ type pubPayload struct {
 }
 
 // 缺省配置：ID 自动填充且唯一、OccurredAt 自动填 UTC 当前时间
-// （design.md §6）。
+// （docs/design.md §6）。
 func TestDefaultPublish_Fills_IDAndOccurredAt(t *testing.T) {
 	d := newStubDriver()
 	pub := event.NewPublisher(d)
@@ -48,7 +48,7 @@ func TestDefaultPublish_Fills_IDAndOccurredAt(t *testing.T) {
 	}
 }
 
-// WithIDGenerator 注入的生成器替代缺省实现（design.md §6）。
+// WithIDGenerator 注入的生成器替代缺省实现（docs/design.md §6）。
 func TestInjectedIDGenerator_Publish_UsesInjected(t *testing.T) {
 	d := newStubDriver()
 	pub := event.NewPublisher(d, event.WithIDGenerator(func() string { return "gen-id" }))
@@ -114,7 +114,7 @@ func TestWithoutEventID_Publish_UsesGenerator(t *testing.T) {
 	}
 }
 
-// WithPublisherCodec 注入的 codec 替代缺省 JSON（design.md §6）。
+// WithPublisherCodec 注入的 codec 替代缺省 JSON（docs/design.md §6）。
 func TestInjectedCodec_Publish_EncodesWithInjected(t *testing.T) {
 	d := newStubDriver()
 	pub := event.NewPublisher(d, event.WithPublisherCodec(&prefixCodec{}))

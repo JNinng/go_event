@@ -10,7 +10,7 @@ type codecPayload struct {
 	Value string `json:"value"`
 }
 
-// 正常载荷编解码往返一致（design.md §6）。
+// 正常载荷编解码往返一致（docs/design.md §6）。
 func TestRoundtripPayload_Codec_PreservesValue(t *testing.T) {
 	c := event.NewJSONCodec()
 	in := codecPayload{Value: "hello"}

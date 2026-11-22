@@ -301,13 +301,10 @@ WHERE c.event_id = e.id AND e.type = $1 AND c.consumer_type = $2
 	}
 	terminalFailed := int(terminalTag.RowsAffected())
 
-	// 2) 原子认领（单语句两个数据修改 CTE 共享同一拾取窗口）：延迟事件按 q.Now 判定到期（deliver_at
-	//    <= now，ADR 0013 §1），未到期行不进拾取窗口；被取代行不进拾取窗口
-	//    （superseded 是事件行属性，对新消费者身份同样生效，ADR 0014）；无主
-	//    与 retrying 重认领走 INSERT（Fail 时已计入，接管不再计数，ADR 0006），
-	//    active 过期租约走 UPDATE 接管（计入重试）。已知边界：快照为 active
-	//    的行若在 UPDATE 执行时被旧属主迟到 Fail 翻成 retrying 且退避未期满，
-	//    本轮不发放、下轮再认领（ADR 0011，at-least-once 不破坏）。
+	// 2) 原子认领（单语句两个数据修改 CTE 共享同一拾取窗口）：无主/retrying
+	//    重认领走 INSERT 不递增计数（Fail 时已计入）、active 过期走 UPDATE
+	//    接管递增（ADR 0006/0011）；快照与执行间竞态本轮不发放、下轮再认领
+	//    （ADR 0011）。
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 WITH picked AS (
 	SELECT e.id, c.status

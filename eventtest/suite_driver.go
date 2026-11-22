@@ -572,8 +572,9 @@ func testClaimOverLimitSlot(t *testing.T, d event.Driver) {
 	}
 	fail(os1, baseNow.Add(2*time.Minute)) // count=2 达上限 → failed 终态
 
-	// os1 failed；os2 活跃租约过期且接管将达上限（2+1 >= 2）→ 置 failed
-	// 不占槽位；新行 os3 无主 → Limit=1 恰好发放给 os3。
+	// os1 failed；os2 活跃租约过期且接管将达上限（claim_count=1，本次接管
+	// 1+1 >= RetryLimit=2 → 翻转置 failed）不占槽位；新行 os3 无主 →
+	// Limit=1 恰好发放给 os3。
 	appendEvent(t, d, "os3", typ, "3", nil)
 	res, err := d.Claim(t.Context(), event.ClaimQuery{
 		Type: typ, ConsumerType: "os", Lease: time.Minute, Limit: 1,

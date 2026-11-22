@@ -25,30 +25,10 @@ const wakeChannelPrefix = "go_event_wake_"
 // 按字节截断安全。
 const wakeChannelTrunc = 32
 
-// appendInsertSQL 是事件写入的单一语句定义：普通 Append（自管连接，独立
-// 提交）与事务性 AppendTx（加入调用方业务事务）共用同一份，避免第二份拷
-// 贝漂移（幂等语义一致：同 ID 首写为准，design.md §4；合并投递取代与插入
-// 同一写路径，ADR 0014）。
-//
-// 单条 CTE 原子「置同键待消费前驱 superseded + 插入新行」（ADR 0014）：
-//   - sup：同 (type, coalesce_key)、未被取代、且无任何认领行（任意消费者
-//     身份——处理中 / 等退避 / 租约过期待接管 / 终态行均不取代，v1 保守
-//     口径）的待消费前驱置 superseded_at；NOT EXISTS(dup.id) 使重复 Append
-//     同 ID 成为纯 no-op（幂等与合并正交，重发旧事件不杀死新赢家）。
-//   - ins：INSERT ... ON CONFLICT (id) DO NOTHING（首写为准）；coalesce_key
-//     空串存 NULL——NULL 不参与取代匹配，未设键的发布天然不合并。
-//
-// 数据修改 CTE 按文档保证「恰好执行一次、不受主查询是否读取输出影响」；
-// 跨实例唤醒信号经 wake CTE 挂在插入事实之后：仅实际插入行时 NOTIFY（幂
-// 等冲突不重发信号），MATERIALIZED + 主查询引用保证求值恰好一次；通道与
-// payload 只带 schema 名，不带事件内容（ADR 0013 §2）。pg_notify 随所在
-// 事务提交才可见——事务性入队的信号在提交时刻发出，与「提交前发信号只会
-// 让消费者空拉一趟」的边界（ADR 0012 §2）天然相容；延迟行与被取代的延迟
-// 行同样只在插入（事务提交）时发，不判断 deliver_at——推送只回答「有新
-// 行」，不回答「有可投递行」，消费侧空拉一趟由轮询兜底。
-//
-// 返回行恒一行两列：superseded（本次取代的待消费前驱行数，与落库事实
-// 一致）、woke（唤醒信号发出数，0/1——仅插入行时为 1）。
+// appendInsertSQL 是普通 Append 与事务性 AppendTx 共用的单一写入语句：
+// 同 ID 首写为准 + 单条 CTE 原子「置同键待消费前驱 superseded + 插入新行」
+// + 插入行时 NOTIFY；CTE 语义见 ADR 0014 §2，NOTIFY 时序见 ADR 0013 §2；
+// 返回一行两列（superseded 取代行数、woke 信号数）。
 const appendInsertSQL = `
 WITH sup AS (
 	UPDATE %s.event e

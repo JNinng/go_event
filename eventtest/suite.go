@@ -7,8 +7,7 @@
 // RunInspectorSuite / RunAdminReplaySuite / RunTransactionalAppendSuite
 // 覆盖只读查询面（ADR 0005）、管理面重放（ADR 0010）与 outbox 事务性
 // 入队（ADR 0012）三个可选面；RunStoreSuite 覆盖组合对象 Store 的三面
-// 同源（便利构造，各面完整语义仍由上述套件约束）。用例级清单以各 Run
-// 入口的注册表为准；用例命名遵循三段式「条件_动作_预期结果」。
+// 同源（便利构造，各面完整语义仍由上述套件约束）；用例清单与三段式命名以各 Run 入口注册表为准。
 package eventtest
 
 import (

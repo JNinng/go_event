@@ -11,22 +11,13 @@ import (
 
 // appendInsertSQL 是事件写入的单一语句定义：普通 Append（自管连接，独立
 // 提交）与事务性 AppendTx（加入调用方业务事务）共用同一份，避免第二份拷
-// 贝漂移（幂等语义一致：同 ID 首写为准，design.md §4；合并投递取代与插入
-// 同一写路径，ADR 0014）。
+// 贝漂移（幂等语义一致：同 ID 首写为准，design.md §4）。
 //
-// 单条 CTE 原子「置同键待消费前驱 superseded + 插入新行」（ADR 0014）：
-//   - sup：同 (type, coalesce_key)、未被取代、且无任何认领行（任意消费者
-//     身份——处理中 / 等退避 / 租约过期待接管 / 终态行均不取代，v1 保守
-//     口径）的待消费前驱置 superseded_at；NOT EXISTS(dup.id) 使重复 Append
-//     同 ID 成为纯 no-op（幂等与合并正交，重发旧事件不杀死新赢家）。
-//   - ins：INSERT ... ON CONFLICT (id) DO NOTHING（首写为准）；coalesce_key
-//     空串存 NULL——NULL 不参与取代匹配，未设键的发布天然不合并。
-//
-// 数据修改 CTE 按文档保证「恰好执行一次、不受主查询是否读取输出影响」。
-// 返回行恒一行两列：superseded（本次取代的待消费前驱行数，与落库事实
-// 一致）、inserted（本次是否实际插入新行）。本后端不承载跨实例唤醒信号
-// （database/sql 无驱动无关的 LISTEN 接入，退化轮询，ADR 0013 §4）；唤醒
-// 信号的 pg_notify 变体仅 pgxc 提供。
+// 单条 CTE 原子「置同键待消费前驱 superseded + 插入新行」（sup / ins 逐条
+// 语义与取代范围见 ADR 0014 §2）：重复 Append 同 ID 纯 no-op（幂等与合并
+// 正交）；返回一行两列——superseded（本次取代行数，与落库事实一致）与
+// inserted（本次是否实际插入新行）。本后端不承载跨实例唤醒信号（退化轮
+// 询，ADR 0013 §4）；唤醒信号的 pg_notify 变体仅 pgxc 提供。
 const appendInsertSQL = `
 WITH sup AS (
 	UPDATE %s.event e
@@ -115,11 +106,10 @@ func newTransactionalAppenderOn(d *Driver) *TransactionalAppender {
 
 // AppendTx 在调用方业务事务 tx 内追加事件（不提交、不回滚——事务控制归
 // 调用方）。事件在提交前对外不可见（Fetch / Claim / HeadPosition 均只锚
-// 已提交行），提交后经轮询/认领可见（本后端无跨实例唤醒信号）；广播消费
-// 下可能被并发提交的更大 position 越过水位而漏投（ADR 0012 §2 投递边界，
-// 需可靠投递用认领消费——Claim 直接查库，不受水位影响）。合并投递的取代
-// 与插入同事务（共用 appendInsertSQL，ADR 0014）。position 在 INSERT 时
-// 分配，回滚不回收（Postgres 序列不回收，缺口不进入消费契约）。
+// 已提交行），提交后经轮询/认领可见（本后端无跨实例唤醒信号）；广播漏投
+// 边界见 ADR 0012 §2（README 能力边界表同）。合并投递的取代与插入同事务
+// （共用 appendInsertSQL，ADR 0014）。position 在 INSERT 时分配，回滚不
+// 回收（Postgres 序列不回收，缺口不进消费契约）。
 func (ta *TransactionalAppender) AppendTx(ctx context.Context, tx *sql.Tx, e event.RawEnvelope) error {
 	// 调用方取消：不发起写（pre-canceled ctx 显式预检，与 Admin 写路径同口径）。
 	if err := ctx.Err(); err != nil {

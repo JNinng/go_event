@@ -13,7 +13,7 @@ import (
 //   - 状态查询：无认领行 = 「待处理」（ok=false）；processing/retrying/
 //     done/failed 与认领行 status 严格对齐；Attempts = 已计入的重试计数。
 //   - 分档计数：「待处理」= 该身份无认领行（口径写进 Inspector 契约）；
-//     done 为归档档，五档互斥且完备。
+//     done 为归档档，六档互斥且完备。
 //   - failed 列表：偏移分页（首页/末页/越界/零 Limit/负 Offset），按
 //     failed_at 降序、同刻按事件 ID 升序；摘要与终态时刻随行（ADR 0009）。
 //
@@ -310,8 +310,8 @@ func testInspectorCountAllPending(t *testing.T, d event.Driver, insp event.Inspe
 	}
 }
 
-// 五档混合事实与 Claim/Fail/Complete 落库事实逐档一致；五档互斥且合计
-// 等于该类型事件总数。
+// 五档混合事实（superseded 档为空）与 Claim/Fail/Complete 落库事实逐档
+// 一致；六档互斥且合计等于该类型事件总数（本用例 superseded=0）。
 func testInspectorCountMixed(t *testing.T, d event.Driver, insp event.Inspector) {
 	typ := t.Name()
 	inspectMixedFixture(t, d, typ)
@@ -328,7 +328,7 @@ func testInspectorCountMixed(t *testing.T, d event.Driver, insp event.Inspector)
 	}
 }
 
-// 全部完成：done 单独归档，不计入其余四档（done 归档口径）。
+// 全部完成：done 单独归档，不计入其余五档（done 归档口径）。
 func testInspectorCountDoneArchived(t *testing.T, d event.Driver, insp event.Inspector) {
 	typ := t.Name()
 	appendEvent(t, d, "ic-d1", typ, "1", nil)

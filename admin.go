@@ -12,11 +12,9 @@ import (
 // 与各自 Driver 共享连接与命名空间选项。
 //
 // 硬边界：仅处置认领消费的 failed 终态行（done 幂等不可逆、不重放）；
-// 重放窗口 = 保留窗口（design.md §5.3）；写操作持与迁移执行相同的命名
-// 空间互斥锁（超时返回 ErrAdminLockTimeout，瞬时）；每次调用发射操作
-// 来源观测（指标 / slog / ObserverV3.OnAdminReplay，均为旁路）。形态与
-// 重放语义见 docs/api.md §2.11 与
-// [ADR 0010](docs/adr/0010-admin-write-plane-and-replay.md)。
+// 重放窗口 = 保留窗口，写操作持与迁移相同的命名空间互斥锁（瞬时超时
+// 返回 ErrAdminLockTimeout）。形态与重放语义见 docs/api.md §2.11 与
+// docs/adr/0010-admin-write-plane-and-replay.md。
 type Admin interface {
 	// ReplayFailed 把（事件 × 消费者身份）的 failed 终态认领行重新置为
 	// 可认领（手工重放）：单条条件更新（CAS）仅命中 status='failed'，

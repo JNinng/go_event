@@ -1,14 +1,11 @@
 // Package inmem 构造进程内 event.Driver：供 eventtest 契约测试与使用方
 // 本地测试/示例使用。条件过滤在内存模拟，能力边界注明「模拟」档
-// （ADR 0005）。同一实现提供只读查询面 event.Inspector（NewInspector
-// 构造或类型断言探测）、管理写面 event.Admin（NewAdmin 构造，failed
-// 事件手工重放）、事务性入队面 TransactionalAppender（outbox 可选面，
-// NewTransactionalAppender 构造）与组合对象 Store（NewStore 构造，便利
-// 构造非能力面）：各面共享同一份内存状态与互斥锁，语义与 Postgres 后端
-// 一致，逐面契约见 docs/api.md §4 与 docs/design.md §6。延迟事件
-// （DeliverAt）在内存模拟同一到期判据（deliver_at <= now，ADR 0013）；
-// 合并投递（CoalesceKey，同键最新一次消费）在内存模拟同一取代与下推
-// 排除口径（ADR 0014）；就近唤醒为同进程 LocalWake 语义（无跨实例面）。
+// （ADR 0005）。同一实现提供 Inspector / Admin / TransactionalAppender /
+// Store 各面：各面共享同一份内存状态与互斥锁，语义与 Postgres 后端一致，
+// 逐面契约见 docs/api.md §4 与 docs/design.md §6。延迟事件（DeliverAt）
+// 在内存模拟同一到期判据（deliver_at <= now，ADR 0013）；合并投递
+// （CoalesceKey，同键最新一次消费）在内存模拟同一取代与下推排除口径
+// （ADR 0014）；就近唤醒为同进程 LocalWake 语义（无跨实例面）。
 package inmem
 
 import (
@@ -263,7 +260,7 @@ func (d *Driver) Claim(_ context.Context, q event.ClaimQuery) (event.ClaimResult
 	})
 
 	// 1) 接管达重试上限的行直接置 failed 终态：不发放、不占用 Limit
-	//    槽位（与 SQL 实现的「先置 failed 再 LIMIT 拾取」一致，ADR 0006）。
+	//    槽位（与 SQL 实现的「先置 failed 再 LIMIT 拾取」一致，ADR 0006/0011）。
 	//    终态时刻随置入写入；接管路径没有本次处理错误，不写摘要。
 	terminalFailed := 0
 	for _, cd := range candidates {

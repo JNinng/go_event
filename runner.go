@@ -328,10 +328,9 @@ func (r *Runner) startSubscription(runCtx context.Context, s *subscription) {
 // 操作。启动后可继续经 SubscribeBroadcast / SubscribeClaim 动态注册订阅，
 // 即时生效（ADR 0015）。
 //
-// 广播基线在 Start 内同步确立（ADR 0006）：对每个广播订阅调用
-// Driver.HeadPosition，水位锚定到该类型当前已提交的最大位置——Start
-// 返回即基线确立，此后发布的事件必然可投递。任一锚点查询失败则整体
-// 不启动并返回错误，可修复后重试 Start。
+// 广播基线在 Start 内同步锚定（ADR 0006）：对每个广播订阅调用
+// Driver.HeadPosition，Start 返回即基线确立；任一锚点查询失败则整体
+// 不启动并返回错误，可修复后重试。
 func (r *Runner) Start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -402,8 +401,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	return r.Stop(context.WithoutCancel(ctx))
 }
 
-// runBroadcast 广播消费 poll 循环：发完即忘（ADR 0006）。水位已由
-// Start 锚定到该类型的头部位置，循环只读取其后发布的事件。
+// runBroadcast 广播消费 poll 循环：发完即忘（ADR 0006）。水位在装配时
+// 锚定到该类型的头部位置——Start 统一装配或启动后经 register 动态注册
+// 两条路径均在启动订阅前锚定（ADR 0015）——循环只读取其后发布的事件。
 func (r *Runner) runBroadcast(ctx context.Context, s *subscription) {
 	defer r.wg.Done()
 	if s.wakeCh != nil {

@@ -403,7 +403,7 @@ func adminReplayDurationDatapoint(t *testing.T, reader *sdkmetric.ManualReader, 
 
 // 观测面集成（操作来源记录）：重放结果逐次发射指标 / 日志 / Observer
 // 事件，结果枚举与返回值一致；日志含操作与事件 × 身份，错误路径携带
-// error.type（不含错误原文以外的敏感数据口径由属性键约束）。
+// error.type（除错误原文外不携带其他敏感字段，口径由属性键约束）。
 func TestAdminReplayObservability(t *testing.T) {
 	pool := migrationPool(t)
 	ctx := context.Background()

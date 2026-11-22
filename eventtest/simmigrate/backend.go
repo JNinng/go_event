@@ -292,8 +292,8 @@ func (b *Backend) Capabilities() event.MigrationCapabilities {
 
 // Prepare 构造场景。Partial 应用基线前 5 个对象（schema、event 表、
 // event_pk、event_type_id_uniq、event_type_position_idx）：已有对象定义与
-// 计划一致，仅缺 event_claim 相关对象。Conflict 用 payload text（计划为
-// bytea）构造定义冲突。
+// 计划一致，其余对象缺失（event_claim 相关，及 event 表 v3/v4 版本列与
+// 同键取代索引）。Conflict 用 payload text（计划为 bytea）构造定义冲突。
 func (b *Backend) Prepare(t *testing.T, scene eventtest.MigrationScene) {
 	t.Helper()
 	b.catalog.mu.Lock()

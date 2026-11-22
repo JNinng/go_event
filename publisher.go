@@ -15,7 +15,8 @@ type IDGenerator func() string
 
 // Publisher 发布实现。依赖注入：Driver、ID 生成器、codec、就近唤醒总线，
 // 全部经 NewPublisher 构造级注入（design.md §4）。可观测面（指标 provider
-// 与 scope、Observer）同样构造期注入，缺省跟随全局。
+// 与 scope、Observer）同样构造期注入，缺省构造期快照全局（快照后替换
+// 全局不追溯已建实例，语义同 observability.go）。
 type Publisher struct {
 	drv   Driver
 	idgen IDGenerator
@@ -132,13 +133,10 @@ func WithDeliverAt(t time.Time) PublishOption {
 
 // WithCoalesceKey 声明合并投递键（ADR 0014）：同 (Type, CoalesceKey)
 // 作用域内，Append 原子将「无任何认领行的待消费前驱」置为 superseded
-// 并插入新行——同键短期多次发布只消费最新一次（如知识库重建短窗多次
-// 触发）。空串（选项缺省）= 未设置，不参与合并；处理中 / 等退避 / 租约
-// 过期待接管 / 终态的前驱不取代，新事件照常排队（v1 保守口径）。键与
-// 事件 ID 正交：同 ID 幂等 Append 语义不变（重复 Append 不触发取代——
-// 去抖配方须每次发布新 ID，见 usage.md §4.3）。窗口语义不内建：去抖经
-// 与 WithDeliverAt 组合表达（合并键 + deliver_at = now + 静默期，每次
-// 新发布自带基线）。被取代行照常占 position，广播水位直接越过。
+// 并插入新行——同键短期多次发布只消费最新一次；空串（选项缺省）= 未
+// 设置。键与事件 ID 正交：重复 Append 同 ID 不触发取代，去抖须每次
+// 发布新 ID（usage.md §4.3）；窗口语义经与 WithDeliverAt 组合表达
+// （docs/api.md §2.3）。被取代行照常占 position，广播水位直接越过。
 func WithCoalesceKey(key string) PublishOption {
 	return func(c *publishConfig) { c.coalesceKey = key }
 }

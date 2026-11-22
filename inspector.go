@@ -26,10 +26,9 @@ type Inspector interface {
 	// CountStates 按消费者身份对某事件类型做状态分档计数：待处理 /
 	// superseded / 重试中 / processing / failed / done 六档互斥且完备，
 	// 合计等于该类型的事件总数，分档口径与 Claim/Fail/Complete/Append
-	// 的落库事实严格对齐（docs/api.md §2.10）——Pending 即「该身份无
-	// 认领行且未被取代」而非「退避中」；Superseded 是事件行属性档（该
-	// 身份无认领行且已被合并取代，ADR 0014）；processing 按落库
-	// status='active' 分档，租约是否已过期不改变本档。
+	// 的落库事实严格对齐（docs/api.md §2.10）——Pending 即「该身份无认领
+	// 行且未被取代」；Superseded 是事件行属性档（ADR 0014）；processing
+	// 按落库 status='active' 分档，租约是否已过期不改变本档。
 	CountStates(ctx context.Context, typ, consumerType string) (StateCounts, error)
 
 	// FailedEvents 返回 failed 终态事件的分页列表（含错误摘要与终态

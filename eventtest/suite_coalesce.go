@@ -7,21 +7,12 @@ import (
 	"github.com/jninng/go_event"
 )
 
-// 合并投递契约（同键最新一次消费，ADR 0014）：Append 原子「置同键待消费
-// 前驱 superseded + 插入新行」，Fetch / Claim 下推排除被取代行（一种机制
-// 服务广播与认领两种消费模式）；v1 保守取代范围只覆盖「无任何认领行的
-// 待消费前驱」（活跃租约 / 退避 / 租约过期待接管 / 终态行不动，新事件
-// 照常排队）；键与事件 ID 正交（重复 Append 同 ID 不触发取代，重发旧 ID
-// 不杀死新赢家）；被取代行照常占 position（HeadPosition / 广播水位口径
-// 不变，水位直接越过）；被取代的延迟行永不到期投递；AppendTx 的取代与
-// 插入同事务；superseded 行照常参与保留期清理。时钟一律注入判据值并以
-// microNow 截断（Postgres timestamptz 精度）。
-//
-// newDriver 契约：每个用例返回配置了保留窗口的全新 Driver 实例（同
-// RunRetentionSuite：窗口 ≤ 2s，retentionSettle 等过节流窗；其余用例以
-// microNow 构造窗口内行，不受清理影响）。beginTx 契约：与传入 driver
-// 同源（同一后端实例、同一命名空间）绑定事务会话，同 RunTransactionalAppendSuite
-// 的 TxSession——装配缺失沿先例 Fatal 终止。
+// RunCoalescingSuite 运行合并投递契约测试（同键最新一次消费，design.md §9.2、
+// ADR 0014，契约要点见 docs/api.md §4）：latest-wins 与 Fetch / Claim 双模式
+// 排除、保守取代范围、键与事件 ID 正交、AppendTx 取代与插入同事务、
+// Inspector superseded 分档与保留期清理。newDriver 须每用例返回配置了保留
+// 窗口（≤2s，同 RunRetentionSuite）的全新 Driver；beginTx 须与 driver 同源
+// 绑定事务会话（同 RunTransactionalAppendSuite 的 TxSession），nil 即 Fatal。
 func RunCoalescingSuite(t *testing.T, newDriver func(*testing.T) event.Driver,
 	beginTx func(*testing.T, event.Driver) TxSession) {
 	if newDriver == nil {
