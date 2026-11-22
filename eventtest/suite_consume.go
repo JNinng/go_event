@@ -781,26 +781,6 @@ func testGuardMissingIdentity(t *testing.T, d event.Driver) {
 	}
 }
 
-// 订阅守卫：Start 后订阅返回 ErrRunnerStarted（docs/api.md §2.7）。
-func testGuardSubscribeAfterStart(t *testing.T, d event.Driver) {
-	ctx := t.Context()
-	ev := event.Declare[suitePayload]("guard-ss-" + t.Name())
-	handler := func(context.Context, event.Envelope[suitePayload]) error { return nil }
-
-	run := event.NewRunner(d, event.WithIdentity("base"), event.WithLogger(discardLogger()))
-	if err := run.Start(ctx); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	defer func() { _ = run.Stop(context.WithoutCancel(ctx)) }()
-
-	if err := ev.SubscribeBroadcast(run, handler); err != event.ErrRunnerStarted {
-		t.Fatalf("broadcast after start: want ErrRunnerStarted, got %v", err)
-	}
-	if err := ev.SubscribeClaim(run, handler); err != event.ErrRunnerStarted {
-		t.Fatalf("claim after start: want ErrRunnerStarted, got %v", err)
-	}
-}
-
 // attemptObservation handler 侧读到的尝试次数快照。
 type attemptObservation struct {
 	attempts    int

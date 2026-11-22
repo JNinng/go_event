@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### 新特性
+
+- **启动后动态注册订阅（[ADR 0015](docs/adr/0015-dynamic-subscription-registration.md)）**：订阅注册在 `Runner` 生命周期内任意时刻可用（`Stop` 前），不再要求在 `Start` 之前注册完毕——运行期才知道的消费方（按配置启用的订阅、装配完成后注册）可随时接入，注册返回即生效，既有订阅与停机语义不受影响。
+  - 认领订阅：注册即参与认领，起点对齐新身份口径——从当前可认领行（保留窗口内，含其他身份已 `done`/`failed` 的）开始，后续事件照常；零新增簿记。
+  - 广播订阅：基线锚定于注册调用（`Driver.HeadPosition`），注册返回即基线确立，只处理注册之后发布的事件；锚定查询失败注册返回错误、订阅不生效，修复后可重试（与 Start「基线失败不启动」同构）。
+  - 新增 `<scope>.subscribe` 计数（`event` / `mode` / `result` 维度，仅计启动后动态注册）；`Driver` 契约与三个后端零改动。
+- 新增哨兵错误 `event.ErrRunnerStopped`：`Runner.Stop` 后注册订阅（Runner 一次性）返回该错误。
+
+### 破坏性变更与兼容期
+
+- **移除 `event.ErrRunnerStarted`**（v0.x 允许破坏性变更）：动态注册生效后「Start 后再订阅」不再是拒绝路径，该哨兵永不返回；Stop 后注册的拒绝由新增的 `event.ErrRunnerStopped` 承接。原以 `ErrRunnerStarted` 判别「订阅须在 Start 前」的代码可直接移除该判别分支。
+
 ## [v0.3.0] - 2026-11-21
 
 ### 新特性

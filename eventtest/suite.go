@@ -1,14 +1,14 @@
 // Package eventtest 契约测试套件：接口的语义就是这套测试，新后端必须
-// 全过（design.md §1、§9.1）。RunSuite 覆盖公共、广播读取、认领消费与
-// core 编排语义；RunRetentionSuite / RunDelayedDeliverySuite 覆盖保留窗
-// 口清理资格与延迟事件（design.md §5.2、ADR 0013）；RunCoalescingSuite
-// 覆盖合并投递（同键最新一次消费，ADR 0014）；RunMigrationSuite
-// 经 MigrationBackend 覆盖持久结构初始化面；RunInspectorSuite /
-// RunAdminReplaySuite / RunTransactionalAppendSuite 覆盖只读查询面
-// （ADR 0005）、管理面重放（ADR 0010）与 outbox 事务性入队（ADR 0012）
-// 三个可选面；RunStoreSuite 覆盖组合对象 Store 的三面同源（便利构造，
-// 各面完整语义仍由上述套件约束）。用例级清单以各 Run 入口的注册表为
-// 准；用例命名遵循三段式「条件_动作_预期结果」。
+// 全过（design.md §1、§9.1）。RunSuite 覆盖公共、广播读取、认领消费、
+// core 编排语义与启动后动态注册（ADR 0015）；RunRetentionSuite /
+// RunDelayedDeliverySuite 覆盖保留窗口清理资格与延迟事件（design.md
+// §5.2、ADR 0013）；RunCoalescingSuite 覆盖合并投递（同键最新一次消费，
+// ADR 0014）；RunMigrationSuite 经 MigrationBackend 覆盖持久结构初始化面；
+// RunInspectorSuite / RunAdminReplaySuite / RunTransactionalAppendSuite
+// 覆盖只读查询面（ADR 0005）、管理面重放（ADR 0010）与 outbox 事务性
+// 入队（ADR 0012）三个可选面；RunStoreSuite 覆盖组合对象 Store 的三面
+// 同源（便利构造，各面完整语义仍由上述套件约束）。用例级清单以各 Run
+// 入口的注册表为准；用例命名遵循三段式「条件_动作_预期结果」。
 package eventtest
 
 import (
@@ -110,7 +110,14 @@ func RunSuite(t *testing.T, d event.Driver) {
 	t.Run("PublishWithDeliverAt_FetchAndClaim_FilteredUntilDue", func(t *testing.T) { testPublishWithDeliverAt(t, d) })
 	t.Run("ClaimOnlyOption_BroadcastSubscribe_Rejected", func(t *testing.T) { testGuardClaimOnlyOnBroadcast(t, d) })
 	t.Run("MissingIdentity_ClaimSubscribe_Rejected", func(t *testing.T) { testGuardMissingIdentity(t, d) })
-	t.Run("PostStartSubscribe_RejectedErrRunnerStarted", func(t *testing.T) { testGuardSubscribeAfterStart(t, d) })
+
+	// ---- 启动后动态注册（ADR 0015）----
+	t.Run("PostStartEvents_BroadcastSubscribe_OnlyPostRegistrationDelivered", func(t *testing.T) { testDynamicBroadcastOnlyAfterRegistration(t, d) })
+	t.Run("PostStartEvents_ClaimSubscribe_ReplaysBacklogThenNew", func(t *testing.T) { testDynamicClaimReplaysBacklog(t, d) })
+	t.Run("BaselineFailure_PostStartBroadcastSubscribe_RejectedRetryable", func(t *testing.T) { testDynamicBroadcastBaselineFailure_RejectedRetryable(t, d) })
+	t.Run("AfterStop_Subscribe_RejectedErrRunnerStopped", func(t *testing.T) { testSubscribeAfterStop_RejectedErrRunnerStopped(t, d) })
+	t.Run("PostStartSubscription_LocalWake_ImmediateDelivery", func(t *testing.T) { testDynamicSubscriptionLocalWake(t, d) })
+	t.Run("PostStartSubscription_Stop_WaitsInFlightHandler", func(t *testing.T) { testDynamicSubscriptionStopWaitsInFlight(t, d) })
 }
 
 // RunRetentionSuite 运行保留窗口惰性清理契约（design.md §5.2：清理资格

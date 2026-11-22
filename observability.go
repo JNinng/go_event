@@ -270,6 +270,7 @@ type runnerMetrics struct {
 	heartbeat           metric.Int64Counter
 	complete            metric.Int64Counter
 	fail                metric.Int64Counter
+	subscribe           metric.Int64Counter
 }
 
 func newRunnerMetrics(mp metric.MeterProvider, scope string) *runnerMetrics {
@@ -306,6 +307,9 @@ func newRunnerMetrics(mp metric.MeterProvider, scope string) *runnerMetrics {
 		metric.WithDescription("租约完成标记结果计数"), metric.WithUnit("1"))
 	rm.fail, _ = m.Int64Counter(scope+".fail",
 		metric.WithDescription("租约失败标记结果计数"), metric.WithUnit("1"))
+	rm.subscribe, _ = m.Int64Counter(scope+".subscribe",
+		metric.WithDescription("启动后动态注册订阅计数（Start 前注册不计入，ADR 0015）"),
+		metric.WithUnit("1"))
 	return rm
 }
 

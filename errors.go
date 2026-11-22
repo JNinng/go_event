@@ -4,8 +4,9 @@ import "errors"
 
 // 哨兵错误（docs/api.md §2.7）。
 var (
-	// ErrRunnerStarted：Runner.Start 后再订阅。
-	ErrRunnerStarted = errors.New("event: runner already started")
+	// ErrRunnerStopped：Runner.Stop 后再订阅（Runner 一次性，ADR 0015；
+	// Start ctx 已取消、poller 已退出但未 Stop 的窗口同此拒绝）。
+	ErrRunnerStopped = errors.New("event: runner already stopped")
 
 	// ErrNotClaimSubscription：广播订阅传入认领专属选项。
 	ErrNotClaimSubscription = errors.New("event: claim-only option on broadcast subscription")

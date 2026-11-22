@@ -32,6 +32,8 @@ type Runner struct {
 	mu      sync.Mutex
 	subs    []*subscription
 	started bool
+	stopped bool            // Stop 后置位：注册一律拒绝（Runner 一次性，ADR 0015）
+	runCtx  context.Context // poller 生命周期 context：Start 建立后供动态注册复用
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 }
@@ -154,6 +156,14 @@ const (
 	modeClaim
 )
 
+// modeName 订阅模式的观测属性取值（attrMode）。
+func modeName(m subMode) string {
+	if m == modeClaim {
+		return modeNameClaim
+	}
+	return modeNameBroadcast
+}
+
 type subscription struct {
 	mode    subMode
 	typ     string
@@ -181,8 +191,8 @@ func (r *Runner) subscribeBroadcast(typ string,
 	h func(context.Context, RawEnvelope) error, opts []SubscribeOption) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.started {
-		return ErrRunnerStarted
+	if err := r.registrationGuard(); err != nil {
+		return err
 	}
 	cfg := subscribeConfig{}
 	for _, opt := range opts {
@@ -198,16 +208,15 @@ func (r *Runner) subscribeBroadcast(typ string,
 		concurrency: maxOr(cfg.concurrency, defaultConcurrency),
 		fetchLimit:  maxOr(cfg.fetchLimit, defaultFetchLimit),
 	}
-	r.subs = append(r.subs, s)
-	return nil
+	return r.register(s)
 }
 
 func (r *Runner) subscribeClaim(typ string,
 	h func(context.Context, RawEnvelope) error, opts []SubscribeOption) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.started {
-		return ErrRunnerStarted
+	if err := r.registrationGuard(); err != nil {
+		return err
 	}
 	cfg := subscribeConfig{}
 	for _, opt := range opts {
@@ -251,11 +260,73 @@ func (r *Runner) subscribeClaim(typ string,
 		retryLimit:    maxOr(cfg.retryLimit, defaultRetryLimit),
 		backoff:       backoff,
 	}
-	r.subs = append(r.subs, s)
+	return r.register(s)
+}
+
+// registrationGuard 注册闸门（两订阅入口共用，调用方持有 r.mu）：Stop 后
+// ——含 Start ctx 已取消、poller 已退出的窗口——注册一律拒绝；未启动与
+// 运行中放行（运行中经 register 即时生效，ADR 0015）。
+func (r *Runner) registrationGuard() error {
+	if r.stopped || (r.started && r.runCtx.Err() != nil) {
+		return ErrRunnerStopped
+	}
 	return nil
 }
 
-// Start 启动全部订阅的 poller（返回后后台运行）。重复 Start 为无操作。
+// register 把订阅写入注册表（调用方持有 r.mu）：未启动时仅入表，由 Start
+// 统一装配并锚定基线；启动后即时装配生效（ADR 0015）——广播订阅在注册
+// 调用内同步锚定基线（HeadPosition），注册返回即基线确立；锚定失败则
+// 订阅不入表，既有订阅不受影响，修复后可重试注册。
+func (r *Runner) register(s *subscription) error {
+	if !r.started {
+		r.subs = append(r.subs, s)
+		return nil
+	}
+	if s.mode == modeBroadcast {
+		pos, err := r.drv.HeadPosition(r.runCtx, s.typ)
+		if err != nil {
+			r.metrics.subscribe.Add(r.runCtx, 1, metric.WithAttributes(
+				attribute.String(attrEvent, s.typ),
+				attribute.String(attrMode, modeName(s.mode)),
+				attribute.String(attrResult, resultError)))
+			return fmt.Errorf("event: broadcast baseline for %q: %w", s.typ, err)
+		}
+		s.watermark = pos
+	}
+	r.startSubscription(r.runCtx, s)
+	r.subs = append(r.subs, s)
+	r.logger.Info("event: subscription registered",
+		"type", s.typ, "mode", modeName(s.mode), "subscriptions", len(r.subs))
+	r.metrics.subscribe.Add(r.runCtx, 1, metric.WithAttributes(
+		attribute.String(attrEvent, s.typ),
+		attribute.String(attrMode, modeName(s.mode)),
+		attribute.String(attrResult, resultOK)))
+	return nil
+}
+
+// startSubscription 装配并启动单个订阅的 poller（Start 与动态注册共用，
+// 调用方持有 r.mu）；runCtx 是该订阅 poller 的生命周期 context。
+func (r *Runner) startSubscription(runCtx context.Context, s *subscription) {
+	s.sem = make(chan struct{}, s.concurrency)
+	if s.mode == modeClaim {
+		// 容量 1、非阻塞发送：handler 结束释放槽位后立即补认领，
+		// 积压消化不依赖轮询间隔；多次释放合并为一次信号。
+		s.claimCh = make(chan struct{}, 1)
+	}
+	if r.wake != nil {
+		s.wakeCh = r.wake.subscribe(s.typ)
+	}
+	r.wg.Add(1)
+	if s.mode == modeBroadcast {
+		go r.runBroadcast(runCtx, s)
+	} else {
+		go r.runClaim(runCtx, s)
+	}
+}
+
+// Start 启动全部已注册订阅的 poller（返回后后台运行）。重复 Start 为无
+// 操作。启动后可继续经 SubscribeBroadcast / SubscribeClaim 动态注册订阅，
+// 即时生效（ADR 0015）。
 //
 // 广播基线在 Start 内同步确立（ADR 0006）：对每个广播订阅调用
 // Driver.HeadPosition，水位锚定到该类型当前已提交的最大位置——Start
@@ -278,24 +349,11 @@ func (r *Runner) Start(ctx context.Context) error {
 		s.watermark = pos
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	r.runCtx = runCtx
 	r.cancel = cancel
 	r.started = true
 	for _, s := range r.subs {
-		s.sem = make(chan struct{}, s.concurrency)
-		if s.mode == modeClaim {
-			// 容量 1、非阻塞发送：handler 结束释放槽位后立即补认领，
-			// 积压消化不依赖轮询间隔；多次释放合并为一次信号。
-			s.claimCh = make(chan struct{}, 1)
-		}
-		if r.wake != nil {
-			s.wakeCh = r.wake.subscribe(s.typ)
-		}
-		r.wg.Add(1)
-		if s.mode == modeBroadcast {
-			go r.runBroadcast(runCtx, s)
-		} else {
-			go r.runClaim(runCtx, s)
-		}
+		r.startSubscription(runCtx, s)
 	}
 	r.logger.Info("event: runner started", "subscriptions", len(r.subs))
 	return nil
@@ -307,6 +365,9 @@ func (r *Runner) Stop(ctx context.Context) error {
 	wasStarted := false
 	if r.cancel != nil {
 		wasStarted = true
+		// Runner 一次性：Stop 后注册一律拒绝（ADR 0015）。未启动的 Stop
+		// 仍是无操作，Runner 保持可用。
+		r.stopped = true
 		r.cancel()
 	}
 	r.mu.Unlock()

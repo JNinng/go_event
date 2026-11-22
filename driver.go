@@ -36,8 +36,10 @@ type Driver interface {
 	Fetch(ctx context.Context, q FetchQuery) ([]RawEnvelope, error)
 
 	// HeadPosition 返回该类型当前已提交事件的最大 Position，作为广播
-	// 消费的基线锚点：core 在 Runner.Start 时调用一次，水位锚定到该
-	// 快照，Start 返回即基线确立（ADR 0006）。该类型无事件时返回空串。
+	// 消费的基线锚点：core 在 Runner.Start 时对每个广播订阅调用一次，
+	// 水位锚定到该快照，Start 返回即基线确立（ADR 0006）；启动后动态
+	// 注册广播订阅时同样调用（基线锚定于注册调用内，注册返回即基线
+	// 确立，ADR 0015）。该类型无事件时返回空串。
 	HeadPosition(ctx context.Context, typ string) (string, error)
 
 	// Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、退避期满，
