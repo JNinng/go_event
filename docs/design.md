@@ -100,7 +100,9 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 
 ## 5. 消费语义
 
-两种方式统一约定：订阅在 Runner 启动前注册完毕，启动后动态注册留作扩展。
+两种方式统一约定：订阅注册在 Runner 生命周期内任意时刻可用（Stop 前）；
+Start 前注册的订阅由 Start 统一装配并锚定基线，启动后注册即时生效
+（起点语义见 §5.1 / §5.2，[ADR 0015](adr/0015-dynamic-subscription-registration.md)）。
 
 ### 5.1 消费者身份（认领消费）
 
@@ -113,22 +115,29 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 - 身份是消费者的事实身份而非可热切换的旋钮：新增或变更身份即新消费者从头
   认领（历史事件重投，仅限后端保留窗口内），不是断点续跑；存量身份
   的重命名迁移归管理面（生产化能力）。
+- 启动后动态注册的认领订阅对齐同一口径（[ADR 0015](adr/0015-dynamic-subscription-registration.md)）：
+  注册即时生效，从当前可认领行（保留窗口内，含其他身份已 done/failed 的）
+  开始认领，后续事件照常——认领订阅无簿记，不引入任何新状态。
 
 ### 5.2 广播消费（发完即忘）
 
 - 消费端不在存储侧留下任何簿记（无游标、无认领）：消费进度以实例内存中的
   已读水位记录，由 core 在 Fetch 时作为条件下推
   （见 [ADR 0004](adr/0004-demand-driven-pull.md)）。
-- 起点：只处理订阅启动后发布的事件；基线在 `Runner.Start` 内同步锚定——
-  对每订阅取 `Driver.HeadPosition`（该类型已提交的最大位置，单条语句
-  快照）为初始水位，Start 返回即基线确立，此后发布的事件必然可投递，
-  锚点查询失败则 Start 返回错误、整体不启动。停机与重启期间发布的
-  事件不补投，重启从当前位置开始（对齐 Redis Pub/Sub 的发完即忘语义）。
-  需要不丢、可重试、可追踪的场景应使用认领消费。基线锚点为单条语句
-  快照，只锚已提交行（事务性入队未提交的行不进基线）；Postgres 上
-  position 分配序（bigserial）与提交可见序在并发发布下存在理论上的乱序
-  窗口（早分配的行晚提交会被水位越过）——普通 Publish 保持单语句独立
-  提交使该窗口可忽略，「Start 后发布的事件必然可投递」仅在此路径成立。
+- 起点：只处理订阅生效后发布的事件；基线锚定于订阅生效时刻
+  （[ADR 0015](adr/0015-dynamic-subscription-registration.md)）——Start 前
+  注册的订阅在 `Runner.Start` 内同步锚定：对每订阅取 `Driver.HeadPosition`
+  （该类型已提交的最大位置，单条语句快照）为初始水位，Start 返回即基线
+  确立，此后发布的事件必然可投递，锚点查询失败则 Start 返回错误、整体
+  不启动；启动后动态注册的订阅在注册调用内同步锚定，注册返回即基线确立，
+  锚定失败则注册以错误返回、订阅不生效、修复后可重试。停机与重启期间
+  发布的事件不补投，重启从当前位置开始（对齐 Redis Pub/Sub 的发完即忘
+  语义）。需要不丢、可重试、可追踪的场景应使用认领消费。基线锚点为
+  单条语句快照，只锚已提交行（事务性入队未提交的行不进基线）；Postgres
+  上 position 分配序（bigserial）与提交可见序在并发发布下存在理论上的
+  乱序窗口（早分配的行晚提交会被水位越过）——普通 Publish 保持单语句
+  独立提交使该窗口可忽略，「订阅生效后发布的事件必然可投递」仅在此路径
+  成立。
   事务性入队（outbox）把窗口放大为常态：并发提交的更大 position 会把
   内存水位推过晚提交的行，该行对所有在途广播实例永久不可见（重启实例
   的基线锚定同样不含）——事务内发布下的广播投递为尽力而为，认领消费
@@ -258,7 +267,7 @@ core：编排层（poll 循环、心跳、重试上限、就近唤醒、并发�
 | 事件声明  | 泛型 `Declare[T]` / `NoPayload` | Type 名是认领与路由的稳定标识；payload 默认 JSON codec、可插拔                                                                                                                          |
 | 事件信封  | Envelope                      | 发布侧唯一 ID、Type、Payload、元数据块（透传）、OccurredAt、DeliverAt（最早投递时刻，零值=立即，ADR 0013）、CoalesceKey（合并投递键，空串=未设置，ADR 0014）；Attempts/LastAttempt 为 core 运行时注入（认领消费按租约尝试序号与 RetryLimit 计算，广播恒 0/false）                                                                                                                          |
 | 生产    | Publisher                     | Publish 发布；ID 与元数据缺省自动填充；`WithDeliverAt` 声明延迟投递（ADR 0013）；`WithCoalesceKey` 声明合并投递键（ADR 0014）；ID 生成器等构造级注入；outbox 拓展见生产化能力                                                                                                                |
-| 消费编排  | Runner + Subscribe            | 订阅级声明消费方式（广播/认领命名式入口，同一 Runner 可混合承载）与消费者身份（仅认领消费，构造默认 + 订阅级覆盖）、并发、租约、轮询间隔、重试上限与退避（仅认领消费；广播消费失败即跳过，见 §5.2）；两种方式同一订阅签名（强类型糖）；签名见 docs/api.md                                              |
+| 消费编排  | Runner + Subscribe            | 订阅级声明消费方式（广播/认领命名式入口，同一 Runner 可混合承载）与消费者身份（仅认领消费，构造默认 + 订阅级覆盖）、并发、租约、轮询间隔、重试上限与退避（仅认领消费；广播消费失败即跳过，见 §5.2）；两种方式同一订阅签名（强类型糖）；订阅全生命周期可注册（Stop 前），启动后动态注册即时生效（ADR 0015）；签名见 docs/api.md                                              |
 | 后端缝合点 | Driver                        | 单次原子操作，需求条件（订阅类型集 + 租约过期判据 + 可认领/水位条件）在单条 Fetch/Claim 内下推：Append / Fetch、HeadPosition（广播消费，水位条件与基线锚点由 core 传入）/ Claim、Heartbeat、Complete、Fail（认领消费）；语义见 §5 与 ADR |
 | 查询面（可选） | Inspector                 | 只读查询，按能力探测接入（ADR 0005）：（事件 × 消费者身份）状态与重试计数；按身份的状态分档计数——pending（该身份无认领行且未被取代）/ superseded（无认领行且已被合并取代，事件行属性档，ADR 0014）/ retrying / processing / failed / done（done 为归档档，六档互斥且完备）；failed 事件偏移分页列表（错误摘要与 failed_at 随行返回，ADR 0009）。与 Driver 共享连接与命名空间选项；只读、不参与认领/完成路径；结果仅在保留窗口内可见（硬边界，§5.2） |
 | 管理面（可选） | Admin                     | 写操作与运行面分离、不进 Driver、不挂后端 Driver 类型（ADR 0010）：`ReplayFailed` 把（事件 × 消费者身份）的 failed 终态行重置为可认领——仅 failed 可重放（done 不可逆），单条 CAS 条件更新防竞态；重放置 retrying、claim_count=0、清租约、next_eligible_at=now、failed_at 清空、last_error 保留；不经运行面类型获得——经后端 `NewAdmin` 构造或经组合对象 Store 聚合（同一内部构造路径；与 Driver 共享连接与命名空间选项，鉴权归使用方）；重放窗口 = 保留窗口（§5.3）。写路径持与迁移执行共用的命名空间互斥锁（等待有界）、归属校验即 CAS、发射操作来源观测（指标/日志/Observer 事件）、错误可判别（`ErrAdminLockTimeout` / 迁移面哨兵 / 连接故障）；无自动 down，迁移侧无台账无需 reset/stamp 入口 |
@@ -405,7 +414,9 @@ RabbitMQ、Kafka 排除）见 [ADR 0005](adr/0005-backend-capability-boundary.md
 - **消费编排**：认领消费多身份承载、需求驱动拉取（按类型轮询限额，防单类型
   洪泛饿死其他类型）、并发度控制、优雅停机（停领在途跑完）；认领每轮有效
   批大小为 `min(WithFetchLimit, 空闲并发槽位)`，无空闲槽位时不认领；派发前
-  由 core 按租约尝试序号与订阅 RetryLimit 注入 Attempts/LastAttempt。
+  由 core 按租约尝试序号与订阅 RetryLimit 注入 Attempts/LastAttempt；订阅
+  全生命周期可注册（Stop 前），启动后动态注册即时生效——广播基线锚定于
+  注册调用、认领对齐 §5.1 新身份口径（[ADR 0015](adr/0015-dynamic-subscription-registration.md)）。
 - **就近消费**：同进程发布唤醒本实例立即拉取/认领（仅信号，不跳过存储）。
 - **可观测**：日志走 stdlib `slog`，指标走 `go.opentelemetry.io/otel/metric`
   并跟随全局装配（未配置时 otel 全局 provider 即 noop，热路径零开销）；

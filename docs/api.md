@@ -56,18 +56,32 @@ func (ev Event[T]) Publish(ctx context.Context, p *Publisher,
 // SubscribeBroadcast 注册广播订阅：发完即忘（ADR 0006）。仅接受
 // WithConcurrency / WithFetchLimit；传入认领专属选项返回
 // ErrNotClaimSubscription。
+//
+// 注册在 Runner 生命周期内任意时刻可用（Stop 前，ADR 0015）：Start 前
+// 注册的订阅由 Start 统一装配；启动后注册即时生效——基线锚定于注册
+// 调用内，注册返回即基线确立，只处理注册之后发布的事件；锚定查询失败
+// 返回错误（包装底层错误）、订阅不生效，修复后可重试。Stop 后注册返回
+// ErrRunnerStopped。
 func (ev Event[T]) SubscribeBroadcast(r *Runner, h Handler[T],
     opts ...SubscribeOption) error
 
 // SubscribeClaim 注册认领订阅（ADR 0006）。身份取 WithConsumerType，
 // 未设置时用 Runner 构造默认身份（WithIdentity）；两者皆缺返回
 // ErrIdentityMissing。
+//
+// 注册在 Runner 生命周期内任意时刻可用（Stop 前，ADR 0015）：启动后
+// 注册即时生效，起点对齐新身份口径——从当前可认领行（保留窗口内，
+// 含其他身份已 done/failed 的）开始认领（design.md §5.1）。Stop 后注册
+// 返回 ErrRunnerStopped。
 func (ev Event[T]) SubscribeClaim(r *Runner, h Handler[T],
     opts ...SubscribeOption) error
 ```
 
-订阅须在 `Runner.Start` 前完成；Start 后调用返回 `ErrRunnerStarted`
-（design.md §5「订阅在 Runner 启动前注册完毕」）。
+订阅注册在 Runner 生命周期内任意时刻可用（Stop 前）；Stop 后调用返回
+`ErrRunnerStopped`（Runner 一次性，ADR 0015）。启动后注册的阻塞与失败
+语义：广播订阅在注册调用内同步执行基线锚定查询（使用 Runner 运行期
+context），返回即基线确立；失败则订阅不生效、既有订阅不受影响，修复后
+可重试。
 
 ### 2.2 信封与编解码
 
@@ -225,7 +239,9 @@ type Driver interface {
 
     // HeadPosition 广播基线锚点：返回该类型当前已提交事件的最大
     // Position，无事件返回空串。core 在 Runner.Start 时对每个广播
-    // 订阅调用一次，水位锚定到该快照，Start 返回即基线确立（ADR 0006）。
+    // 订阅调用一次，水位锚定到该快照，Start 返回即基线确立（ADR 0006）；
+    // 启动后动态注册广播订阅时同样调用（基线锚定于注册调用内，注册
+    // 返回即基线确立，ADR 0015）。
     HeadPosition(ctx context.Context, typ string) (string, error)
 
     // Claim 认领消费：原子认领至多 q.Limit 条「无主、租约过期、退避期满，
@@ -427,10 +443,12 @@ func WithBackoff(b Backoff) SubscribeOption             // 缺省 ExponentialBac
 ```
 
 ```go
-// Start 启动全部订阅的 poller。广播基线在 Start 内同步确立：对每个
+// Start 启动全部已注册订阅的 poller。广播基线在 Start 内同步确立：对每个
 // 广播订阅调用 Driver.HeadPosition，水位锚定到该类型已提交的最大位置
 // ——Start 返回即基线确立，此后发布的事件必然可投递；任一锚点查询
 // 失败则整体不启动并返回错误，修复后可重试 Start。重复 Start 为无操作。
+// 启动后可继续经 SubscribeBroadcast / SubscribeClaim 动态注册订阅，
+// 即时生效（ADR 0015）。
 func (r *Runner) Start(ctx context.Context) error
 
 // Stop 优雅停机：停止认领/拉取，等待在途 handler 跑完（design.md §9.1）。
@@ -445,7 +463,8 @@ func (r *Runner) Run(ctx context.Context) error
 编排行为（core 内部，不进签名面）：
 
 - 广播基线在 Start 内经 `Driver.HeadPosition` 同步锚定（返回即基线确立，
-  ADR 0006）；此后按订阅类型轮询 Fetch，watermark 按（订阅 × 类型）在
+  ADR 0006）；启动后动态注册的广播订阅在注册调用内锚定，语义同构
+  （ADR 0015）。此后按订阅类型轮询 Fetch，watermark 按（订阅 × 类型）在
   内存维护，只进不退（ADR 0004）；handler 失败仅记日志跳过。
 - 认领消费按订阅类型轮询 Claim，每轮 Limit 取 `min(WithFetchLimit, 当前
   空闲并发槽位)`，无空闲槽位时不认领；`WithFetchLimit` 对认领是批次上限，
@@ -489,7 +508,7 @@ func (w *LocalWake) NotifyAll() (notified, dropped int)
 
 ```go
 var (
-    ErrRunnerStarted        // Runner.Start 后再订阅
+    ErrRunnerStopped        // Runner.Stop 后再订阅（Runner 一次性，ADR 0015）
     ErrNotClaimSubscription // 广播订阅传入认领专属选项
     ErrIdentityMissing      // 认领订阅未设置身份（订阅级与 Runner 默认皆缺）
     ErrEmptyEventID         // WithEventID 传入空串（不回退到 IDGenerator）
@@ -752,6 +771,7 @@ const (
 | `go_event.handle.duration` | Histogram | `mode`, `event`, `result` |
 | `go_event.heartbeat` / `complete` / `fail` | Counter | `result`=ok/error |
 | `go_event.wake` | Counter | `result`=sent/dropped |
+| `go_event.subscribe` | Counter | `event`, `mode`, `result`（仅启动后动态注册计数；Start 前注册不计入，ADR 0015） |
 
 属性值仅枚举与标识符（`identity` 为消费者身份，多实例区分维度）；业务
 payload（事件 ID、错误原文）不入属性。日志仅低频生命周期事件
@@ -1684,7 +1704,7 @@ func TestVectorizeFlow(t *testing.T) {
 | 元数据透传（§4）                          | `RawEnvelope.Metadata` + `WithMetadata`                                      |
 | 就近唤醒仅信号（ADR 0003）                  | `LocalWake` + `WithLocalWake`（Publisher/Runner 双侧注入）                         |
 | 消费者身份构造默认 + 订阅覆盖（§5.1）             | `WithIdentity` + `WithConsumerType`，皆缺返回 `ErrIdentityMissing`                |
-| 订阅启动前注册完毕（§5）                      | 订阅入口在 Start 后返回 `ErrRunnerStarted`                                           |
+| 订阅全生命周期可注册、启动后即生效（§5、ADR 0015） | 订阅入口在 Stop 前任意时刻可用；启动后注册即时装配，广播基线锚定于注册调用；Stop 后返回 `ErrRunnerStopped` |
 | 构造器显式注入、无包级状态（§4）                  | 全部 `NewX(依赖, opts...)`；`Event[T]` 为无状态声明值                                    |
 | 持久结构初始化按模式（§8、ADR 0007）             | `MigrateMode` + 后端 `WithMigrateMode`/`Migrate`/`Verify`；缺省 Create                     |
 | 迁移能力声明用于契约测试与文档判定（§8、ADR 0007） | `MigrationCapabilities` + `FaultPoint` + `Capabilities()`                          |

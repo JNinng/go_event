@@ -88,7 +88,8 @@ func main() {
 		return
 	}
 
-	// 消费（认领：消费者身份 + 租约 + 心跳 + 失败重试）。订阅须在 Start 之前注册。
+	// 消费（认领：消费者身份 + 租约 + 心跳 + 失败重试）。
+	// 订阅可在 Start 前注册，也可运行期动态注册（见 §3）。
 	run := event.NewRunner(drv, event.WithPollInterval(5*time.Second))
 	if err := orderCreated.SubscribeClaim(run,
 		func(_ context.Context, e event.Envelope[OrderCreated]) error {
@@ -226,7 +227,7 @@ run := event.NewRunner(drv,
 
 - 一个 `Publisher` 可发布任意类型的事件。
 - 一个 `Runner` 可注册多个订阅，混合承载广播与认领。
-- **订阅必须在 `Runner.Start` 之前注册**；Start 之后再订阅返回 `event.ErrRunnerStarted`。
+- **订阅注册在 Runner 生命周期内任意时刻可用（Stop 前）**：Start 前注册的订阅由 Start 统一装配；启动后注册即时生效（动态注册见下）。Stop 之后再订阅返回 `event.ErrRunnerStopped`。
 - `LocalWake` 是可选的同进程唤醒总线：同一个实例同时注入 `Publisher` 与 `Runner` 后，发布成功会立即唤醒本实例对应类型的 poller。它只是信号，不跳过存储，跨实例与信号丢失由周期轮询兜底。
 
 生命周期：
@@ -250,6 +251,37 @@ if err := run.Run(ctx); err != nil { // Start 后阻塞，ctx 取消后 Stop
 ```
 
 `Stop` 会停止拉取/认领并等待在途 handler 跑完；在途 handler 的 `ctx` 不因停机取消，`Stop(ctx)` 的 ctx 超时是调用方兜底。
+
+### 3.1 启动后动态注册订阅（ADR 0015）
+
+运行期才知道的消费方（按配置启用的订阅、装配完成后注册）可在 Start 之后随时接入，注册返回即生效，既有订阅与停机语义不受影响：
+
+```go
+if err := run.Start(ctx); err != nil {
+    return err
+}
+
+// 运行期新增订阅：认领订阅注册即参与认领，起点同新身份——从当前可认领
+// 行（保留窗口内，含其他身份已 done/failed 的）开始，后续事件照常。
+if err := docUploaded.SubscribeClaim(run, handleUpload,
+    event.WithConsumerType("upload-worker"),
+); err != nil {
+    return err // ErrRunnerStopped：Runner 已 Stop
+}
+
+// 广播订阅在注册调用内同步锚定基线（HeadPosition）：注册返回即基线确立，
+// 只处理注册之后发布的事件，注册前事件不补投。锚定查询失败返回错误、
+// 订阅不生效，修复后可重试注册。
+if err := cacheFlush.SubscribeBroadcast(run, handleFlush); err != nil {
+    return err
+}
+```
+
+要点：
+
+- 两种模式同一注册入口、同一选项集；Stop 后注册一律返回 `event.ErrRunnerStopped`（Runner 一次性，不支持重启）。Start 的 ctx 已取消、poller 已退出的窗口同样拒绝——调用方应以 `Stop` 为停机边界。
+- 动态注册可配额外观测：`<scope>.subscribe` 计数（`event` / `mode` / `result` 属性，见 [§13.2](#132-指标口径)）与一行 `subscription registered` 日志；Start 前注册不计入该指标。
+- 广播基线锚定查询使用 Runner 的运行期 context：`Stop` 时未完成的注册随之中止并返回错误。
 
 ## 4. 发布事件
 
@@ -405,12 +437,12 @@ err := docUploaded.SubscribeBroadcast(run,
 
 - **发完即忘**：不承诺 at-least-once，不承诺保序；handler 返回错误或 panic 仅记日志并跳过，不重试、不阻塞、不设死信。
 - **存储侧无簿记**：已读水位保存在实例内存中，按订阅在 `Fetch` 时下推，只进不退。
-- **起点在 `Start`**：`Runner.Start` 内对每个广播订阅调用 `Driver.HeadPosition`，把水位锚定到该类型当前最大位置。**Start 返回之后发布的事件才会被投递**；停机期间与 Start 之前发布的事件不补投。锚点只锚已提交行（[§4.4](#44-事务内发布outbox) 未提交事务内的事件不进基线）。
+- **起点在订阅生效时刻**：Start 前注册的订阅在 `Runner.Start` 内对每个广播订阅调用 `Driver.HeadPosition`，把水位锚定到该类型当前最大位置，**Start 返回之后发布的事件才会被投递**；启动后动态注册的订阅在注册调用内同步锚定，**注册返回之后发布的事件才会被投递**（[§3.1](#31-启动后动态注册订阅adr-0015)）。停机期间与订阅生效之前发布的事件不补投。锚点只锚已提交行（[§4.4](#44-事务内发布outbox) 未提交事务内的事件不进基线）。
 - **事务内发布可能漏投（outbox 边界，ADR 0012）**：position 分配序与提交可见序在事务内发布下可能乱序——并发提交的更大 position 会把内存水位推过晚提交的行，该行对所有在途广播实例**永久不可见**（重启实例的基线锚定同样不含）。「Start 后发布的事件必然可投递」仅对普通发布路径成立（单语句独立提交，理论残余窗口可忽略——Postgres 无提交序全局串行化，幂等 Append 同 ID 冲突会等待在途事务，窗口非绝对为零、非绝对保证）；需要可靠投递的业务事件用认领消费（Claim 直接查库，不受水位影响）。
 - **延迟事件可能被水位越过（延迟 + 广播组合边界，ADR 0013）**：延迟行占用 position；到期前被下推条件过滤、不推进水位，但其后发布的即时行会把水位推过延迟行——该行到期后**不再有广播可见性**（与上一条同源：水位只进不退）。「延迟事件 + 广播消费者」只适用于漏掉可容忍的通知类事件；需要定时必达用认领消费（Claim 无水位条件，到期后最迟下一认领轮次可见）。
 - **多实例各自全收**：每个活跃实例独立拉取并处理全部事件，实例间互不感知；实例数不影响语义。
 - **只接受通用选项**：广播订阅只允许 `WithConcurrency` 与 `WithFetchLimit`；传入认领专属选项返回 `event.ErrNotClaimSubscription`。
-- **基线失败不启动**：任一广播订阅的 `HeadPosition` 查询失败，`Start` 返回错误且整体不启动，修复后可重试。
+- **基线失败不启动、不生效**：任一广播订阅的 `HeadPosition` 查询失败，`Start` 返回错误且整体不启动，修复后可重试；启动后动态注册的广播订阅基线查询失败时注册返回错误、订阅不生效（既有订阅不受影响），修复后可重试注册（[ADR 0015](docs/adr/0015-dynamic-subscription-registration.md)）。
 
 广播消费适合通知、缓存失效、广播类副作用等“不需要补投与完成追踪”的场景。需要可靠投递时改用认领消费。
 
@@ -904,7 +936,7 @@ func TestMyBackendRetention(t *testing.T) {
 
 | 错误 | 触发条件 | 处理 |
 | --- | --- | --- |
-| `event.ErrRunnerStarted` | `Runner.Start` 之后注册订阅 | 把所有订阅移到 Start 之前 |
+| `event.ErrRunnerStopped` | `Runner.Stop` 之后注册订阅（Runner 一次性；Start ctx 已取消但未 Stop 的窗口同此） | 在 Stop 之前注册；需要新消费方时新建 Runner |
 | `event.ErrNotClaimSubscription` | 广播订阅传入认领专属选项 | 移除认领选项，或改为认领订阅 |
 | `event.ErrIdentityMissing` | 认领订阅既无 `WithConsumerType` 也无 `WithIdentity` | 补齐身份 |
 | `event.ErrEmptyEventID` | `WithEventID` 传入空串 | 传入非空业务键，或不使用该选项 |
@@ -921,7 +953,7 @@ func TestMyBackendRetention(t *testing.T) {
 
 **广播订阅收不到事件**
 
-1. 事件是否在 `Runner.Start` 返回之后发布？Start 之前的事件按设计跳过。
+1. 事件是否在订阅生效之后发布？Start 之前的事件、以及动态注册的广播订阅生效之前发布的事件，均按设计跳过。
 2. 发布与订阅的 `Event.Name` 是否完全一致？
 3. 发布与消费是否指向同一个数据库/schema？
 4. 跨实例场景是否只依赖 `LocalWake`？唤醒仅限同进程；跨实例低延迟唤醒用 pgxc 的 `Wake`（LISTEN/NOTIFY，[§11](#11-运维注意事项)「轮询开销」），postgrec 依赖轮询——检查 `WithPollInterval`。
@@ -943,9 +975,9 @@ func TestMyBackendRetention(t *testing.T) {
 2. 认领：事件滞留超过保留窗口且无活跃租约，会被惰性清理。按 [8.5](#85-保留窗口与惰性清理) 的公式加长窗口。
 3. 检查是否是新身份：新身份只重放保留窗口内的历史。
 
-**Start 返回基线错误**
+**Start 返回基线错误 / 动态注册返回基线错误**
 
-广播基线通过 `Driver.HeadPosition` 同步确立；数据库不可用、权限不足或 schema 不存在都会导致 Start 失败。修复后重试 Start 即可，未启动的 Runner 不会留下半启动状态。
+广播基线通过 `Driver.HeadPosition` 同步确立；数据库不可用、权限不足或 schema 不存在都会导致 Start 失败（整体不启动，修复后重试 Start），动态注册的广播订阅则注册返回错误、订阅不生效（既有订阅不受影响，修复后重试注册即可）。失败的注册不会留下半生效状态。
 
 **首次 Append/Claim 报迁移错误**
 
