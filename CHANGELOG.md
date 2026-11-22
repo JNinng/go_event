@@ -4,17 +4,25 @@
 
 ## [Unreleased]
 
+## [v0.4.0] - 2026-11-22
+
 ### 新特性
 
-- **启动后动态注册订阅（[ADR 0015](docs/adr/0015-dynamic-subscription-registration.md)）**：订阅注册在 `Runner` 生命周期内任意时刻可用（`Stop` 前），不再要求在 `Start` 之前注册完毕——运行期才知道的消费方（按配置启用的订阅、装配完成后注册）可随时接入，注册返回即生效，既有订阅与停机语义不受影响。
-  - 认领订阅：注册即参与认领，起点对齐新身份口径——从当前可认领行（保留窗口内，含其他身份已 `done`/`failed` 的）开始，后续事件照常；零新增簿记。
-  - 广播订阅：基线锚定于注册调用（`Driver.HeadPosition`），注册返回即基线确立，只处理注册之后发布的事件；锚定查询失败注册返回错误、订阅不生效，修复后可重试（与 Start「基线失败不启动」同构）。
-  - 新增 `<scope>.subscribe` 计数（`event` / `mode` / `result` 维度，仅计启动后动态注册）；`Driver` 契约与三个后端零改动。
-- 新增哨兵错误 `event.ErrRunnerStopped`：`Runner.Stop` 后注册订阅（Runner 一次性）返回该错误。
+- **启动后动态注册订阅（[ADR 0015](docs/adr/0015-dynamic-subscription-registration.md)）**：订阅注册不再要求在 `Runner.Start` 之前完成——`SubscribeBroadcast` / `SubscribeClaim` 在 Runner 生命周期内（`Stop` 前）任意时刻可用，运行期新增的订阅注册返回即生效，既有订阅与停机语义不受影响。
+  - 认领订阅：注册即参与认领，起点与新增消费者身份一致——从保留窗口内的全部历史（含其他身份已 `done`/`failed` 的事件）开始认领，后续事件照常。
+  - 广播订阅：基线在注册调用内锚定（`Driver.HeadPosition`），注册返回即基线确立，只处理注册之后发布的事件；锚定查询失败注册返回错误、订阅不生效，修复后可重试。
+  - 新增 `<scope>.subscribe` 指标（`event` / `mode` / `result` 维度，仅计动态注册），动态注册可在指标与日志中直接观测。
+  - `Driver` 契约与内置后端零改动：三个后端经契约套件自动执行六个新动态注册用例。
+- 新增哨兵错误 `event.ErrRunnerStopped`：`Runner.Stop` 之后注册订阅（Runner 一次性，不支持重启）返回该错误；Start ctx 已取消但未 `Stop` 的窗口同样拒绝，避免注册出永不消费的订阅。
 
 ### 破坏性变更与兼容期
 
-- **移除 `event.ErrRunnerStarted`**（v0.x 允许破坏性变更）：动态注册生效后「Start 后再订阅」不再是拒绝路径，该哨兵永不返回；Stop 后注册的拒绝由新增的 `event.ErrRunnerStopped` 承接。原以 `ErrRunnerStarted` 判别「订阅须在 Start 前」的代码可直接移除该判别分支。
+- **移除 `event.ErrRunnerStarted`**（v0.x 允许破坏性变更）：动态注册生效后「Start 后再订阅」不再是拒绝路径，该哨兵永不返回；`Stop` 后注册的拒绝由新增的 `event.ErrRunnerStopped` 承接。以 `ErrRunnerStarted` 判别「订阅须在 Start 前」的代码可直接移除该判别分支。
+
+### 文档
+
+- 新增 [ADR 0015](docs/adr/0015-dynamic-subscription-registration.md)：动态订阅注册的语义口径决策记录（两种消费模式的起点语义、错误面、Runner 一次性与已否决备选）。
+- usage.md 新增 §3.1 启动后动态注册配方；design.md §5 消费语义、api.md 订阅注册契约与 usage.md 排障口径同步为「订阅生效时刻」表述。
 
 ## [v0.3.0] - 2026-11-21
 
@@ -88,5 +96,6 @@
 - 新增 LICENSE（MIT），README 增许可证一节并同步状态与路线。
 
 [v0.2.0]: https://github.com/JNinng/go_event/compare/v0.1.1...v0.2.0
-[Unreleased]: https://github.com/JNinng/go_event/compare/v0.3.0...HEAD
 [v0.3.0]: https://github.com/JNinng/go_event/compare/v0.2.0...v0.3.0
+[v0.4.0]: https://github.com/JNinng/go_event/compare/v0.3.0...v0.4.0
+[Unreleased]: https://github.com/JNinng/go_event/compare/v0.4.0...HEAD
